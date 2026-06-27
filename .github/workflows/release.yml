@@ -1,0 +1,11 @@
+name: Release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  release:
+    uses: agoodkind/go-makefile/.github/workflows/_release.yml@main
+    permissions:
+      contents: write
+    secrets: inherit

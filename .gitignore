@@ -1,0 +1,6 @@
+.make/
+dist/
+/gha-mac-broker
+go.work
+go.work.sum
+config.mk
