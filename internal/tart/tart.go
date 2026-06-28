@@ -20,16 +20,19 @@ type CommandRunner func(ctx context.Context, bin string, args ...string) ([]byte
 
 // Tart drives the tart binary. The run field is swappable in white-box tests.
 type Tart struct {
-	bin string
-	run CommandRunner
+	bin      string
+	resolver string
+	run      CommandRunner
 }
 
-// New returns a Tart that invokes the given binary (default "tart").
-func New(bin string) *Tart {
+// New returns a Tart that invokes the given binary (default "tart"). resolver is
+// the `tart ip --resolver` strategy ("dhcp"/"arp"/"agent"); an empty resolver
+// uses tart's default.
+func New(bin, resolver string) *Tart {
 	if bin == "" {
 		bin = "tart"
 	}
-	return &Tart{bin: bin, run: execRunner}
+	return &Tart{bin: bin, resolver: resolver, run: execRunner}
 }
 
 // command builds an [exec.Cmd] for the tart binary. Centralizing construction
@@ -82,9 +85,14 @@ func (t *Tart) Clone(ctx context.Context, source, name string) error {
 	return err
 }
 
-// IP returns the VM's IP address.
+// IP returns the VM's IP address, using the configured resolver when set. The
+// "agent" resolver returns IPv6 addresses under bridged networking.
 func (t *Tart) IP(ctx context.Context, name string) (string, error) {
-	out, err := t.run(ctx, t.bin, "ip", name)
+	args := []string{"ip", name}
+	if t.resolver != "" {
+		args = append(args, "--resolver", t.resolver)
+	}
+	out, err := t.run(ctx, t.bin, args...)
 	if err != nil {
 		return "", err
 	}
@@ -114,6 +122,10 @@ type BootOptions struct {
 	Dirs []DirMount
 	// NoGraphics runs the VM headless.
 	NoGraphics bool
+	// BridgeInterface, when set, boots the VM with bridged networking on that
+	// host interface (`--net-bridged=<iface>`) so the VM joins the host LAN and
+	// can obtain an IPv6 address. Empty uses tart's default shared NAT.
+	BridgeInterface string
 }
 
 // DirMount is one host directory shared into a VM.
@@ -130,6 +142,9 @@ func (t *Tart) BootCommand(ctx context.Context, name string, opts BootOptions) *
 	args := []string{"run", name}
 	if opts.NoGraphics {
 		args = append(args, "--no-graphics")
+	}
+	if opts.BridgeInterface != "" {
+		args = append(args, "--net-bridged="+opts.BridgeInterface)
 	}
 	for _, d := range opts.Dirs {
 		args = append(args, "--dir", d.Name+":"+d.Path)

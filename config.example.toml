@@ -28,3 +28,10 @@ vm_name_prefix = "gha-runner"
 cache_dir      = "/Users/you/.tart/cache"
 ssh_key_path   = "/Users/you/.config/gha-mac-broker/id_broker"
 ssh_user       = "admin"
+# Networking. "nat" (default) is IPv4-only shared NAT. "bridged" joins the VM to
+# the host LAN so it gets IPv6 via SLAAC for the IPv6-native control plane;
+# bridged requires bridge_interface and uses the "agent" resolver (which needs
+# the cirruslabs tart-guest-agent baked into the golden image).
+network         = "nat"
+# bridge_interface = "en0"
+# ip_resolver      = "agent"

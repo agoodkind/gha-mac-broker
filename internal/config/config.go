@@ -71,7 +71,27 @@ type TartConfig struct {
 	SSHKeyPath string `toml:"ssh_key_path"`
 	// SSHUser is the account the golden image exposes for runner control.
 	SSHUser string `toml:"ssh_user"`
+	// Network selects VM networking: "nat" (default, shared NAT, IPv4-only) or
+	// "bridged" (the VM joins the host LAN and gets IPv6 via SLAAC). Bridged is
+	// required for the IPv6-native control plane and needs BridgeInterface plus
+	// the "agent" IP resolver.
+	Network string `toml:"network"`
+	// BridgeInterface is the host interface used for bridged networking, e.g.
+	// "en0". Required when Network is "bridged".
+	BridgeInterface string `toml:"bridge_interface"`
+	// IPResolver is the `tart ip --resolver` strategy: "dhcp" (works for NAT),
+	// "arp" (IPv4 bridged only), or "agent" (returns IPv6, needs the cirruslabs
+	// tart-guest-agent baked into the golden image). Empty uses tart's default;
+	// bridged networking defaults it to "agent".
+	IPResolver string `toml:"ip_resolver"`
 }
+
+// Networking modes for TartConfig.Network.
+const (
+	networkNAT     = "nat"
+	networkBridged = "bridged"
+	resolverAgent  = "agent"
+)
 
 // DefaultConfigPath returns the XDG-aware default config file path:
 // $XDG_CONFIG_HOME/gha-mac-broker/config.toml, falling back to
@@ -119,6 +139,12 @@ func (c *Config) applyDefaults() {
 	if c.Tart.SSHUser == "" {
 		c.Tart.SSHUser = "admin"
 	}
+	if c.Tart.Network == "" {
+		c.Tart.Network = networkNAT
+	}
+	if c.Tart.Network == networkBridged && c.Tart.IPResolver == "" {
+		c.Tart.IPResolver = resolverAgent
+	}
 	if c.PoolSize == 0 {
 		c.PoolSize = 2
 	}
@@ -140,6 +166,9 @@ func (c *Config) validate() error {
 	}
 	if len(c.AllowedRepos) == 0 {
 		missing = append(missing, "allowed_repos")
+	}
+	if c.Tart.Network == networkBridged && c.Tart.BridgeInterface == "" {
+		missing = append(missing, "tart.bridge_interface (required for bridged networking)")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("config: missing required fields: %s", strings.Join(missing, ", "))
