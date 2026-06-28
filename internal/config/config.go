@@ -83,7 +83,7 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) applyDefaults() {
 	if c.ListenAddr == "" {
-		c.ListenAddr = "127.0.0.1:8080"
+		c.ListenAddr = "[::1]:8080"
 	}
 	if c.Tart.Binary == "" {
 		c.Tart.Binary = "tart"

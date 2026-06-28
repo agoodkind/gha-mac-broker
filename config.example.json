@@ -1,5 +1,5 @@
 {
-  "listen_addr": "127.0.0.1:8080",
+  "listen_addr": "[::1]:8080",
   "app": {
     "app_id": "REPLACE_WITH_APP_ID",
     "private_key_path": "/Users/you/.config/gha-mac-broker/app-private-key.pem",
