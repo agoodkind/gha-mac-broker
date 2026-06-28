@@ -10,9 +10,15 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"goodkind.io/gha-mac-broker/internal/broker"
 )
+
+// warmFailDelay is the back-off pause between a failed Warm call and the next
+// refill signal. It prevents a tight goroutine retry loop when Warm fails
+// persistently (e.g. tart binary missing or golden image unavailable).
+const warmFailDelay = 5 * time.Second
 
 // Warmer creates and tears down warm VMs. *broker.Binder satisfies this
 // interface; tests use a stub.
@@ -52,16 +58,17 @@ func New(size int, w Warmer) *Pool {
 }
 
 // Start launches the background fill goroutine. It returns immediately; the
-// fill loop runs until ctx is cancelled or Shutdown is called.
+// fill loop runs until ctx is cancelled or Shutdown is called. The goroutine
+// is tracked by wg so Shutdown waits for it to exit before draining idle VMs.
 func (p *Pool) Start(ctx context.Context) {
-	go func() {
+	p.wg.Go(func() {
 		defer func() {
 			if r := recover(); r != nil {
 				slog.ErrorContext(ctx, "fillLoop panic recovered", "err", fmt.Errorf("panic: %v", r))
 			}
 		}()
 		p.fillLoop(ctx)
-	}()
+	})
 }
 
 // Lease returns an idle warm VM, blocking until one is available or ctx is
@@ -139,10 +146,12 @@ func (p *Pool) tryFill(ctx context.Context) {
 			return
 		}
 		p.warming++
+		// Add to wg while the mutex is still held so Shutdown's wg.Wait()
+		// cannot return between the unlock and the goroutine launch.
+		p.wg.Add(1)
 		p.mu.Unlock()
 
 		id := strconv.FormatInt(p.counter.Add(1), 10)
-		p.wg.Add(1)
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -167,6 +176,17 @@ func (p *Pool) warmOne(ctx context.Context, id string) {
 	vm, err := p.warmer.Warm(ctx, id)
 	if err != nil {
 		slog.WarnContext(ctx, "warm failed", "err", err, "id", id)
+		// Back off before signalling a refill so a persistent Warm failure
+		// (e.g. tart missing or image unavailable) does not spin goroutines.
+		retryTimer := time.NewTimer(warmFailDelay)
+		defer retryTimer.Stop()
+		select {
+		case <-retryTimer.C:
+		case <-p.done:
+			return
+		case <-ctx.Done():
+			return
+		}
 		p.sendRefill()
 		return
 	}

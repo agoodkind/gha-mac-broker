@@ -52,6 +52,12 @@ const httpTimeout = 30 * time.Second
 // shutdownTimeout bounds the graceful HTTP shutdown.
 const shutdownTimeout = 30 * time.Second
 
+// webhookWriteTimeout caps the total per-connection handler time. A Lease
+// call can block until a warming VM is ready (up to 90 s per broker.Warm);
+// 120 s covers one full boot cycle plus processing headroom so a stuck lease
+// cannot pin a connection open indefinitely.
+const webhookWriteTimeout = 120 * time.Second
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	ctx := context.Background()
@@ -233,6 +239,8 @@ func runServe(ctx context.Context, args []string) error {
 		Addr:              cfg.ListenAddr,
 		Handler:           srv,
 		ReadHeaderTimeout: httpTimeout,
+		ReadTimeout:       httpTimeout,
+		WriteTimeout:      webhookWriteTimeout,
 	}
 
 	errCh := make(chan error, 1)

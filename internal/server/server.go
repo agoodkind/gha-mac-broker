@@ -100,6 +100,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // allowlist and label set, and dispatches a job goroutine for queued events
 // the broker can handle.
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	slog.DebugContext(r.Context(), "webhook received")
 	body, ok := s.readVerifiedBody(w, r)
 	if !ok {
@@ -168,7 +172,7 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("job goroutine panic recovered", "err", fmt.Errorf("panic: %v", r), "vm", vm.Name)
+				slog.ErrorContext(jobCtx, "job goroutine panic recovered", "err", fmt.Errorf("panic: %v", r), "vm", vm.Name)
 			}
 		}()
 		defer s.pool.Recycle(jobCtx, vm)
@@ -182,12 +186,22 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 
 // handleCapacity checks whether the pool has a free slot for a given repo and
 // run_id. If so it records a reservation and returns {"available":true}.
+// A missing or non-numeric run_id is rejected with 400 so a bad request
+// cannot create a phantom reservation that wastes a pool slot until TTL.
 func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get("repo")
 	runID := r.URL.Query().Get("run_id")
 	slog.DebugContext(r.Context(), "capacity request", "repo", repo, "run_id", runID)
 	if !s.cfg.RepoAllowed(repo) {
 		writeJSON(w, capacityResponse{Available: false})
+		return
+	}
+	if runID == "" {
+		http.Error(w, "run_id required", http.StatusBadRequest)
+		return
+	}
+	if _, err := strconv.ParseInt(runID, 10, 64); err != nil {
+		http.Error(w, "run_id must be numeric", http.StatusBadRequest)
 		return
 	}
 	available := s.store.Reserve(runID, s.pool.FreeSlots())

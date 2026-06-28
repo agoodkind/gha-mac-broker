@@ -216,6 +216,20 @@ func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
 	}
 }
 
+func TestWebhookNonPostMethodReturns405(t *testing.T) {
+	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
+	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 42)
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		req := httptest.NewRequest(method, "/webhook", strings.NewReader(string(body)))
+		req.Header.Set("X-Hub-Signature-256", signBody(body))
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405 for %s, got %d", method, w.Code)
+		}
+	}
+}
+
 // --- capacity handler tests ---
 
 func TestCapacityDisallowedRepo(t *testing.T) {
@@ -266,6 +280,26 @@ func TestCapacityNotAvailable(t *testing.T) {
 	}
 	if resp.Available {
 		t.Fatal("expected available=false when pool has no free slots")
+	}
+}
+
+func TestCapacityEmptyRunIDReturns400(t *testing.T) {
+	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
+	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty run_id, got %d", w.Code)
+	}
+}
+
+func TestCapacityNonNumericRunIDReturns400(t *testing.T) {
+	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
+	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=notanumber", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-numeric run_id, got %d", w.Code)
 	}
 }
 
