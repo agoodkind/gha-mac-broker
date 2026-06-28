@@ -92,7 +92,7 @@ func newTestConfig(allowedRepo string) *config.Config {
 			CapacityTokenPath: "",
 			WebhookCIDRsPath:  "",
 		},
-		Tart:         config.TartConfig{Binary: "tart", GoldenImage: "golden", VMNamePrefix: "gha", SSHKeyPath: "/tmp/id_rsa", SSHUser: "admin", CacheDir: ""},
+		Tart:         config.TartConfig{Binary: "tart", GoldenImage: "golden", VMNamePrefix: "gha", CacheDir: ""},
 		Labels:       []string{"self-hosted", "macOS"},
 		AllowedRepos: []string{allowedRepo},
 		PoolSize:     2,
@@ -203,7 +203,7 @@ func TestWebhookNoMatchingLabelReturns204(t *testing.T) {
 }
 
 func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
-	vm := &broker.WarmVM{Name: "vm-1", Host: "127.0.0.1"}
+	vm := &broker.WarmVM{Name: "vm-1"}
 	pool := &testPool{freeSlots: 2, leaseVM: vm}
 	runner := &testRunner{ran: make(chan struct{}, 1)}
 	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool, &testStore{}, runner)

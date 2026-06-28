@@ -35,7 +35,6 @@ import (
 	"goodkind.io/gha-mac-broker/internal/server"
 	"goodkind.io/gha-mac-broker/internal/tart"
 	"goodkind.io/gha-mac-broker/internal/version"
-	"goodkind.io/gha-mac-broker/internal/vmssh"
 )
 
 // commandName is the broker's top-level subcommand.
@@ -191,9 +190,8 @@ func runBind(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	vm := tart.New(cfg.Tart.Binary, cfg.Tart.IPResolver)
-	ssh := vmssh.New(cfg.Tart.SSHUser, cfg.Tart.SSHKeyPath)
-	binder := broker.New(cfg, gh, vm, ssh)
+	vm := tart.New(cfg.Tart.Binary)
+	binder := broker.New(cfg, gh, vm)
 
 	bindID := *id
 	if bindID == "" {
@@ -242,9 +240,8 @@ func runServe(ctx context.Context, args []string) error {
 		return fmt.Errorf("serve: read webhook CIDRs: %w", err)
 	}
 
-	v := tart.New(cfg.Tart.Binary, cfg.Tart.IPResolver)
-	ssh := vmssh.New(cfg.Tart.SSHUser, cfg.Tart.SSHKeyPath)
-	binder := broker.New(cfg, gh, v, ssh)
+	v := tart.New(cfg.Tart.Binary)
+	binder := broker.New(cfg, gh, v)
 
 	// runToken is embedded in every VM name so names stay readable yet never
 	// repeat across restarts or collide between overlapping processes. It pairs

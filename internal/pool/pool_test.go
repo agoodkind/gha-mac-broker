@@ -35,7 +35,7 @@ func (s *stubWarmer) Warm(_ context.Context, id string) (*broker.WarmVM, error) 
 	}
 	s.warmed++
 	s.ids = append(s.ids, id)
-	return &broker.WarmVM{Name: "vm-" + id, Host: "127.0.0.1"}, nil
+	return &broker.WarmVM{Name: "vm-" + id}, nil
 }
 
 func (s *stubWarmer) Teardown(_ context.Context, _ *broker.WarmVM) {
@@ -247,7 +247,7 @@ func (b *blockingWarmer) Warm(ctx context.Context, id string) (*broker.WarmVM, e
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	return &broker.WarmVM{Name: "vm-" + id, Host: "127.0.0.1"}, nil
+	return &broker.WarmVM{Name: "vm-" + id}, nil
 }
 
 func (b *blockingWarmer) Teardown(_ context.Context, _ *broker.WarmVM) {
