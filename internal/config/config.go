@@ -183,6 +183,23 @@ func (c *Config) ReadCapacityToken() ([]byte, error) {
 	return bytes.TrimRight(token, "\r\n"), nil
 }
 
+// ReadWebhookSecret reads the webhook HMAC secret from disk, stripping trailing
+// line endings so a secret file written by echo or printf verifies correctly
+// against GitHub's X-Hub-Signature-256 (a stray newline silently breaks HMAC).
+// The path is required; an empty or unreadable path is an error so the server
+// never starts with an unverifiable webhook.
+func (c *Config) ReadWebhookSecret() ([]byte, error) {
+	if c.App.WebhookSecretPath == "" {
+		return nil, fmt.Errorf("config: webhook_secret_path is required")
+	}
+	secret, err := os.ReadFile(c.App.WebhookSecretPath)
+	if err != nil {
+		slog.Error("read webhook secret failed", "err", err, "path", c.App.WebhookSecretPath)
+		return nil, fmt.Errorf("config: read webhook secret %s: %w", c.App.WebhookSecretPath, err)
+	}
+	return bytes.TrimRight(secret, "\r\n"), nil
+}
+
 // ReadWebhookCIDRs reads the allowed IP ranges for /webhook from the file at
 // WebhookCIDRsPath (one CIDR per line; blank lines are skipped). When the
 // path is empty the method returns (nil, nil) and the server disables the IP

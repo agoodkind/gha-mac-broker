@@ -20,11 +20,12 @@ import (
 // persistently (e.g. tart binary missing or golden image unavailable).
 const warmFailDelay = 5 * time.Second
 
-// Warmer creates and tears down warm VMs. *broker.Binder satisfies this
-// interface; tests use a stub.
+// Warmer creates and tears down warm VMs, and sweeps orphaned VMs left by a
+// prior process. *broker.Binder satisfies this interface; tests use a stub.
 type Warmer interface {
 	Warm(ctx context.Context, id string) (*broker.WarmVM, error)
 	Teardown(ctx context.Context, vm *broker.WarmVM)
+	SweepOrphans(ctx context.Context)
 }
 
 // Pool keeps up to size idle warm VMs and refills as VMs are leased or
@@ -38,13 +39,16 @@ type Pool struct {
 	mu        sync.Mutex
 	warming   int
 	counter   atomic.Int64
+	runToken  string // per-process token embedded in VM names; prevents cross-restart and cross-process name collisions
 	wg        sync.WaitGroup
 	failDelay time.Duration // overrides warmFailDelay in tests; zero uses warmFailDelay
 }
 
-// New returns a Pool of the given size backed by the given Warmer. Call Start
-// to begin the fill loop.
-func New(size int, w Warmer) *Pool {
+// New returns a Pool of the given size backed by the given Warmer. runToken is a
+// per-process token embedded in every VM name (alongside an incrementing
+// counter), so names never repeat across restarts and never collide between two
+// overlapping processes. Call Start to begin the fill loop.
+func New(size int, w Warmer, runToken string) *Pool {
 	return &Pool{
 		size:      size,
 		warmer:    w,
@@ -54,6 +58,7 @@ func New(size int, w Warmer) *Pool {
 		mu:        sync.Mutex{},
 		warming:   0,
 		counter:   atomic.Int64{},
+		runToken:  runToken,
 		wg:        sync.WaitGroup{},
 		failDelay: 0,
 	}
@@ -118,6 +123,9 @@ func (p *Pool) FreeSlots() int {
 // fillLoop runs until ctx is done or done is closed, triggering tryFill on
 // each refill signal.
 func (p *Pool) fillLoop(ctx context.Context) {
+	// Clear any VMs orphaned by a previous process before filling so a hard
+	// restart cannot leave stale clones behind or collide on a reused name.
+	p.warmer.SweepOrphans(ctx)
 	p.tryFill(ctx)
 	for {
 		select {
@@ -153,7 +161,7 @@ func (p *Pool) tryFill(ctx context.Context) {
 		p.wg.Add(1)
 		p.mu.Unlock()
 
-		id := strconv.FormatInt(p.counter.Add(1), 10)
+		id := p.runToken + "-" + strconv.FormatInt(p.counter.Add(1), 10)
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {

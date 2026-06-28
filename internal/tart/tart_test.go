@@ -41,6 +41,30 @@ func TestLifecycleCommands(t *testing.T) {
 	}
 }
 
+func TestListParsesNames(t *testing.T) {
+	stub := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if args[0] != "list" {
+			t.Fatalf("expected list call, got %v", args)
+		}
+		return []byte(`[{"Name":"gha-golden","State":"stopped"},{"Name":"gha-runner-260628T170530-1","State":"running"}]`), nil
+	}
+	tt := New("tart")
+	tt.run = stub
+	names, err := tt.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	want := []string{"gha-golden", "gha-runner-260628T170530-1"}
+	if len(names) != len(want) {
+		t.Fatalf("names = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Errorf("names[%d] = %q, want %q", i, names[i], want[i])
+		}
+	}
+}
+
 func TestBootCommandArgs(t *testing.T) {
 	tt := New("tart")
 	cmd := tt.BootCommand(context.Background(), "warm-1", BootOptions{

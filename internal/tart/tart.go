@@ -7,6 +7,7 @@ package tart
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -48,6 +49,31 @@ func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error)
 		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out.String()))
 	}
 	return out.Bytes(), nil
+}
+
+// listEntry is the subset of one `tart list --format json` record the broker
+// reads. Other columns (source, disk, state) are ignored.
+type listEntry struct {
+	Name string `json:"Name"`
+}
+
+// List returns the names of every VM tart knows about. The orphan sweep uses it
+// to find stale pool clones left by a previous broker process.
+func (t *Tart) List(ctx context.Context) ([]string, error) {
+	out, err := t.run(ctx, t.bin, "list", "--format", "json")
+	if err != nil {
+		return nil, err
+	}
+	var entries []listEntry
+	if err := json.Unmarshal(out, &entries); err != nil {
+		slog.ErrorContext(ctx, "tart list parse failed", "err", err)
+		return nil, fmt.Errorf("tart: parse list output: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name)
+	}
+	return names, nil
 }
 
 // Clone makes a copy-on-write clone of source under name.
