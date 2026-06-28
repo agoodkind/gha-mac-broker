@@ -10,7 +10,7 @@
     <string>@@BIN_PATH@@</string>
     <string>serve</string>
     <string>-config</string>
-    <string>@@HOME@@/.config/gha-mac-broker/config.json</string>
+    <string>@@HOME@@/.config/gha-mac-broker/config.toml</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

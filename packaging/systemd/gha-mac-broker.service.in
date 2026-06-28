@@ -1,0 +1,12 @@
+[Unit]
+Description=gha-mac-broker daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=@@BIN_PATH@@ serve -config @@HOME@@/.config/gha-mac-broker/config.toml
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target
