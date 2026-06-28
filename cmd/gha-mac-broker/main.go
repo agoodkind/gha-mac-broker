@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 	"goodkind.io/gha-mac-broker/internal/broker"
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
+	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/pool"
 	"goodkind.io/gha-mac-broker/internal/reservation"
 	"goodkind.io/gha-mac-broker/internal/server"
@@ -41,10 +43,11 @@ import (
 type commandName string
 
 const (
-	commandVersion   commandName = "version"
-	commandJITConfig commandName = "jitconfig"
-	commandBind      commandName = "bind"
-	commandServe     commandName = "serve"
+	commandVersion     commandName = "version"
+	commandJITConfig   commandName = "jitconfig"
+	commandBind        commandName = "bind"
+	commandServe       commandName = "serve"
+	commandBuildGolden commandName = "build-golden"
 )
 
 // httpTimeout bounds GitHub API calls.
@@ -80,6 +83,8 @@ func main() {
 		err = runBind(ctx, args)
 	case commandServe:
 		err = runServe(ctx, args)
+	case commandBuildGolden:
+		err = runBuildGolden(ctx, args)
 	default:
 		usage()
 		os.Exit(2)
@@ -91,7 +96,76 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|build-golden> [flags]")
+}
+
+// runBuildGolden builds and self-verifies the golden VM image from a Cirrus base
+// over vsock. It needs no config (suitable for a bare host bootstrap): the
+// runner version defaults to the latest actions/runner release.
+func runBuildGolden(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("build-golden", flag.ExitOnError)
+	tartBin := fs.String("tart", "tart", "tart binary")
+	baseImage := fs.String("base-image", "ghcr.io/cirruslabs/macos-tahoe-base:latest", "Cirrus base image to clone")
+	goldenName := fs.String("golden", "gha-golden", "golden image name to (re)build")
+	buildVM := fs.String("build-vm", "gha-golden-build", "scratch VM name used during the build")
+	runnerVersion := fs.String("runner-version", "", "actions/runner version to install (default: latest)")
+	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "build-golden flag parse failed", "err", err)
+		return fmt.Errorf("build-golden flags: %w", err)
+	}
+
+	version := *runnerVersion
+	if version == "" {
+		resolved, err := resolveRunnerVersion(ctx)
+		if err != nil {
+			return err
+		}
+		version = resolved
+	}
+
+	builder := golden.New(tart.New(*tartBin))
+	if err := builder.Build(ctx, golden.Options{
+		BaseImage:     *baseImage,
+		GoldenName:    *goldenName,
+		BuildVM:       *buildVM,
+		RunnerVersion: version,
+	}); err != nil {
+		return fmt.Errorf("build-golden: %w", err)
+	}
+	slog.InfoContext(ctx, "golden build complete", "golden", *goldenName)
+	return nil
+}
+
+// runnerRelease is the subset of the actions/runner latest-release API response
+// the version resolver reads.
+type runnerRelease struct {
+	TagName string `json:"tag_name"`
+}
+
+// resolveRunnerVersion fetches the latest actions/runner release tag and returns
+// it without the leading "v".
+func resolveRunnerVersion(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/actions/runner/releases/latest", nil)
+	if err != nil {
+		slog.ErrorContext(ctx, "build request failed", "err", err)
+		return "", fmt.Errorf("build-golden: build request: %w", err)
+	}
+	client := &http.Client{Timeout: httpTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.ErrorContext(ctx, "resolve runner version request failed", "err", err)
+		return "", fmt.Errorf("build-golden: fetch latest runner: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("build-golden: latest runner status %d", resp.StatusCode)
+	}
+	var rel runnerRelease
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		slog.ErrorContext(ctx, "decode runner release failed", "err", err)
+		return "", fmt.Errorf("build-golden: decode runner release: %w", err)
+	}
+	return strings.TrimPrefix(rel.TagName, "v"), nil
 }
 
 // loadDeps loads config and builds the GitHub App client shared by subcommands.
