@@ -80,7 +80,11 @@ func DefaultConfigPath() string {
 	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
 		return filepath.Join(dir, "gha-mac-broker", "config.toml")
 	}
-	return filepath.Join(os.Getenv("HOME"), ".config", "gha-mac-broker", "config.toml")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, ".config", "gha-mac-broker", "config.toml")
 }
 
 // Load reads and validates a TOML config file.

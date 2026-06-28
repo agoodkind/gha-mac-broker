@@ -32,9 +32,11 @@ local checkout without network, set `GO_MK_DEV_DIR` in `config.mk`.
 
 ## Configure
 
-Copy `config.example.toml` to `~/.config/gha-mac-broker/config.toml` (the
-default XDG path) and fill in the App credentials and pool settings.
-Secrets are referenced by file path, never inlined.
+Copy `config.example.toml` to the default path and fill in the App credentials
+and pool settings. The default path is `$XDG_CONFIG_HOME/gha-mac-broker/config.toml`
+when `XDG_CONFIG_HOME` is set, otherwise `~/.config/gha-mac-broker/config.toml`;
+override it with `-config`. Secrets are referenced by absolute file path (no
+tilde expansion), never inlined.
 
 | Field | Meaning |
 | --- | --- |
