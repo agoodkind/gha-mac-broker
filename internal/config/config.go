@@ -4,9 +4,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 )
@@ -41,6 +43,13 @@ type AppConfig struct {
 	PrivateKeyPath string `json:"private_key_path"`
 	// WebhookSecretPath points to a file holding the webhook HMAC secret.
 	WebhookSecretPath string `json:"webhook_secret_path"`
+	// CapacityTokenPath points to a file holding the bearer token required
+	// on GET /capacity. When empty, /capacity is closed (401 fail-safe).
+	CapacityTokenPath string `json:"capacity_token_path"`
+	// WebhookCIDRsPath points to a file with one CIDR per line listing the
+	// IP ranges allowed to deliver webhook payloads. When empty or the list
+	// is empty after parsing, the IP guard is disabled (dev/local mode).
+	WebhookCIDRsPath string `json:"webhook_cidrs_path"`
 }
 
 // TartConfig configures the VM substrate.
@@ -83,7 +92,7 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) applyDefaults() {
 	if c.ListenAddr == "" {
-		c.ListenAddr = "127.0.0.1:8080"
+		c.ListenAddr = "[::1]:8080"
 	}
 	if c.Tart.Binary == "" {
 		c.Tart.Binary = "tart"
@@ -140,4 +149,49 @@ func (c *Config) ReadPrivateKey() ([]byte, error) {
 		return nil, fmt.Errorf("config: read private key %s: %w", c.App.PrivateKeyPath, err)
 	}
 	return key, nil
+}
+
+// ReadCapacityToken reads the bearer token required on GET /capacity. When
+// CapacityTokenPath is empty the method returns (nil, nil): the server then
+// treats /capacity as closed (401 fail-safe). Trailing line endings are
+// stripped so a file written by echo or printf works without extra care.
+func (c *Config) ReadCapacityToken() ([]byte, error) {
+	if c.App.CapacityTokenPath == "" {
+		return nil, nil
+	}
+	token, err := os.ReadFile(c.App.CapacityTokenPath)
+	if err != nil {
+		slog.Error("read capacity token failed", "err", err, "path", c.App.CapacityTokenPath)
+		return nil, fmt.Errorf("config: read capacity token %s: %w", c.App.CapacityTokenPath, err)
+	}
+	return bytes.TrimRight(token, "\r\n"), nil
+}
+
+// ReadWebhookCIDRs reads the allowed IP ranges for /webhook from the file at
+// WebhookCIDRsPath (one CIDR per line; blank lines are skipped). When the
+// path is empty the method returns (nil, nil) and the server disables the IP
+// guard so local/dev runs work without a CIDRs file.
+func (c *Config) ReadWebhookCIDRs() ([]*net.IPNet, error) {
+	if c.App.WebhookCIDRsPath == "" {
+		return nil, nil
+	}
+	raw, err := os.ReadFile(c.App.WebhookCIDRsPath)
+	if err != nil {
+		slog.Error("read webhook CIDRs failed", "err", err, "path", c.App.WebhookCIDRsPath)
+		return nil, fmt.Errorf("config: read webhook CIDRs %s: %w", c.App.WebhookCIDRsPath, err)
+	}
+	var nets []*net.IPNet
+	for line := range strings.SplitSeq(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		_, ipNet, parseErr := net.ParseCIDR(line)
+		if parseErr != nil {
+			slog.Error("parse webhook CIDR failed", "err", parseErr, "cidr", line)
+			return nil, fmt.Errorf("config: parse CIDR %q: %w", line, parseErr)
+		}
+		nets = append(nets, ipNet)
+	}
+	return nets, nil
 }

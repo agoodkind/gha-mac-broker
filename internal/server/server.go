@@ -6,11 +6,13 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -65,27 +67,37 @@ type capacityResponse struct {
 
 // Server handles the /webhook, /capacity, and /healthz endpoints.
 type Server struct {
-	mux    *http.ServeMux
-	secret []byte
-	cfg    *config.Config
-	pool   pooler
-	store  reserver
-	binder jobRunner
+	mux           *http.ServeMux
+	secret        []byte
+	capacityToken []byte
+	webhookCIDRs  []*net.IPNet
+	cfg           *config.Config
+	pool          pooler
+	store         reserver
+	binder        jobRunner
 }
 
 // New builds a Server and registers its routes on an internal mux.
-func New(secret []byte, cfg *config.Config, p pooler, store reserver, binder jobRunner) *Server {
+// capacityToken is the bearer token required on GET /capacity; a nil or empty
+// token closes the endpoint (401 fail-safe). webhookCIDRs is the IP allowlist
+// for POST /webhook; a nil or empty slice disables the IP guard.
+func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler, store reserver, binder jobRunner) *Server {
 	s := &Server{
-		mux:    http.NewServeMux(),
-		secret: secret,
-		cfg:    cfg,
-		pool:   p,
-		store:  store,
-		binder: binder,
+		mux:           http.NewServeMux(),
+		secret:        secret,
+		capacityToken: capacityToken,
+		webhookCIDRs:  webhookCIDRs,
+		cfg:           cfg,
+		pool:          p,
+		store:         store,
+		binder:        binder,
 	}
 	s.mux.HandleFunc("/webhook", s.handleWebhook)
 	s.mux.HandleFunc("/capacity", s.handleCapacity)
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	if len(webhookCIDRs) == 0 {
+		slog.Warn("webhook IP guard disabled: no CIDRs configured")
+	}
 	return s
 }
 
@@ -102,6 +114,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.checkWebhookIP(w, r) {
 		return
 	}
 	slog.DebugContext(r.Context(), "webhook received")
@@ -189,6 +204,13 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 // A missing or non-numeric run_id is rejected with 400 so a bad request
 // cannot create a phantom reservation that wastes a pool slot until TTL.
 func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.checkBearerToken(w, r) {
+		return
+	}
 	repo := r.URL.Query().Get("repo")
 	runID := r.URL.Query().Get("run_id")
 	slog.DebugContext(r.Context(), "capacity request", "repo", repo, "run_id", runID)
@@ -225,6 +247,71 @@ func (s *Server) hasLabel(jobLabels []string) bool {
 		}
 	}
 	return false
+}
+
+// checkBearerToken verifies the Authorization: Bearer <token> header against
+// the server's configured capacity token using a constant-time compare. An
+// empty configured token always returns false (401 fail-safe): a server with
+// no token configured never opens /capacity by accident.
+func (s *Server) checkBearerToken(w http.ResponseWriter, r *http.Request) bool {
+	if len(s.capacityToken) == 0 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	const bearerPrefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if len(auth) < len(bearerPrefix) || !strings.EqualFold(auth[:len(bearerPrefix)], bearerPrefix) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	provided := []byte(auth[len(bearerPrefix):])
+	if subtle.ConstantTimeCompare(provided, s.capacityToken) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+// checkWebhookIP extracts the real client IP from the request and confirms it
+// falls within one of the configured webhook CIDRs. When the CIDR list is
+// empty the check is skipped (dev/local mode); New logs that once at startup.
+// Returns false and writes a 403 response when the IP is not allowed.
+func (s *Server) checkWebhookIP(w http.ResponseWriter, r *http.Request) bool {
+	if len(s.webhookCIDRs) == 0 {
+		return true
+	}
+	ipStr := webhookClientIP(r)
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		slog.WarnContext(r.Context(), "webhook: unparseable client IP", "raw", ipStr)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	for _, cidr := range s.webhookCIDRs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	slog.WarnContext(r.Context(), "webhook: client IP not in allowlist", "ip", ipStr)
+	http.Error(w, "forbidden", http.StatusForbidden)
+	return false
+}
+
+// webhookClientIP returns the best-effort real client IP for a webhook
+// request. It prefers the CF-Connecting-IP header set by cloudflared, then
+// True-Client-IP, and falls back to the TCP RemoteAddr host.
+func webhookClientIP(r *http.Request) string {
+	if ip := r.Header.Get("Cf-Connecting-Ip"); ip != "" {
+		return ip
+	}
+	if ip := r.Header.Get("True-Client-Ip"); ip != "" {
+		return ip
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // writeJSON marshals payload and writes it as an application/json 200 response.

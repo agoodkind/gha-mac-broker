@@ -27,7 +27,7 @@ func TestLoadDefaultsAndAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.ListenAddr != "127.0.0.1:8080" {
+	if cfg.ListenAddr != "[::1]:8080" {
 		t.Errorf("default listen addr = %q", cfg.ListenAddr)
 	}
 	if cfg.PoolSize != 2 {
