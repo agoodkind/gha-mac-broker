@@ -182,7 +182,11 @@ func (b *Binder) bootCommand(ctx context.Context, vmName string) *exec.Cmd {
 	if b.cfg.Tart.CacheDir != "" {
 		dirs = []tart.DirMount{{Name: "cache", Path: b.cfg.Tart.CacheDir}}
 	}
-	return b.vm.BootCommand(ctx, vmName, tart.BootOptions{NoGraphics: true, Dirs: dirs})
+	return b.vm.BootCommand(ctx, vmName, tart.BootOptions{
+		NoGraphics:      true,
+		Dirs:            dirs,
+		BridgeInterface: b.cfg.Tart.BridgeInterface,
+	})
 }
 
 // generateJIT mints the repo-scoped JIT config for one job.

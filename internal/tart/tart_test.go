@@ -15,7 +15,7 @@ func TestLifecycleCommands(t *testing.T) {
 		}
 		return nil, nil
 	}
-	tt := New("tart")
+	tt := New("tart", "")
 	tt.run = stub
 	ctx := context.Background()
 
@@ -48,7 +48,7 @@ func TestListParsesNames(t *testing.T) {
 		}
 		return []byte(`[{"Name":"gha-golden","State":"stopped"},{"Name":"gha-runner-260628T170530-1","State":"running"}]`), nil
 	}
-	tt := New("tart")
+	tt := New("tart", "")
 	tt.run = stub
 	names, err := tt.List(context.Background())
 	if err != nil {
@@ -66,7 +66,7 @@ func TestListParsesNames(t *testing.T) {
 }
 
 func TestBootCommandArgs(t *testing.T) {
-	tt := New("tart")
+	tt := New("tart", "")
 	cmd := tt.BootCommand(context.Background(), "warm-1", BootOptions{
 		NoGraphics: true,
 		Dirs:       []DirMount{{Name: "cache", Path: "/Users/x/.tart/cache"}},
@@ -76,5 +76,35 @@ func TestBootCommandArgs(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("boot args %q missing %q", got, want)
 		}
+	}
+}
+
+func TestIPUsesResolver(t *testing.T) {
+	var gotArgs []string
+	stub := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte("fd00::1\n"), nil
+	}
+	tt := New("tart", "agent")
+	tt.run = stub
+	ip, err := tt.IP(context.Background(), "warm-1")
+	if err != nil {
+		t.Fatalf("IP: %v", err)
+	}
+	if ip != "fd00::1" {
+		t.Errorf("ip = %q, want fd00::1", ip)
+	}
+	joined := strings.Join(gotArgs, " ")
+	if !strings.Contains(joined, "ip warm-1") || !strings.Contains(joined, "--resolver agent") {
+		t.Errorf("ip args %q missing resolver", joined)
+	}
+}
+
+func TestBootCommandBridged(t *testing.T) {
+	tt := New("tart", "")
+	cmd := tt.BootCommand(context.Background(), "warm-1", BootOptions{NoGraphics: true, BridgeInterface: "en0"})
+	got := strings.Join(cmd.Args, " ")
+	if !strings.Contains(got, "--net-bridged=en0") {
+		t.Errorf("boot args %q missing --net-bridged=en0", got)
 	}
 }

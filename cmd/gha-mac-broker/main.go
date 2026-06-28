@@ -191,7 +191,7 @@ func runBind(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	vm := tart.New(cfg.Tart.Binary)
+	vm := tart.New(cfg.Tart.Binary, cfg.Tart.IPResolver)
 	ssh := vmssh.New(cfg.Tart.SSHUser, cfg.Tart.SSHKeyPath)
 	binder := broker.New(cfg, gh, vm, ssh)
 
@@ -242,7 +242,7 @@ func runServe(ctx context.Context, args []string) error {
 		return fmt.Errorf("serve: read webhook CIDRs: %w", err)
 	}
 
-	v := tart.New(cfg.Tart.Binary)
+	v := tart.New(cfg.Tart.Binary, cfg.Tart.IPResolver)
 	ssh := vmssh.New(cfg.Tart.SSHUser, cfg.Tart.SSHKeyPath)
 	binder := broker.New(cfg, gh, v, ssh)
 
