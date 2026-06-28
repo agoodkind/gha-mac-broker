@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,8 @@ type stubWarmer struct {
 	warmErr error
 	// failN makes the first failN calls return a transient error before succeeding.
 	failN int
+	swept int
+	ids   []string
 }
 
 func (s *stubWarmer) Warm(_ context.Context, id string) (*broker.WarmVM, error) {
@@ -31,6 +34,7 @@ func (s *stubWarmer) Warm(_ context.Context, id string) (*broker.WarmVM, error) 
 		return nil, errors.New("transient warm error")
 	}
 	s.warmed++
+	s.ids = append(s.ids, id)
 	return &broker.WarmVM{Name: "vm-" + id, Host: "127.0.0.1"}, nil
 }
 
@@ -38,6 +42,12 @@ func (s *stubWarmer) Teardown(_ context.Context, _ *broker.WarmVM) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.torn++
+}
+
+func (s *stubWarmer) SweepOrphans(_ context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.swept++
 }
 
 // waitFor polls cond every 10 ms until it returns true or 5 s elapses.
@@ -54,7 +64,7 @@ func waitFor(t *testing.T, cond func() bool) {
 
 func TestPoolFillsToSize(t *testing.T) {
 	w := &stubWarmer{}
-	p := New(2, w)
+	p := New(2, w, "test")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p.Start(ctx)
@@ -68,7 +78,7 @@ func TestPoolFillsToSize(t *testing.T) {
 
 func TestPoolLeaseDecrementsAndRefills(t *testing.T) {
 	w := &stubWarmer{}
-	p := New(2, w)
+	p := New(2, w, "test")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p.Start(ctx)
@@ -97,7 +107,7 @@ func TestPoolLeaseDecrementsAndRefills(t *testing.T) {
 
 func TestPoolRecycleTeardownAndRefill(t *testing.T) {
 	w := &stubWarmer{}
-	p := New(1, w)
+	p := New(1, w, "test")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p.Start(ctx)
@@ -124,7 +134,7 @@ func TestPoolRecycleTeardownAndRefill(t *testing.T) {
 
 func TestPoolShutdownTeardownsIdle(t *testing.T) {
 	w := &stubWarmer{}
-	p := New(2, w)
+	p := New(2, w, "test")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p.Start(ctx)
@@ -147,7 +157,7 @@ func TestPoolShutdownTeardownsIdle(t *testing.T) {
 
 func TestPoolLeaseContextCancelled(t *testing.T) {
 	w := &stubWarmer{warmErr: context.Canceled}
-	p := New(1, w)
+	p := New(1, w, "test")
 	ctx, cancel := context.WithCancel(context.Background())
 	p.Start(ctx)
 	cancel()
@@ -167,7 +177,7 @@ func TestPoolLeaseContextCancelled(t *testing.T) {
 // the pool permanently empty.
 func TestPoolRefillsAfterWarmFailure(t *testing.T) {
 	w := &stubWarmer{failN: 1}
-	p := New(1, w)
+	p := New(1, w, "test")
 	p.failDelay = 10 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -181,11 +191,34 @@ func TestPoolRefillsAfterWarmFailure(t *testing.T) {
 	})
 }
 
+// TestPoolSweepsAndNamesCarryRunToken verifies the pool sweeps orphans once on
+// start and that every VM id embeds the injected run token, so names stay
+// readable yet never collide across restarts.
+func TestPoolSweepsAndNamesCarryRunToken(t *testing.T) {
+	w := &stubWarmer{}
+	p := New(1, w, "tok123")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	waitFor(t, func() bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.swept >= 1 && len(w.ids) >= 1
+	})
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !strings.HasPrefix(w.ids[0], "tok123-") {
+		t.Fatalf("id %q should start with run token %q", w.ids[0], "tok123-")
+	}
+}
+
 func TestPoolFreeSlotsIncludesWarming(t *testing.T) {
 	// Use a blocking warmer so warming count stays > 0 during the check.
 	block := make(chan struct{})
 	bw := &blockingWarmer{block: block}
-	p := New(2, bw)
+	p := New(2, bw, "test")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p.Start(ctx)
@@ -222,3 +255,5 @@ func (b *blockingWarmer) Teardown(_ context.Context, _ *broker.WarmVM) {
 	defer b.mu.Unlock()
 	b.torn++
 }
+
+func (b *blockingWarmer) SweepOrphans(_ context.Context) {}

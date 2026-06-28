@@ -119,7 +119,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if !s.checkWebhookIP(w, r) {
 		return
 	}
-	slog.DebugContext(r.Context(), "webhook received")
+	slog.InfoContext(r.Context(), "webhook received")
 	body, ok := s.readVerifiedBody(w, r)
 	if !ok {
 		return
@@ -149,6 +149,7 @@ func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byt
 	}
 	sig := r.Header.Get("X-Hub-Signature-256")
 	if !verifySignature(s.secret, body, sig) {
+		slog.InfoContext(r.Context(), "webhook rejected", "reason", "bad signature")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
@@ -162,10 +163,12 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 	ctx := r.Context()
 	repo := payload.Repository.FullName
 	if !s.cfg.RepoAllowed(repo) {
+		slog.InfoContext(ctx, "webhook ignored", "reason", "repo not allowed", "repo", repo)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if !s.hasLabel(payload.WorkflowJob.Labels) {
+		slog.InfoContext(ctx, "webhook ignored", "reason", "no matching label", "repo", repo, "labels", payload.WorkflowJob.Labels)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}

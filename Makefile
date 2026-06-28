@@ -19,7 +19,7 @@ VPKG   := goodkind.io/gha-mac-broker/internal/version
 # BEFORE -include $(GO_MK).
 LAUNCHD_LABEL := io.goodkind.gha-mac-broker
 SYSTEMD_UNIT  := gha-mac-broker.service
-LOG_PATH      := $(or $(XDG_STATE_HOME),$(HOME)/.local/state)/gha-mac-broker/gha-mac-broker.log
+LOG_PATH      := $(HOME)/Library/Logs/gha-mac-broker.log
 BUNDLE_ID     ?= io.goodkind.gha-mac-broker
 
 # Pipeline modules. go-service.mk supplies service-install/uninstall/restart.

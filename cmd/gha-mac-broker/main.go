@@ -222,7 +222,7 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 
-	secret, err := os.ReadFile(cfg.App.WebhookSecretPath)
+	secret, err := cfg.ReadWebhookSecret()
 	if err != nil {
 		slog.ErrorContext(ctx, "read webhook secret failed", "err", err)
 		return fmt.Errorf("serve: read webhook secret: %w", err)
@@ -244,7 +244,12 @@ func runServe(ctx context.Context, args []string) error {
 	ssh := vmssh.New(cfg.Tart.SSHUser, cfg.Tart.SSHKeyPath)
 	binder := broker.New(cfg, gh, v, ssh)
 
-	p := pool.New(cfg.PoolSize, binder)
+	// runToken is a compact per-process timestamp embedded in every VM name so
+	// names stay readable yet never repeat across restarts or collide between
+	// two overlapping processes. Generated here at the main boundary where
+	// time.Now is permitted, then injected into the pool.
+	runToken := time.Now().Format("060102T150405")
+	p := pool.New(cfg.PoolSize, binder, runToken)
 	store := reservation.New()
 	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, store, binder)
 

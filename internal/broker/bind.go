@@ -60,6 +60,14 @@ func (b *Binder) Warm(ctx context.Context, id string) (*WarmVM, error) {
 	vmName := b.cfg.Tart.VMNamePrefix + "-" + id
 	slog.InfoContext(ctx, "warming vm", "vm", vmName)
 
+	// Idempotent clone: best-effort delete any pre-existing VM of this exact
+	// name before cloning, so the clone self-heals even if the startup sweep
+	// missed a VM or a same-instant run-token clash leaves a stale name. A
+	// "does not exist" error is the normal case and is logged at debug only.
+	if err := b.vm.Delete(ctx, vmName); err != nil {
+		slog.DebugContext(ctx, "pre-clone delete skipped (vm absent)", "err", err, "vm", vmName)
+	}
+
 	if err := b.vm.Clone(ctx, b.cfg.Tart.GoldenImage, vmName); err != nil {
 		slog.ErrorContext(ctx, "clone failed", "err", err, "vm", vmName)
 		return nil, fmt.Errorf("broker: clone %s: %w", vmName, err)
@@ -121,6 +129,33 @@ func (b *Binder) Teardown(ctx context.Context, vm *WarmVM) {
 		_ = vm.boot.Process.Kill()
 	}
 	b.teardown(ctx, vm.Name)
+}
+
+// SweepOrphans stops and deletes any leftover pool VMs from a previous broker
+// process. On a fresh start the pool owns no VMs, so every VM whose name
+// carries the pool prefix is an orphan (for example after a hard restart that
+// skipped graceful shutdown) and is torn down before the pool fills. The golden
+// image is named separately and never matches the prefix. Best effort: list and
+// teardown failures are logged, not returned.
+func (b *Binder) SweepOrphans(ctx context.Context) {
+	names, err := b.vm.List(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "orphan sweep: list failed", "err", err)
+		return
+	}
+	prefix := b.cfg.Tart.VMNamePrefix + "-"
+	swept := 0
+	for _, name := range names {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		slog.DebugContext(ctx, "orphan sweep: tearing down stale vm", "vm", name)
+		b.teardown(ctx, name)
+		swept++
+	}
+	if swept > 0 {
+		slog.InfoContext(ctx, "orphan sweep complete", "count", swept)
+	}
 }
 
 // BindOnce clones a warm VM, registers it as an ephemeral runner for repo,

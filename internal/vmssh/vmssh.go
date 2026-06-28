@@ -48,6 +48,12 @@ func (r *Runner) sshArgs(host string, extra ...string) []string {
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=5",
+		// BatchMode disables any interactive/askpass prompt and
+		// PreferredAuthentications limits auth to the key, so a missing or
+		// rejected key fails in seconds instead of hanging until the readiness
+		// timeout waiting on a prompt that never comes.
+		"-o", "BatchMode=yes",
+		"-o", "PreferredAuthentications=publickey",
 		r.user + "@" + host,
 	}
 	return append(args, extra...)
