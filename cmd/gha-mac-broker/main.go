@@ -8,22 +8,29 @@
 //	version            print version and exit
 //	jitconfig          mint a repo-scoped JIT runner config (proves App auth)
 //	bind               clone a warm VM, run one ephemeral job, tear it down
+//	serve              run the HTTP daemon with warm pool and webhook handler
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"goodkind.io/gha-mac-broker/internal/broker"
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
+	"goodkind.io/gha-mac-broker/internal/pool"
+	"goodkind.io/gha-mac-broker/internal/reservation"
+	"goodkind.io/gha-mac-broker/internal/server"
 	"goodkind.io/gha-mac-broker/internal/tart"
 	"goodkind.io/gha-mac-broker/internal/version"
 	"goodkind.io/gha-mac-broker/internal/vmssh"
@@ -36,10 +43,14 @@ const (
 	commandVersion   commandName = "version"
 	commandJITConfig commandName = "jitconfig"
 	commandBind      commandName = "bind"
+	commandServe     commandName = "serve"
 )
 
 // httpTimeout bounds GitHub API calls.
 const httpTimeout = 30 * time.Second
+
+// shutdownTimeout bounds the graceful HTTP shutdown.
+const shutdownTimeout = 30 * time.Second
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
@@ -60,6 +71,8 @@ func main() {
 		err = runJITConfig(ctx, args)
 	case commandBind:
 		err = runBind(ctx, args)
+	case commandServe:
+		err = runServe(ctx, args)
 	default:
 		usage()
 		os.Exit(2)
@@ -71,7 +84,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve> [flags]")
 }
 
 // loadDeps loads config and builds the GitHub App client shared by subcommands.
@@ -175,5 +188,85 @@ func runBind(ctx context.Context, args []string) error {
 	if err := binder.BindOnce(ctx, *repo, bindID); err != nil {
 		return fmt.Errorf("bind: %w", err)
 	}
+	return nil
+}
+
+// runServe loads config, builds the pool, reservation store, and HTTP server,
+// starts the fill loop, and listens until SIGINT or SIGTERM triggers a
+// graceful shutdown.
+func runServe(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	configPath := fs.String("config", "", "path to broker config JSON")
+	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "serve flag parse failed", "err", err)
+		return fmt.Errorf("serve flags: %w", err)
+	}
+	if *configPath == "" {
+		return fmt.Errorf("serve requires -config")
+	}
+
+	cfg, gh, err := loadDeps(ctx, *configPath)
+	if err != nil {
+		return err
+	}
+
+	secret, err := os.ReadFile(cfg.App.WebhookSecretPath)
+	if err != nil {
+		slog.ErrorContext(ctx, "read webhook secret failed", "err", err)
+		return fmt.Errorf("serve: read webhook secret: %w", err)
+	}
+
+	v := tart.New(cfg.Tart.Binary)
+	ssh := vmssh.New(cfg.Tart.SSHUser, cfg.Tart.SSHKeyPath)
+	binder := broker.New(cfg, gh, v, ssh)
+
+	p := pool.New(cfg.PoolSize, binder)
+	store := reservation.New()
+	srv := server.New(secret, cfg, p, store, binder)
+
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	p.Start(ctx)
+
+	httpSrv := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           srv,
+		ReadHeaderTimeout: httpTimeout,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(ctx, "server goroutine panic recovered", "err", fmt.Errorf("panic: %v", r))
+				errCh <- fmt.Errorf("serve: panic: %v", r)
+			}
+		}()
+		slog.InfoContext(ctx, "server listening", "addr", cfg.ListenAddr)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.ErrorContext(ctx, "server error", "err", err)
+			errCh <- fmt.Errorf("serve: listen: %w", err)
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case <-ctx.Done():
+		slog.InfoContext(ctx, "shutting down", "reason", ctx.Err())
+	case err := <-errCh:
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	shutCtx, shutCancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+	defer shutCancel()
+	if err := httpSrv.Shutdown(shutCtx); err != nil {
+		slog.WarnContext(shutCtx, "http shutdown error", "err", err)
+	}
+	p.Shutdown(shutCtx)
 	return nil
 }
