@@ -1,7 +1,8 @@
 // Package tart wraps the `tart` CLI to manage the lifecycle of ephemeral macOS
-// VMs: clone a golden image, boot it, read its IP, and tear it down. Commands
-// that complete and return output go through an injectable runner so they can be
-// unit tested; booting a VM is a long-lived process handled separately.
+// VMs: clone a golden image, boot it, run commands inside it over the guest
+// agent's vsock channel (no IP, no SSH), and tear it down. Commands that
+// complete and return output go through an injectable runner so they can be unit
+// tested; booting a VM is a long-lived process handled separately.
 package tart
 
 import (
@@ -20,19 +21,16 @@ type CommandRunner func(ctx context.Context, bin string, args ...string) ([]byte
 
 // Tart drives the tart binary. The run field is swappable in white-box tests.
 type Tart struct {
-	bin      string
-	resolver string
-	run      CommandRunner
+	bin string
+	run CommandRunner
 }
 
-// New returns a Tart that invokes the given binary (default "tart"). resolver is
-// the `tart ip --resolver` strategy ("dhcp"/"arp"/"agent"); an empty resolver
-// uses tart's default.
-func New(bin, resolver string) *Tart {
+// New returns a Tart that invokes the given binary (default "tart").
+func New(bin string) *Tart {
 	if bin == "" {
 		bin = "tart"
 	}
-	return &Tart{bin: bin, resolver: resolver, run: execRunner}
+	return &Tart{bin: bin, run: execRunner}
 }
 
 // command builds an [exec.Cmd] for the tart binary. Centralizing construction
@@ -85,22 +83,12 @@ func (t *Tart) Clone(ctx context.Context, source, name string) error {
 	return err
 }
 
-// IP returns the VM's IP address, using the configured resolver when set. The
-// "agent" resolver returns IPv6 addresses under bridged networking.
-func (t *Tart) IP(ctx context.Context, name string) (string, error) {
-	args := []string{"ip", name}
-	if t.resolver != "" {
-		args = append(args, "--resolver", t.resolver)
-	}
-	out, err := t.run(ctx, t.bin, args...)
-	if err != nil {
-		return "", err
-	}
-	ip := strings.TrimSpace(string(out))
-	if ip == "" {
-		return "", fmt.Errorf("tart: empty ip for %s", name)
-	}
-	return ip, nil
+// Exec runs a command inside a booted VM over the guest agent's vsock channel
+// (`tart exec <name> <argv...>`), with no IP and no SSH. It returns the combined
+// output; a non-zero guest exit code surfaces as an error.
+func (t *Tart) Exec(ctx context.Context, name string, argv ...string) ([]byte, error) {
+	args := append([]string{"exec", name}, argv...)
+	return t.run(ctx, t.bin, args...)
 }
 
 // Stop gracefully stops a running VM.
@@ -122,10 +110,6 @@ type BootOptions struct {
 	Dirs []DirMount
 	// NoGraphics runs the VM headless.
 	NoGraphics bool
-	// BridgeInterface, when set, boots the VM with bridged networking on that
-	// host interface (`--net-bridged=<iface>`) so the VM joins the host LAN and
-	// can obtain an IPv6 address. Empty uses tart's default shared NAT.
-	BridgeInterface string
 }
 
 // DirMount is one host directory shared into a VM.
@@ -142,9 +126,6 @@ func (t *Tart) BootCommand(ctx context.Context, name string, opts BootOptions) *
 	args := []string{"run", name}
 	if opts.NoGraphics {
 		args = append(args, "--no-graphics")
-	}
-	if opts.BridgeInterface != "" {
-		args = append(args, "--net-bridged="+opts.BridgeInterface)
 	}
 	for _, d := range opts.Dirs {
 		args = append(args, "--dir", d.Name+":"+d.Path)
