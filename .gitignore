@@ -4,3 +4,4 @@ dist/
 go.work
 go.work.sum
 config.mk
+.superpowers/
