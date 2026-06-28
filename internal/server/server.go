@@ -95,6 +95,9 @@ func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs [
 	s.mux.HandleFunc("/webhook", s.handleWebhook)
 	s.mux.HandleFunc("/capacity", s.handleCapacity)
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	if len(webhookCIDRs) == 0 {
+		slog.Warn("webhook IP guard disabled: no CIDRs configured")
+	}
 	return s
 }
 
@@ -201,6 +204,10 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 // A missing or non-numeric run_id is rejected with 400 so a bad request
 // cannot create a phantom reservation that wastes a pool slot until TTL.
 func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	if !s.checkBearerToken(w, r) {
 		return
 	}
@@ -253,11 +260,11 @@ func (s *Server) checkBearerToken(w http.ResponseWriter, r *http.Request) bool {
 	}
 	const bearerPrefix = "Bearer "
 	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, bearerPrefix) {
+	if len(auth) < len(bearerPrefix) || !strings.EqualFold(auth[:len(bearerPrefix)], bearerPrefix) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
-	provided := []byte(strings.TrimPrefix(auth, bearerPrefix))
+	provided := []byte(auth[len(bearerPrefix):])
 	if subtle.ConstantTimeCompare(provided, s.capacityToken) != 1 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
@@ -267,11 +274,10 @@ func (s *Server) checkBearerToken(w http.ResponseWriter, r *http.Request) bool {
 
 // checkWebhookIP extracts the real client IP from the request and confirms it
 // falls within one of the configured webhook CIDRs. When the CIDR list is
-// empty the check is skipped (dev/local mode) and a Warn is logged. Returns
-// false and writes a 403 response when the IP is not allowed.
+// empty the check is skipped (dev/local mode); New logs that once at startup.
+// Returns false and writes a 403 response when the IP is not allowed.
 func (s *Server) checkWebhookIP(w http.ResponseWriter, r *http.Request) bool {
 	if len(s.webhookCIDRs) == 0 {
-		slog.WarnContext(r.Context(), "webhook IP guard disabled: no CIDRs configured")
 		return true
 	}
 	ipStr := webhookClientIP(r)
