@@ -32,7 +32,8 @@ local checkout without network, set `GO_MK_DEV_DIR` in `config.mk`.
 
 ## Configure
 
-Copy `config.example.json` and fill in the App credentials and pool settings.
+Copy `config.example.toml` to `~/.config/gha-mac-broker/config.toml` (the
+default XDG path) and fill in the App credentials and pool settings.
 Secrets are referenced by file path, never inlined.
 
 | Field | Meaning |
@@ -50,8 +51,11 @@ Secrets are referenced by file path, never inlined.
 
 ```sh
 gha-mac-broker version
-gha-mac-broker jitconfig -config config.json -repo agoodkind/lmd
-gha-mac-broker bind      -config config.json -repo agoodkind/lmd
+gha-mac-broker jitconfig -repo agoodkind/lmd
+gha-mac-broker bind      -repo agoodkind/lmd
+gha-mac-broker serve
+# override the default XDG path with -config:
+gha-mac-broker serve -config /path/to/config.toml
 ```
 
 - `jitconfig` mints a repo-scoped JIT runner config and prints it. It exercises

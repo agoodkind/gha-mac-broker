@@ -9,7 +9,7 @@ import (
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
+	path := filepath.Join(dir, "config.toml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -17,11 +17,16 @@ func writeConfig(t *testing.T, body string) string {
 }
 
 func TestLoadDefaultsAndAllowlist(t *testing.T) {
-	path := writeConfig(t, `{
-		"app": {"app_id": "12345", "private_key_path": "/tmp/key.pem"},
-		"tart": {"golden_image": "gha-golden"},
-		"allowed_repos": ["agoodkind/lmd", "agoodkind/swift-makefile"]
-	}`)
+	path := writeConfig(t, `
+allowed_repos = ["agoodkind/lmd", "agoodkind/swift-makefile"]
+
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[tart]
+golden_image = "gha-golden"
+`)
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -45,7 +50,10 @@ func TestLoadDefaultsAndAllowlist(t *testing.T) {
 }
 
 func TestLoadMissingRequired(t *testing.T) {
-	path := writeConfig(t, `{"app": {"app_id": "12345"}}`)
+	path := writeConfig(t, `
+[app]
+app_id = "12345"
+`)
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for missing required fields")
