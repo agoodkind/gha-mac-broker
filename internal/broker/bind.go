@@ -1,8 +1,9 @@
-// Package broker orchestrates a single just-in-time runner bind: it clones a
-// warm VM from the golden image, boots it, mints a repo-scoped JIT runner
-// config, injects it over SSH so the VM runs exactly one ephemeral job, then
-// tears the VM down. The warm pool and webhook server in later phases drive this
-// same BindOnce primitive.
+// Package broker orchestrates just-in-time runner binds against warm Tart VMs.
+// The Binder can clone, boot, and SSH-probe a VM (Warm), run a single
+// ephemeral GitHub Actions job on it (RunJob), and tear it down (Teardown).
+// BindOnce composes these three steps into one synchronous call and is used by
+// the bind CLI command. The pool drives Warm and Teardown directly; the webhook
+// server drives RunJob.
 package broker
 
 import (
@@ -28,7 +29,17 @@ const readinessInterval = 2 * time.Second
 // runnerHome is where the golden image keeps the GitHub Actions runner.
 const runnerHome = "~/actions-runner"
 
-// Binder performs single JIT runner binds against a warm VM substrate.
+// WarmVM is a booted, SSH-ready VM that has not yet been bound to a job.
+// Name and Host are safe to read from any goroutine once Warm returns.
+type WarmVM struct {
+	// Name is the tart VM name used to stop and delete the VM.
+	Name string
+	// Host is the IP address the VM is reachable on over SSH.
+	Host string
+	boot *exec.Cmd
+}
+
+// Binder performs JIT runner binds against a warm VM substrate.
 type Binder struct {
 	cfg *config.Config
 	gh  *ghapp.Client
@@ -41,10 +52,45 @@ func New(cfg *config.Config, gh *ghapp.Client, vm *tart.Tart, ssh *vmssh.Runner)
 	return &Binder{cfg: cfg, gh: gh, vm: vm, ssh: ssh}
 }
 
-// BindOnce clones a warm VM, registers it as an ephemeral runner for repo, runs
-// one job, and tears the VM down. id makes the VM and runner names unique. repo
-// is owner/repo and must be in the allowlist.
-func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
+// Warm clones the golden image to a prefixed name derived from id, boots the
+// VM, and waits until it accepts SSH. On any failure, Warm tears down the
+// partial VM before returning the error; the caller owns teardown only on
+// success.
+func (b *Binder) Warm(ctx context.Context, id string) (*WarmVM, error) {
+	vmName := b.cfg.Tart.VMNamePrefix + "-" + id
+	slog.InfoContext(ctx, "warming vm", "vm", vmName)
+
+	if err := b.vm.Clone(ctx, b.cfg.Tart.GoldenImage, vmName); err != nil {
+		slog.ErrorContext(ctx, "clone failed", "err", err, "vm", vmName)
+		return nil, fmt.Errorf("broker: clone %s: %w", vmName, err)
+	}
+
+	bootCmd := b.bootCommand(ctx, vmName)
+	if err := bootCmd.Start(); err != nil {
+		slog.ErrorContext(ctx, "vm boot failed", "err", err, "vm", vmName)
+		b.teardown(ctx, vmName)
+		return nil, fmt.Errorf("broker: boot %s: %w", vmName, err)
+	}
+
+	host, err := b.waitForIP(ctx, vmName)
+	if err != nil {
+		_ = bootCmd.Process.Kill()
+		b.teardown(ctx, vmName)
+		return nil, err
+	}
+	if err := b.waitForSSH(ctx, host); err != nil {
+		_ = bootCmd.Process.Kill()
+		b.teardown(ctx, vmName)
+		return nil, err
+	}
+
+	return &WarmVM{Name: vmName, Host: host, boot: bootCmd}, nil
+}
+
+// RunJob checks the allowlist, mints a JIT config, and ssh-runs one ephemeral
+// GitHub Actions job on the given warm VM. runnerName is used as the runner
+// registration name.
+func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo, runnerName string) error {
 	owner, repoName, ok := strings.Cut(repo, "/")
 	if !ok {
 		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
@@ -53,46 +99,46 @@ func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
 		return fmt.Errorf("broker: repo %s is not in allowed_repos", repo)
 	}
 
-	vmName := b.cfg.Tart.VMNamePrefix + "-" + id
-	runnerName := vmName
-	slog.InfoContext(ctx, "bind starting", "repo", repo, "vm", vmName)
-
-	if err := b.vm.Clone(ctx, b.cfg.Tart.GoldenImage, vmName); err != nil {
-		return fmt.Errorf("broker: clone %s: %w", vmName, err)
-	}
-	defer b.teardown(ctx, vmName)
-
-	bootCmd := b.bootCommand(ctx, vmName)
-	if err := bootCmd.Start(); err != nil {
-		slog.ErrorContext(ctx, "vm boot failed", "err", err, "vm", vmName)
-		return fmt.Errorf("broker: boot %s: %w", vmName, err)
-	}
-	defer func() {
-		if bootCmd.Process != nil {
-			_ = bootCmd.Process.Kill()
-		}
-	}()
-
-	host, err := b.waitForIP(ctx, vmName)
-	if err != nil {
-		return err
-	}
-	if err := b.waitForSSH(ctx, host); err != nil {
-		return err
-	}
-
 	jit, err := b.generateJIT(ctx, owner, repoName, runnerName)
 	if err != nil {
 		return err
 	}
 
 	remote := fmt.Sprintf("cd %s && ./run.sh --jitconfig %s", runnerHome, jit.EncodedJITConfig)
-	slog.InfoContext(ctx, "running ephemeral job", "repo", repo, "vm", vmName, "runner", jit.Runner.Name)
-	if _, err := b.ssh.Run(ctx, host, remote); err != nil {
-		return fmt.Errorf("broker: run job on %s: %w", vmName, err)
+	slog.InfoContext(ctx, "running ephemeral job", "repo", repo, "vm", vm.Name, "runner", jit.Runner.Name)
+	if _, err := b.ssh.Run(ctx, vm.Host, remote); err != nil {
+		slog.ErrorContext(ctx, "job run failed", "err", err, "vm", vm.Name)
+		return fmt.Errorf("broker: run job on %s: %w", vm.Name, err)
 	}
-	slog.InfoContext(ctx, "bind complete", "repo", repo, "vm", vmName)
+	slog.InfoContext(ctx, "job complete", "repo", repo, "vm", vm.Name)
 	return nil
+}
+
+// Teardown kills the boot process if it is still running, then stops and
+// deletes the VM. It is best effort; errors are logged at Warn level.
+func (b *Binder) Teardown(ctx context.Context, vm *WarmVM) {
+	if vm.boot != nil && vm.boot.Process != nil {
+		_ = vm.boot.Process.Kill()
+	}
+	b.teardown(ctx, vm.Name)
+}
+
+// BindOnce clones a warm VM, registers it as an ephemeral runner for repo,
+// runs one job, and tears the VM down. id makes the VM and runner names
+// unique. repo is owner/repo and must be in the allowlist.
+func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
+	if _, _, ok := strings.Cut(repo, "/"); !ok {
+		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
+	}
+	if !b.cfg.RepoAllowed(repo) {
+		return fmt.Errorf("broker: repo %s is not in allowed_repos", repo)
+	}
+	vm, err := b.Warm(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer b.Teardown(ctx, vm)
+	return b.RunJob(ctx, vm, repo, vm.Name)
 }
 
 // bootCommand builds the headless boot command with the cache dir mounted.
@@ -113,10 +159,12 @@ func (b *Binder) generateJIT(ctx context.Context, owner, repoName, runnerName st
 	}
 	token, err := b.gh.InstallationToken(ctx, installationID, repoName)
 	if err != nil {
+		slog.ErrorContext(ctx, "installation token failed", "err", err, "repo", owner+"/"+repoName)
 		return nil, fmt.Errorf("broker: installation token: %w", err)
 	}
 	jit, err := b.gh.GenerateJITConfig(ctx, token, owner, repoName, runnerName, b.cfg.Labels)
 	if err != nil {
+		slog.ErrorContext(ctx, "generate jitconfig failed", "err", err, "repo", owner+"/"+repoName)
 		return nil, fmt.Errorf("broker: generate jitconfig: %w", err)
 	}
 	return jit, nil
