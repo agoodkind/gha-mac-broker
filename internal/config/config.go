@@ -189,6 +189,9 @@ func (c *Config) ReadCapacityToken() ([]byte, error) {
 // The path is required; an empty or unreadable path is an error so the server
 // never starts with an unverifiable webhook.
 func (c *Config) ReadWebhookSecret() ([]byte, error) {
+	if c.App.WebhookSecretPath == "" {
+		return nil, fmt.Errorf("config: webhook_secret_path is required")
+	}
 	secret, err := os.ReadFile(c.App.WebhookSecretPath)
 	if err != nil {
 		slog.Error("read webhook secret failed", "err", err, "path", c.App.WebhookSecretPath)

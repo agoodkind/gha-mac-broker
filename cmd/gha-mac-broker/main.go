@@ -13,6 +13,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -244,11 +246,17 @@ func runServe(ctx context.Context, args []string) error {
 	ssh := vmssh.New(cfg.Tart.SSHUser, cfg.Tart.SSHKeyPath)
 	binder := broker.New(cfg, gh, v, ssh)
 
-	// runToken is a compact per-process timestamp embedded in every VM name so
-	// names stay readable yet never repeat across restarts or collide between
-	// two overlapping processes. Generated here at the main boundary where
-	// time.Now is permitted, then injected into the pool.
-	runToken := time.Now().Format("060102T150405")
+	// runToken is embedded in every VM name so names stay readable yet never
+	// repeat across restarts or collide between overlapping processes. It pairs
+	// a compact timestamp (readable, sortable) with random entropy so two
+	// processes that start within the same second still get distinct names.
+	// Generated here at the main boundary where time.Now is permitted.
+	var entropy [3]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		slog.ErrorContext(ctx, "generate run token entropy failed", "err", err)
+		return fmt.Errorf("serve: generate run token entropy: %w", err)
+	}
+	runToken := time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:])
 	p := pool.New(cfg.PoolSize, binder, runToken)
 	store := reservation.New()
 	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, store, binder)
