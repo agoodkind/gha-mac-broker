@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,8 @@ type stubWarmer struct {
 	warmed  int
 	torn    int
 	warmErr error
+	// failN makes the first failN calls return a transient error before succeeding.
+	failN int
 }
 
 func (s *stubWarmer) Warm(_ context.Context, id string) (*broker.WarmVM, error) {
@@ -22,6 +25,10 @@ func (s *stubWarmer) Warm(_ context.Context, id string) (*broker.WarmVM, error) 
 	defer s.mu.Unlock()
 	if s.warmErr != nil {
 		return nil, s.warmErr
+	}
+	if s.failN > 0 {
+		s.failN--
+		return nil, errors.New("transient warm error")
 	}
 	s.warmed++
 	return &broker.WarmVM{Name: "vm-" + id, Host: "127.0.0.1"}, nil
@@ -151,6 +158,27 @@ func TestPoolLeaseContextCancelled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when leasing with cancelled context")
 	}
+}
+
+// TestPoolRefillsAfterWarmFailure verifies that a size-1 pool recovers to full
+// capacity after a single warm failure. Without the fix, the failing goroutine
+// calls sendRefill while warming is still 1, tryFill computes need=0 and skips
+// spawning, and after the deferred decrement no further refill is sent, leaving
+// the pool permanently empty.
+func TestPoolRefillsAfterWarmFailure(t *testing.T) {
+	w := &stubWarmer{failN: 1}
+	p := New(1, w)
+	p.failDelay = 10 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	// Pool must reach one warm VM despite the initial failure.
+	waitFor(t, func() bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.warmed >= 1
+	})
 }
 
 func TestPoolFreeSlotsIncludesWarming(t *testing.T) {

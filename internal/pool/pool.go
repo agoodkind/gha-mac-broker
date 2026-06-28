@@ -30,30 +30,32 @@ type Warmer interface {
 // Pool keeps up to size idle warm VMs and refills as VMs are leased or
 // recycled. Start must be called once before Lease.
 type Pool struct {
-	size    int
-	warmer  Warmer
-	idle    chan *broker.WarmVM
-	refill  chan struct{}
-	done    chan struct{}
-	mu      sync.Mutex
-	warming int
-	counter atomic.Int64
-	wg      sync.WaitGroup
+	size      int
+	warmer    Warmer
+	idle      chan *broker.WarmVM
+	refill    chan struct{}
+	done      chan struct{}
+	mu        sync.Mutex
+	warming   int
+	counter   atomic.Int64
+	wg        sync.WaitGroup
+	failDelay time.Duration // overrides warmFailDelay in tests; zero uses warmFailDelay
 }
 
 // New returns a Pool of the given size backed by the given Warmer. Call Start
 // to begin the fill loop.
 func New(size int, w Warmer) *Pool {
 	return &Pool{
-		size:    size,
-		warmer:  w,
-		idle:    make(chan *broker.WarmVM, size),
-		refill:  make(chan struct{}, 1),
-		done:    make(chan struct{}),
-		mu:      sync.Mutex{},
-		warming: 0,
-		counter: atomic.Int64{},
-		wg:      sync.WaitGroup{},
+		size:      size,
+		warmer:    w,
+		idle:      make(chan *broker.WarmVM, size),
+		refill:    make(chan struct{}, 1),
+		done:      make(chan struct{}),
+		mu:        sync.Mutex{},
+		warming:   0,
+		counter:   atomic.Int64{},
+		wg:        sync.WaitGroup{},
+		failDelay: 0,
 	}
 }
 
@@ -165,31 +167,50 @@ func (p *Pool) tryFill(ctx context.Context) {
 
 // warmOne calls Warm, decrements the warming counter, and sends the result to
 // idle (or tears it down if the pool is shutting down).
+//
+// warming is decremented explicitly on every path, always before any
+// sendRefill call, so tryFill observes the correct in-flight count.
 func (p *Pool) warmOne(ctx context.Context, id string) {
 	defer p.wg.Done()
-	defer func() {
-		p.mu.Lock()
-		p.warming--
-		p.mu.Unlock()
-	}()
 
 	vm, err := p.warmer.Warm(ctx, id)
 	if err != nil {
 		slog.WarnContext(ctx, "warm failed", "err", err, "id", id)
 		// Back off before signalling a refill so a persistent Warm failure
 		// (e.g. tart missing or image unavailable) does not spin goroutines.
-		retryTimer := time.NewTimer(warmFailDelay)
+		delay := p.failDelay
+		if delay == 0 {
+			delay = warmFailDelay
+		}
+		retryTimer := time.NewTimer(delay)
 		defer retryTimer.Stop()
 		select {
 		case <-retryTimer.C:
 		case <-p.done:
+			p.mu.Lock()
+			p.warming--
+			p.mu.Unlock()
 			return
 		case <-ctx.Done():
+			p.mu.Lock()
+			p.warming--
+			p.mu.Unlock()
 			return
 		}
+		// Decrement before sending the refill signal so tryFill sees the
+		// correct warming count and spawns a replacement goroutine.
+		p.mu.Lock()
+		p.warming--
+		p.mu.Unlock()
 		p.sendRefill()
 		return
 	}
+
+	// Decrement before placing the VM into idle so that a concurrent Lease
+	// (which calls sendRefill) triggers tryFill with the correct count.
+	p.mu.Lock()
+	p.warming--
+	p.mu.Unlock()
 
 	select {
 	case p.idle <- vm:
