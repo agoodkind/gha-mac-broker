@@ -1,77 +1,93 @@
-// Package config loads the broker configuration from a JSON file. Secret values
-// are referenced by file path, never inlined, so the App private key and webhook
-// secret stay out of the config file, logs, and process arguments.
+// Package config loads the broker configuration from a TOML file. Secret
+// values are referenced by file path, never inlined, so the App private key
+// and webhook secret stay out of the config file, logs, and process arguments.
 package config
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 // Config is the broker's runtime configuration.
 type Config struct {
 	// ListenAddr is the address the webhook and capacity server binds to.
-	ListenAddr string `json:"listen_addr"`
+	ListenAddr string `toml:"listen_addr"`
 
 	// App identifies the GitHub App and where its private key lives.
-	App AppConfig `json:"app"`
+	App AppConfig `toml:"app"`
 
 	// Tart configures the VM pool substrate.
-	Tart TartConfig `json:"tart"`
+	Tart TartConfig `toml:"tart"`
 
 	// Labels are the runner labels every JIT runner registers with. The
 	// self-hosted job in CI targets one of these.
-	Labels []string `json:"labels"`
+	Labels []string `toml:"labels"`
 
 	// AllowedRepos is the owner/repo allowlist the broker will serve. A queued
 	// job for any other repository is ignored.
-	AllowedRepos []string `json:"allowed_repos"`
+	AllowedRepos []string `toml:"allowed_repos"`
 
 	// PoolSize is the number of warm VMs kept booted and idle.
-	PoolSize int `json:"pool_size"`
+	PoolSize int `toml:"pool_size"`
 }
 
 // AppConfig holds GitHub App identity and secret references.
 type AppConfig struct {
-	AppID string `json:"app_id"`
+	AppID string `toml:"app_id"`
 	// PrivateKeyPath points to the PEM private key on disk.
-	PrivateKeyPath string `json:"private_key_path"`
+	PrivateKeyPath string `toml:"private_key_path"`
 	// WebhookSecretPath points to a file holding the webhook HMAC secret.
-	WebhookSecretPath string `json:"webhook_secret_path"`
+	WebhookSecretPath string `toml:"webhook_secret_path"`
 	// CapacityTokenPath points to a file holding the bearer token required
 	// on GET /capacity. When empty, /capacity is closed (401 fail-safe).
-	CapacityTokenPath string `json:"capacity_token_path"`
+	CapacityTokenPath string `toml:"capacity_token_path"`
 	// WebhookCIDRsPath points to a file with one CIDR per line listing the
 	// IP ranges allowed to deliver webhook payloads. When empty or the list
 	// is empty after parsing, the IP guard is disabled (dev/local mode).
-	WebhookCIDRsPath string `json:"webhook_cidrs_path"`
+	WebhookCIDRsPath string `toml:"webhook_cidrs_path"`
 }
 
 // TartConfig configures the VM substrate.
 type TartConfig struct {
 	// Binary is the tart executable (default "tart").
-	Binary string `json:"binary"`
+	Binary string `toml:"binary"`
 	// GoldenImage is the source VM the pool clones. It has the runner binary
 	// installed but unconfigured.
-	GoldenImage string `json:"golden_image"`
+	GoldenImage string `toml:"golden_image"`
 	// VMNamePrefix prefixes ephemeral clone names.
-	VMNamePrefix string `json:"vm_name_prefix"`
+	VMNamePrefix string `toml:"vm_name_prefix"`
 	// CacheDir is a host directory shared into each VM so the build cache
 	// survives VM deletion.
-	CacheDir string `json:"cache_dir"`
+	CacheDir string `toml:"cache_dir"`
 	// SSHKeyPath is the private key the broker uses to control the VM over
 	// SSH. Its public half is baked into the golden image.
-	SSHKeyPath string `json:"ssh_key_path"`
+	SSHKeyPath string `toml:"ssh_key_path"`
 	// SSHUser is the account the golden image exposes for runner control.
-	SSHUser string `json:"ssh_user"`
+	SSHUser string `toml:"ssh_user"`
 }
 
-// Load reads and validates a JSON config file.
+// DefaultConfigPath returns the XDG-aware default config file path:
+// $XDG_CONFIG_HOME/gha-mac-broker/config.toml, falling back to
+// $HOME/.config/gha-mac-broker/config.toml when XDG_CONFIG_HOME is unset.
+func DefaultConfigPath() string {
+	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
+		return filepath.Join(dir, "gha-mac-broker", "config.toml")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, ".config", "gha-mac-broker", "config.toml")
+}
+
+// Load reads and validates a TOML config file.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -79,7 +95,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
 	var cfg Config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
+	if err := toml.Unmarshal(raw, &cfg); err != nil {
 		slog.Error("config parse failed", "err", err, "path", path)
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}

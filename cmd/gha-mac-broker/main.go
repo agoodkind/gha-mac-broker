@@ -120,15 +120,18 @@ func loadDeps(ctx context.Context, configPath string) (*config.Config, *ghapp.Cl
 // permissions can be verified against live GitHub before the pool exists.
 func runJITConfig(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("jitconfig", flag.ExitOnError)
-	configPath := fs.String("config", "", "path to broker config JSON")
+	configPath := fs.String("config", "", "path to broker config TOML (default: XDG path)")
 	repo := fs.String("repo", "", "target repository as owner/repo")
 	name := fs.String("name", "gha-mac-broker-probe", "runner name to register")
 	if err := fs.Parse(args); err != nil {
 		slog.ErrorContext(ctx, "jitconfig flag parse failed", "err", err)
 		return fmt.Errorf("jitconfig flags: %w", err)
 	}
-	if *configPath == "" || *repo == "" {
-		return fmt.Errorf("jitconfig requires -config and -repo")
+	if *configPath == "" {
+		*configPath = config.DefaultConfigPath()
+	}
+	if *repo == "" {
+		return fmt.Errorf("jitconfig requires -repo")
 	}
 	owner, repoName, ok := strings.Cut(*repo, "/")
 	if !ok {
@@ -168,15 +171,18 @@ func runJITConfig(ctx context.Context, args []string) error {
 // golden image exists.
 func runBind(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("bind", flag.ExitOnError)
-	configPath := fs.String("config", "", "path to broker config JSON")
+	configPath := fs.String("config", "", "path to broker config TOML (default: XDG path)")
 	repo := fs.String("repo", "", "target repository as owner/repo")
 	id := fs.String("id", "", "unique id for the VM and runner name (default: timestamp)")
 	if err := fs.Parse(args); err != nil {
 		slog.ErrorContext(ctx, "bind flag parse failed", "err", err)
 		return fmt.Errorf("bind flags: %w", err)
 	}
-	if *configPath == "" || *repo == "" {
-		return fmt.Errorf("bind requires -config and -repo")
+	if *configPath == "" {
+		*configPath = config.DefaultConfigPath()
+	}
+	if *repo == "" {
+		return fmt.Errorf("bind requires -repo")
 	}
 
 	cfg, gh, err := loadDeps(ctx, *configPath)
@@ -202,13 +208,13 @@ func runBind(ctx context.Context, args []string) error {
 // graceful shutdown.
 func runServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	configPath := fs.String("config", "", "path to broker config JSON")
+	configPath := fs.String("config", "", "path to broker config TOML (default: XDG path)")
 	if err := fs.Parse(args); err != nil {
 		slog.ErrorContext(ctx, "serve flag parse failed", "err", err)
 		return fmt.Errorf("serve flags: %w", err)
 	}
 	if *configPath == "" {
-		return fmt.Errorf("serve requires -config")
+		*configPath = config.DefaultConfigPath()
 	}
 
 	cfg, gh, err := loadDeps(ctx, *configPath)

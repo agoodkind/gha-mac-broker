@@ -1,0 +1,30 @@
+listen_addr = "[::1]:8080"
+
+labels    = ["self-hosted", "macOS", "ARM64", "agk-local-macos-26"]
+pool_size = 2
+
+allowed_repos = [
+  "agoodkind/lmd",
+  "agoodkind/iphone-cell-tunnel",
+  "agoodkind/macos-fan-curve",
+  "agoodkind/macos-smc-fan",
+  "agoodkind/stickies-improved",
+  "agoodkind/swift-makefile",
+]
+
+# Paths are read verbatim with no shell tilde expansion, so use absolute paths
+# (replace "you" with your username).
+[app]
+app_id              = "REPLACE_WITH_APP_ID"
+private_key_path    = "/Users/you/.config/gha-mac-broker/app-private-key.pem"
+webhook_secret_path = "/Users/you/.config/gha-mac-broker/webhook-secret"
+capacity_token_path = "/Users/you/.config/gha-mac-broker/capacity-token"
+webhook_cidrs_path  = "/Users/you/.config/gha-mac-broker/github-webhook-cidrs.txt"
+
+[tart]
+binary         = "tart"
+golden_image   = "gha-golden"
+vm_name_prefix = "gha-runner"
+cache_dir      = "/Users/you/.tart/cache"
+ssh_key_path   = "/Users/you/.config/gha-mac-broker/id_broker"
+ssh_user       = "admin"
