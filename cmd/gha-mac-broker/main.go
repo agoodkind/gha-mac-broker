@@ -222,13 +222,25 @@ func runServe(ctx context.Context, args []string) error {
 		return fmt.Errorf("serve: read webhook secret: %w", err)
 	}
 
+	capacityToken, err := cfg.ReadCapacityToken()
+	if err != nil {
+		slog.ErrorContext(ctx, "read capacity token failed", "err", err)
+		return fmt.Errorf("serve: read capacity token: %w", err)
+	}
+
+	webhookCIDRs, err := cfg.ReadWebhookCIDRs()
+	if err != nil {
+		slog.ErrorContext(ctx, "read webhook CIDRs failed", "err", err)
+		return fmt.Errorf("serve: read webhook CIDRs: %w", err)
+	}
+
 	v := tart.New(cfg.Tart.Binary)
 	ssh := vmssh.New(cfg.Tart.SSHUser, cfg.Tart.SSHKeyPath)
 	binder := broker.New(cfg, gh, v, ssh)
 
 	p := pool.New(cfg.PoolSize, binder)
 	store := reservation.New()
-	srv := server.New(secret, cfg, p, store, binder)
+	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, store, binder)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

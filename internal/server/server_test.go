@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -77,11 +78,20 @@ func (r *testRunner) RunJob(_ context.Context, _ *broker.WarmVM, _, _ string) er
 // testSecret is the webhook HMAC secret used across all handler tests.
 var testSecret = []byte("test-secret")
 
+// testCapacityToken is the bearer token used across capacity handler tests.
+var testCapacityToken = []byte("test-capacity-token")
+
 // newTestConfig returns a minimal config with one allowed repo and labels.
 func newTestConfig(allowedRepo string) *config.Config {
 	return &config.Config{
-		ListenAddr:   ":8080",
-		App:          config.AppConfig{AppID: "1", PrivateKeyPath: "/tmp/key", WebhookSecretPath: "/tmp/secret"},
+		ListenAddr: ":8080",
+		App: config.AppConfig{
+			AppID:             "1",
+			PrivateKeyPath:    "/tmp/key",
+			WebhookSecretPath: "/tmp/secret",
+			CapacityTokenPath: "",
+			WebhookCIDRsPath:  "",
+		},
 		Tart:         config.TartConfig{Binary: "tart", GoldenImage: "golden", VMNamePrefix: "gha", SSHKeyPath: "/tmp/id_rsa", SSHUser: "admin", CacheDir: ""},
 		Labels:       []string{"self-hosted", "macOS"},
 		AllowedRepos: []string{allowedRepo},
@@ -145,7 +155,7 @@ func webhookBody(action, repo string, labels []string, runID int64) []byte {
 }
 
 func TestWebhookBadSignatureReturns401(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 42)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-Hub-Signature-256", "sha256=badbadbadbad")
@@ -157,7 +167,7 @@ func TestWebhookBadSignatureReturns401(t *testing.T) {
 }
 
 func TestWebhookNonQueuedReturns204(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
 	body := webhookBody("in_progress", "owner/repo", []string{"self-hosted"}, 42)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-Hub-Signature-256", signBody(body))
@@ -169,7 +179,7 @@ func TestWebhookNonQueuedReturns204(t *testing.T) {
 }
 
 func TestWebhookDisallowedRepoReturns204(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{freeSlots: 2}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{freeSlots: 2}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
 	body := webhookBody("queued", "other/repo", []string{"self-hosted"}, 99)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-Hub-Signature-256", signBody(body))
@@ -181,7 +191,7 @@ func TestWebhookDisallowedRepoReturns204(t *testing.T) {
 }
 
 func TestWebhookNoMatchingLabelReturns204(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{freeSlots: 2}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{freeSlots: 2}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
 	body := webhookBody("queued", "owner/repo", []string{"ubuntu-latest"}, 99)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-Hub-Signature-256", signBody(body))
@@ -196,7 +206,7 @@ func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
 	vm := &broker.WarmVM{Name: "vm-1", Host: "127.0.0.1"}
 	pool := &testPool{freeSlots: 2, leaseVM: vm}
 	runner := &testRunner{ran: make(chan struct{}, 1)}
-	srv := New(testSecret, newTestConfig("owner/repo"), pool, &testStore{}, runner)
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool, &testStore{}, runner)
 
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 7)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
@@ -217,7 +227,7 @@ func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
 }
 
 func TestWebhookNonPostMethodReturns405(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 42)
 	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
 		req := httptest.NewRequest(method, "/webhook", strings.NewReader(string(body)))
@@ -233,8 +243,9 @@ func TestWebhookNonPostMethodReturns405(t *testing.T) {
 // --- capacity handler tests ---
 
 func TestCapacityDisallowedRepo(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=other/repo&run_id=1", nil)
+	req.Header.Set("Authorization", "Bearer test-capacity-token")
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -250,8 +261,9 @@ func TestCapacityDisallowedRepo(t *testing.T) {
 }
 
 func TestCapacityAvailable(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=2", nil)
+	req.Header.Set("Authorization", "Bearer test-capacity-token")
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -267,8 +279,9 @@ func TestCapacityAvailable(t *testing.T) {
 }
 
 func TestCapacityNotAvailable(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{freeSlots: 0}, &testStore{reserveAllow: false}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 0}, &testStore{reserveAllow: false}, &testRunner{ran: make(chan struct{}, 1)})
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=3", nil)
+	req.Header.Set("Authorization", "Bearer test-capacity-token")
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -284,8 +297,9 @@ func TestCapacityNotAvailable(t *testing.T) {
 }
 
 func TestCapacityEmptyRunIDReturns400(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo", nil)
+	req.Header.Set("Authorization", "Bearer test-capacity-token")
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -294,8 +308,9 @@ func TestCapacityEmptyRunIDReturns400(t *testing.T) {
 }
 
 func TestCapacityNonNumericRunIDReturns400(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=notanumber", nil)
+	req.Header.Set("Authorization", "Bearer test-capacity-token")
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -303,10 +318,117 @@ func TestCapacityNonNumericRunIDReturns400(t *testing.T) {
 	}
 }
 
+// --- capacity bearer token tests ---
+
+func TestCapacityNoHeaderReturns401(t *testing.T) {
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
+	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=10", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no auth header, got %d", w.Code)
+	}
+}
+
+func TestCapacityWrongTokenReturns401(t *testing.T) {
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
+	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=11", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with wrong token, got %d", w.Code)
+	}
+}
+
+func TestCapacityCorrectTokenReturns200AndReserves(t *testing.T) {
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
+	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=12", nil)
+	req.Header.Set("Authorization", "Bearer test-capacity-token")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with correct token, got %d", w.Code)
+	}
+	var resp capacityResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if !resp.Available {
+		t.Fatal("expected available=true when pool has free slots and reservation allowed")
+	}
+}
+
+func TestCapacityEmptyTokenAlwaysReturns401(t *testing.T) {
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
+	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=13", nil)
+	req.Header.Set("Authorization", "Bearer any-token")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when server has no token configured, got %d", w.Code)
+	}
+}
+
+// --- webhook IP allowlist tests ---
+
+// mustParseCIDR is a test helper that parses a CIDR or fails the test.
+func mustParseCIDR(t *testing.T, cidr string) *net.IPNet {
+	t.Helper()
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		t.Fatalf("ParseCIDR(%q): %v", cidr, err)
+	}
+	return ipNet
+}
+
+func TestWebhookDisallowedIPReturns403(t *testing.T) {
+	allowed := []*net.IPNet{mustParseCIDR(t, "192.30.252.0/22")}
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, allowed, &testPool{freeSlots: 2}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
+	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 99)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", signBody(body))
+	req.Header.Set("CF-Connecting-IP", "1.2.3.4")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for disallowed IP via CF-Connecting-IP, got %d", w.Code)
+	}
+}
+
+func TestWebhookAllowedIPProceedsToHMAC(t *testing.T) {
+	allowed := []*net.IPNet{mustParseCIDR(t, "192.30.252.0/22")}
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, allowed, &testPool{freeSlots: 2}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
+	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 99)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", "sha256=badbadbadbad")
+	req.Header.Set("CF-Connecting-IP", "192.30.252.1")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	// IP is allowed, so we reach the HMAC check and get 401 for the bad signature.
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 (bad HMAC after IP allowed), got %d", w.Code)
+	}
+}
+
+func TestWebhookEmptyCIDRsSkipsIPCheck(t *testing.T) {
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
+	body := webhookBody("in_progress", "owner/repo", []string{"self-hosted"}, 42)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", signBody(body))
+	// No CF-Connecting-IP: falls back to RemoteAddr; IP guard is skipped anyway.
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	// IP check skipped, HMAC passes, action=in_progress -> 204.
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 (IP check skipped, non-queued event), got %d", w.Code)
+	}
+}
+
 // --- healthz ---
 
 func TestHealthz(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), &testPool{}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{}, &testStore{}, &testRunner{ran: make(chan struct{}, 1)})
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
