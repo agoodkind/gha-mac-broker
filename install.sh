@@ -62,8 +62,12 @@ resolve_version() {
         printf '%s' "$VERSION"
         return
     fi
-    curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-        | jq -r '.tag_name // empty' \
+    # The releases list is newest-first and includes pre-releases, which the
+    # /releases/latest endpoint excludes; the broker publishes pre-releases.
+    # Parse the first tag_name with grep/sed so a fresh host needs no jq.
+    curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=1" \
+        | grep -m1 '"tag_name"' \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
         || die "failed to query latest release from $REPO"
 }
 
@@ -106,7 +110,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 need curl
-need jq
 need tar
 
 install_bin

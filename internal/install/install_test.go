@@ -1,7 +1,9 @@
 package install
 
 import (
+	"bytes"
 	"context"
+	"os"
 	"strings"
 	"testing"
 )
@@ -44,6 +46,23 @@ func TestRenderSystemd(t *testing.T) {
 		}
 	}
 	assertNoMarkers(t, rendered)
+}
+
+// TestEmbeddedConfigMatchesRepoRoot guards against the embedded scaffold copy
+// drifting from the repo-root config.example.toml, since go:embed cannot reach
+// the parent directory and the two files are maintained by hand.
+func TestEmbeddedConfigMatchesRepoRoot(t *testing.T) {
+	embedded, err := os.ReadFile("config.example.toml")
+	if err != nil {
+		t.Fatalf("read embedded config.example.toml: %v", err)
+	}
+	root, err := os.ReadFile("../../config.example.toml")
+	if err != nil {
+		t.Fatalf("read repo-root config.example.toml: %v", err)
+	}
+	if !bytes.Equal(embedded, root) {
+		t.Error("internal/install/config.example.toml drifted from the repo-root copy; keep them identical")
+	}
 }
 
 func assertNoMarkers(t *testing.T, rendered string) {
