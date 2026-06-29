@@ -19,6 +19,21 @@ The broker is the primary pool; CI workflows fail over to GitHub-hosted
 `macos-26` when the pool is unavailable. That failover lives in the consumer's
 reusable workflow, not in the broker.
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/agoodkind/gha-mac-broker/main/install.sh | bash
+```
+
+The script downloads the signed binary from the latest release into
+`${XDG_BIN_HOME:-$HOME/.local/bin}` and runs `gha-mac-broker install`, which
+scaffolds the config and secrets, builds the golden Tart image when missing,
+and installs the launchd (macOS) or systemd (Linux) user service. Every step is
+idempotent. Pass `--version <tag>` to pin a release, `--bin-dir <dir>` to change
+the install location, or `--no-service` to install only the binary. After
+install, set `app.app_id` in the config, place the App private key at
+`app.private_key_path`, and set up the Cloudflare tunnel.
+
 ## Build
 
 ```sh
