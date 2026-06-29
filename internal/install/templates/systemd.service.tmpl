@@ -4,7 +4,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=@@BIN_PATH@@ serve -config @@HOME@@/.config/gha-mac-broker/config.toml
+ExecStart={{.BinPath}} serve -config {{.ConfigPath}}
 Restart=always
 RestartSec=1
 

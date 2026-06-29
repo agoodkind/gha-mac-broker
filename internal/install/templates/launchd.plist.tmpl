@@ -7,17 +7,17 @@
   <string>io.goodkind.gha-mac-broker</string>
   <key>ProgramArguments</key>
   <array>
-    <string>@@BIN_PATH@@</string>
+    <string>{{.BinPath}}</string>
     <string>serve</string>
     <string>-config</string>
-    <string>@@HOME@@/.config/gha-mac-broker/config.toml</string>
+    <string>{{.ConfigPath}}</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>@@HOME@@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>{{.Home}}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>
-    <string>@@HOME@@</string>
+    <string>{{.Home}}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -26,8 +26,8 @@
   <key>ThrottleInterval</key>
   <integer>5</integer>
   <key>StandardOutPath</key>
-  <string>@@LOG_PATH@@</string>
+  <string>{{.LogPath}}</string>
   <key>StandardErrorPath</key>
-  <string>@@LOG_PATH@@</string>
+  <string>{{.LogPath}}</string>
 </dict>
 </plist>
