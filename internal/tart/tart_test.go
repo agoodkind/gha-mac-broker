@@ -3,6 +3,7 @@ package tart
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -17,8 +18,11 @@ func TestLifecycleCommands(t *testing.T) {
 	tt.run = stub
 	ctx := context.Background()
 
-	if err := tt.Clone(ctx, "golden", "warm-1"); err != nil {
+	if err := tt.Clone(ctx, "golden", "warm-1", false); err != nil {
 		t.Fatalf("Clone: %v", err)
+	}
+	if err := tt.Clone(ctx, "golden", "warm-2", true); err != nil {
+		t.Fatalf("Clone insecure: %v", err)
 	}
 	if err := tt.Stop(ctx, "warm-1"); err != nil {
 		t.Fatalf("Stop: %v", err)
@@ -27,8 +31,11 @@ func TestLifecycleCommands(t *testing.T) {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	if len(calls) == 0 || calls[0][0] != "clone" {
-		t.Fatalf("first call should be clone, got %v", calls)
+	if !slices.Equal(calls[0], []string{"clone", "golden", "warm-1"}) {
+		t.Fatalf("clone args = %v, want %v", calls[0], []string{"clone", "golden", "warm-1"})
+	}
+	if !slices.Equal(calls[1], []string{"clone", "--insecure", "golden", "warm-2"}) {
+		t.Fatalf("insecure clone args = %v, want %v", calls[1], []string{"clone", "--insecure", "golden", "warm-2"})
 	}
 }
 

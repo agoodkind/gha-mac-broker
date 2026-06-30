@@ -13,18 +13,20 @@ import (
 // stubTart records Exec calls and satisfies the tarter interface for white-box
 // command-construction tests.
 type stubTart struct {
-	execCalls [][]string
-	cloneFrom []string
-	cloneTo   []string
-	names     []string
-	shutdown  map[string]bool
+	execCalls     [][]string
+	cloneFrom     []string
+	cloneTo       []string
+	cloneInsecure []bool
+	names         []string
+	shutdown      map[string]bool
 }
 
 func (s *stubTart) List(_ context.Context) ([]string, error) { return s.names, nil }
 
-func (s *stubTart) Clone(_ context.Context, source, name string) error {
+func (s *stubTart) Clone(_ context.Context, source, name string, insecure bool) error {
 	s.cloneFrom = append(s.cloneFrom, source)
 	s.cloneTo = append(s.cloneTo, name)
+	s.cloneInsecure = append(s.cloneInsecure, insecure)
 	return nil
 }
 

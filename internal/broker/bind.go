@@ -87,7 +87,7 @@ func (b *Binder) Warm(ctx context.Context, image, id string) (*WarmVM, error) {
 		slog.DebugContext(ctx, "pre-clone delete returned error (ignored)", "err", err, "vm", vmName)
 	}
 
-	if err := b.vm.Clone(ctx, goldenName, vmName); err != nil {
+	if err := b.vm.Clone(ctx, goldenName, vmName, false); err != nil {
 		slog.ErrorContext(ctx, "clone failed", "err", err, "vm", vmName)
 		return nil, fmt.Errorf("broker: clone %s: %w", vmName, err)
 	}
