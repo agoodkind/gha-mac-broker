@@ -173,11 +173,11 @@ func TestStageRefusesNonCirrusImage(t *testing.T) {
 
 func TestIsCirrusXcodeRepo(t *testing.T) {
 	cases := map[string]bool{
-		"cirruslabs/macos-tahoe-xcode":   true,
-		"cirruslabs/macos-sonoma-xcode":  true,
-		"cirruslabs/macos-tahoe-base":    false,
-		"example/macos-tahoe-xcode":      false,
-		"cirruslabs/ubuntu":              false,
+		"cirruslabs/macos-tahoe-xcode":  true,
+		"cirruslabs/macos-sonoma-xcode": true,
+		"cirruslabs/macos-tahoe-base":   false,
+		"example/macos-tahoe-xcode":     false,
+		"cirruslabs/ubuntu":             false,
 	}
 	for repo, want := range cases {
 		if got := isCirrusXcodeRepo(repo); got != want {

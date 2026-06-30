@@ -24,18 +24,17 @@ GO_MK_MODULES := go-build.mk go-release.mk
 
 # CGO: a vendored static libaria2 is linked into the binary for the fast
 # parallel base-image pull. GO_MK_GENERATE makes go.mk build libaria2 as an
-# order-only prerequisite before any compile, lint, or test. The CGO flags point
-# at the per-target build prefix; the libaria2 target (below) populates it.
+# order-only prerequisite before any compile, lint, or test. The link flags live
+# in internal/aria2 #cgo directives (package-scoped), NOT exported here, so
+# building unrelated tools such as golangci-lint does not inherit the libaria2
+# link. Only CGO_ENABLED is exported. The build prefix is stable (not per-arch):
+# each build context targets a single arch, and the #cgo directive references
+# this path SRCDIR-relative.
 export CGO_ENABLED := 1
-GOOS         ?= $(shell go env GOOS)
-GOARCH       ?= $(shell go env GOARCH)
 ARIA2_VER    := 1.37.0
 ARIA2_DIR    := third_party/aria2
-ARIA2_PREFIX := $(CURDIR)/$(ARIA2_DIR)/.build/$(GOOS)_$(GOARCH)
+ARIA2_PREFIX := $(CURDIR)/$(ARIA2_DIR)/.build
 ARIA2_LIB    := $(ARIA2_PREFIX)/lib/libaria2.a
-export CGO_CFLAGS   := -I$(ARIA2_PREFIX)/include
-export CGO_CXXFLAGS := -I$(ARIA2_PREFIX)/include -std=c++14
-export CGO_LDFLAGS  := $(ARIA2_LIB) -lc++ -framework Security -framework CoreFoundation -framework SystemConfiguration
 GO_MK_GENERATE := libaria2
 
 # bootstrap.mk fetches go.mk + golangci.yml + every module in GO_MK_MODULES at

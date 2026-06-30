@@ -3,6 +3,13 @@
 // registry, so libaria2's range splitting is used to saturate the link.
 package aria2
 
+// The CGO flags are scoped to this package (not exported globally) so building
+// unrelated tools such as golangci-lint does not inherit the libaria2 link. The
+// static libaria2 is built by the Makefile libaria2 target into
+// third_party/aria2/.build; the frameworks are darwin-only (AppleTLS).
+
+// #cgo CXXFLAGS: -std=c++14 -I${SRCDIR}/../../third_party/aria2/.build/include
+// #cgo darwin LDFLAGS: ${SRCDIR}/../../third_party/aria2/.build/lib/libaria2.a -lc++ -framework Security -framework CoreFoundation -framework SystemConfiguration
 // #include <stdlib.h>
 // #include "aria2_shim.h"
 import "C"
