@@ -9,9 +9,13 @@ import (
 	"context"
 	_ "embed"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os/exec"
+	"slices"
+	"strings"
 	"time"
 
 	"goodkind.io/gha-mac-broker/internal/tart"
@@ -29,11 +33,13 @@ const (
 	readyTimeout       = 120 * time.Second
 	readyInterval      = 3 * time.Second
 	shutdownTimeout    = 90 * time.Second
+	runnerLatestURL    = "https://api.github.com/repos/actions/runner/releases/latest"
 )
 
 // tarter is the VM substrate the builder drives; *tart.Tart satisfies it. It is
 // an interface so tests can stub the tart CLI.
 type tarter interface {
+	List(ctx context.Context) ([]string, error)
 	Clone(ctx context.Context, source, name string) error
 	BootCommand(ctx context.Context, name string, opts tart.BootOptions) *exec.Cmd
 	Exec(ctx context.Context, name string, argv ...string) ([]byte, error)
@@ -61,6 +67,113 @@ type Options struct {
 	BuildVM string
 	// RunnerVersion is the actions/runner version to install (e.g. "2.335.1").
 	RunnerVersion string
+}
+
+// EnsureOptions configures an idempotent golden ensure operation.
+type EnsureOptions struct {
+	// Image is the approved Cirrus tag the golden is derived from.
+	Image string
+	// BuildVM is the scratch VM name used if the golden must be built.
+	BuildVM string
+	// RunnerVersion is the actions/runner version to install. When empty, the
+	// latest release is resolved only if a build is required.
+	RunnerVersion string
+}
+
+// NameForImage returns the deterministic per-image golden name.
+func NameForImage(image string) string {
+	name := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(image)), "ghcr.io/cirruslabs/")
+	var builder strings.Builder
+	builder.WriteString("gha-golden-")
+	for _, value := range name {
+		if value >= 'a' && value <= 'z' {
+			builder.WriteRune(value)
+			continue
+		}
+		if value >= '0' && value <= '9' {
+			builder.WriteRune(value)
+			continue
+		}
+		if value == '.' || value == '-' {
+			builder.WriteRune(value)
+			continue
+		}
+		builder.WriteRune('-')
+	}
+	return strings.TrimRight(builder.String(), "-")
+}
+
+// EnsureGolden builds the derived golden for an image only when it is absent.
+func (b *Builder) EnsureGolden(ctx context.Context, opts EnsureOptions) (string, error) {
+	if opts.Image == "" {
+		return "", fmt.Errorf("golden: image is required")
+	}
+	goldenName := NameForImage(opts.Image)
+	names, err := b.vm.List(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "list VMs failed", "err", err)
+		return "", fmt.Errorf("golden: list VMs: %w", err)
+	}
+	if slices.Contains(names, goldenName) {
+		slog.InfoContext(ctx, "golden present; skipping build", "golden", goldenName, "image", opts.Image)
+		return goldenName, nil
+	}
+
+	runnerVersion := opts.RunnerVersion
+	if runnerVersion == "" {
+		resolved, resolveErr := ResolveRunnerVersion(ctx)
+		if resolveErr != nil {
+			return "", resolveErr
+		}
+		runnerVersion = resolved
+	}
+	buildVM := opts.BuildVM
+	if buildVM == "" {
+		buildVM = goldenName + "-build"
+	}
+	if err := b.Build(ctx, Options{
+		BaseImage:     opts.Image,
+		GoldenName:    goldenName,
+		BuildVM:       buildVM,
+		RunnerVersion: runnerVersion,
+	}); err != nil {
+		slog.ErrorContext(ctx, "ensure golden build failed", "err", err, "golden", goldenName, "image", opts.Image)
+		return "", fmt.Errorf("golden: ensure %s: %w", goldenName, err)
+	}
+	return goldenName, nil
+}
+
+// runnerRelease is the subset of the actions/runner latest-release API response
+// the version resolver reads.
+type runnerRelease struct {
+	TagName string `json:"tag_name"`
+}
+
+// ResolveRunnerVersion fetches the latest actions/runner release tag and
+// returns it without the leading "v".
+func ResolveRunnerVersion(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, runnerLatestURL, nil)
+	if err != nil {
+		slog.ErrorContext(ctx, "build runner request failed", "err", err)
+		return "", fmt.Errorf("golden: build runner request: %w", err)
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.ErrorContext(ctx, "resolve runner version request failed", "err", err)
+		return "", fmt.Errorf("golden: fetch latest runner: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		slog.ErrorContext(ctx, "runner status not ok", "err", fmt.Errorf("status %d", resp.StatusCode), "status", resp.StatusCode)
+		return "", fmt.Errorf("golden: latest runner status %d", resp.StatusCode)
+	}
+	var rel runnerRelease
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		slog.ErrorContext(ctx, "decode runner release failed", "err", err)
+		return "", fmt.Errorf("golden: decode runner release: %w", err)
+	}
+	return strings.TrimPrefix(rel.TagName, "v"), nil
 }
 
 // Build runs the full golden build and self-verification. On any step failure it

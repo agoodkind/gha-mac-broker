@@ -1,7 +1,6 @@
 listen_addr = "[::1]:8080"
 
-labels    = ["self-hosted", "macOS", "ARM64", "agk-local-macos-26"]
-pool_size = 2
+labels = ["self-hosted", "macOS", "ARM64", "agk-local-macos-26"]
 
 allowed_repos = [
   "agoodkind/lmd",
@@ -23,12 +22,16 @@ webhook_cidrs_path  = "/Users/you/.config/gha-mac-broker/github-webhook-cidrs.tx
 
 [tart]
 binary         = "tart"
-golden_image   = "gha-golden"
-# Cirrus image the golden is built from. Use an Xcode-bearing, pinned tag so the
-# golden can build Swift; bump this to move the pool's Xcode (no binary rebuild).
 base_image     = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
+warm_budget    = 2
+golden_budget  = 3
 vm_name_prefix = "gha-runner"
 cache_dir      = "/Users/you/.tart/cache"
 # Control of each VM (readiness, job execution, liveness) runs over the
 # tart-exec vsock channel, so there is no SSH key, user, or VM network config
 # here. The VM keeps tart's default NAT only for its own IPv4 egress to GitHub.
+
+[[tart.images]]
+macos = "tahoe"
+xcode = "26.5"
+tag   = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"

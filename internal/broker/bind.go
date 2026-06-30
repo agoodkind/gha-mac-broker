@@ -16,6 +16,7 @@ import (
 
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
+	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/tart"
 )
 
@@ -41,7 +42,9 @@ const runnerHome = "~/actions-runner"
 type WarmVM struct {
 	// Name is the tart VM name used for exec, stop, and delete.
 	Name string
-	boot *exec.Cmd
+	// Image is the approved Cirrus tag this VM was cloned for.
+	Image string
+	boot  *exec.Cmd
 	// stopTouch ends the per-VM liveness touch loop on teardown.
 	stopTouch context.CancelFunc
 }
@@ -62,9 +65,19 @@ func New(cfg *config.Config, gh *ghapp.Client, vm *tart.Tart) *Binder {
 // waits until its vsock channel answers, and starts the liveness touch loop. On
 // any failure, Warm tears down the partial VM before returning; the caller owns
 // teardown only on success.
-func (b *Binder) Warm(ctx context.Context, id string) (*WarmVM, error) {
+func (b *Binder) Warm(ctx context.Context, image, id string) (*WarmVM, error) {
 	vmName := b.cfg.Tart.VMNamePrefix + "-" + id
-	slog.InfoContext(ctx, "warming vm", "vm", vmName)
+	slog.InfoContext(ctx, "warming vm", "vm", vmName, "image", image)
+
+	goldenName, err := golden.New(b.vm).EnsureGolden(ctx, golden.EnsureOptions{
+		Image:         image,
+		BuildVM:       golden.NameForImage(image) + "-build-" + id,
+		RunnerVersion: "",
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "ensure golden failed", "err", err, "image", image)
+		return nil, fmt.Errorf("broker: ensure golden for %s: %w", image, err)
+	}
 
 	// Idempotent clone: best-effort delete any pre-existing VM of this exact
 	// name before cloning, so the clone self-heals even if the startup sweep
@@ -74,7 +87,7 @@ func (b *Binder) Warm(ctx context.Context, id string) (*WarmVM, error) {
 		slog.DebugContext(ctx, "pre-clone delete returned error (ignored)", "err", err, "vm", vmName)
 	}
 
-	if err := b.vm.Clone(ctx, b.cfg.Tart.GoldenImage, vmName); err != nil {
+	if err := b.vm.Clone(ctx, goldenName, vmName); err != nil {
 		slog.ErrorContext(ctx, "clone failed", "err", err, "vm", vmName)
 		return nil, fmt.Errorf("broker: clone %s: %w", vmName, err)
 	}
@@ -104,7 +117,7 @@ func (b *Binder) Warm(ctx context.Context, id string) (*WarmVM, error) {
 		b.touchLoop(touchCtx, vmName)
 	}()
 
-	return &WarmVM{Name: vmName, boot: bootCmd, stopTouch: stopTouch}, nil
+	return &WarmVM{Name: vmName, Image: image, boot: bootCmd, stopTouch: stopTouch}, nil
 }
 
 // RunJob checks the allowlist, mints a JIT config, and runs one ephemeral GitHub
@@ -146,6 +159,16 @@ func (b *Binder) Teardown(ctx context.Context, vm *WarmVM) {
 	b.teardown(ctx, vm.Name)
 }
 
+// DeleteGolden removes the derived golden for image from disk.
+func (b *Binder) DeleteGolden(ctx context.Context, image string) error {
+	goldenName := golden.NameForImage(image)
+	if err := b.vm.Delete(ctx, goldenName); err != nil {
+		slog.WarnContext(ctx, "delete golden failed", "err", err, "golden", goldenName, "image", image)
+		return fmt.Errorf("broker: delete golden %s: %w", goldenName, err)
+	}
+	return nil
+}
+
 // SweepOrphans stops and deletes any leftover pool VMs from a previous broker
 // process. On a fresh start the pool owns no VMs, so every VM whose name carries
 // the pool prefix is an orphan (for example after a hard restart that skipped
@@ -183,7 +206,7 @@ func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
 	if !b.cfg.RepoAllowed(repo) {
 		return fmt.Errorf("broker: repo %s is not in allowed_repos", repo)
 	}
-	vm, err := b.Warm(ctx, id)
+	vm, err := b.Warm(ctx, b.cfg.Tart.BaseImage, id)
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package golden
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -13,21 +14,96 @@ import (
 // command-construction tests.
 type stubTart struct {
 	execCalls [][]string
+	cloneFrom []string
+	cloneTo   []string
+	names     []string
+	shutdown  map[string]bool
 }
 
-func (s *stubTart) Clone(_ context.Context, _, _ string) error { return nil }
+func (s *stubTart) List(_ context.Context) ([]string, error) { return s.names, nil }
+
+func (s *stubTart) Clone(_ context.Context, source, name string) error {
+	s.cloneFrom = append(s.cloneFrom, source)
+	s.cloneTo = append(s.cloneTo, name)
+	return nil
+}
 
 func (s *stubTart) BootCommand(_ context.Context, _ string, _ tart.BootOptions) *exec.Cmd {
 	return exec.Command("true")
 }
 
-func (s *stubTart) Exec(_ context.Context, _ string, argv ...string) ([]byte, error) {
+func (s *stubTart) Exec(_ context.Context, name string, argv ...string) ([]byte, error) {
 	s.execCalls = append(s.execCalls, argv)
+	if len(argv) >= 3 && argv[0] == "sudo" && argv[1] == "/sbin/shutdown" {
+		if s.shutdown == nil {
+			s.shutdown = make(map[string]bool)
+		}
+		s.shutdown[name] = true
+		return nil, nil
+	}
+	if len(argv) == 1 && argv[0] == "true" && s.shutdown[name] {
+		return nil, errors.New("vm is down")
+	}
 	return nil, nil
 }
 
 func (s *stubTart) Stop(_ context.Context, _ string) error   { return nil }
 func (s *stubTart) Delete(_ context.Context, _ string) error { return nil }
+
+func TestNameForImageSanitizesCirrusTag(t *testing.T) {
+	got := NameForImage("ghcr.io/cirruslabs/macos-tahoe-xcode:26.5")
+	want := "gha-golden-macos-tahoe-xcode-26.5"
+	if got != want {
+		t.Fatalf("golden name = %q, want %q", got, want)
+	}
+}
+
+func TestEnsureGoldenSkipsExistingGolden(t *testing.T) {
+	image := "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
+	goldenName := NameForImage(image)
+	s := &stubTart{names: []string{goldenName}}
+	b := New(s)
+
+	got, err := b.EnsureGolden(context.Background(), EnsureOptions{
+		Image:         image,
+		BuildVM:       goldenName + "-build",
+		RunnerVersion: "2.99.0",
+	})
+	if err != nil {
+		t.Fatalf("EnsureGolden: %v", err)
+	}
+	if got != goldenName {
+		t.Fatalf("golden name = %q, want %q", got, goldenName)
+	}
+	if len(s.cloneFrom) != 0 {
+		t.Fatalf("existing golden should not be rebuilt, clone calls = %v", s.cloneFrom)
+	}
+}
+
+func TestEnsureGoldenBuildsMissingGoldenFromImage(t *testing.T) {
+	image := "ghcr.io/cirruslabs/macos-sonoma-xcode:15.4"
+	goldenName := NameForImage(image)
+	s := &stubTart{names: []string{}}
+	b := New(s)
+
+	got, err := b.EnsureGolden(context.Background(), EnsureOptions{
+		Image:         image,
+		BuildVM:       goldenName + "-build",
+		RunnerVersion: "2.99.0",
+	})
+	if err != nil {
+		t.Fatalf("EnsureGolden: %v", err)
+	}
+	if got != goldenName {
+		t.Fatalf("golden name = %q, want %q", got, goldenName)
+	}
+	if len(s.cloneFrom) == 0 || s.cloneFrom[0] != image {
+		t.Fatalf("first clone source = %v, want %q", s.cloneFrom, image)
+	}
+	if !strings.Contains(strings.Join(s.cloneTo, "\n"), goldenName) {
+		t.Fatalf("clone targets should include derived golden %q, got %v", goldenName, s.cloneTo)
+	}
+}
 
 func TestInstallRunnerURL(t *testing.T) {
 	s := &stubTart{}

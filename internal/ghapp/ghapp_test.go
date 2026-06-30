@@ -17,6 +17,12 @@ import (
 	"time"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
 func testKeyPEM(t *testing.T) ([]byte, *rsa.PrivateKey) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -82,40 +88,46 @@ func TestAppJWTVerifies(t *testing.T) {
 func TestGenerateJITConfigFlow(t *testing.T) {
 	pemKey, _ := testKeyPEM(t)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/installation":
 			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 				t.Errorf("installation lookup must use App JWT bearer, got %q", r.Header.Get("Authorization"))
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 999})
+			_ = json.NewEncoder(w).Encode(installationResponse{ID: 999})
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/999/access_tokens":
-			_ = json.NewEncoder(w).Encode(map[string]any{"token": "ghs_installationtoken"})
+			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "ghs_installationtoken"})
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/agoodkind/lmd/actions/runners/generate-jitconfig":
 			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
 				t.Errorf("jitconfig must use installation token, got %q", got)
 			}
-			var body map[string]any
+			var body jitConfigRequest
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["name"] != "warm-vm-1" {
-				t.Errorf("runner name = %v, want warm-vm-1", body["name"])
+			if body.Name != "warm-vm-1" {
+				t.Errorf("runner name = %v, want warm-vm-1", body.Name)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"encoded_jit_config": "ZW5jb2RlZA==",
-				"runner":             map[string]any{"id": 7, "name": "warm-vm-1"},
+			_ = json.NewEncoder(w).Encode(JITConfig{
+				EncodedJITConfig: "ZW5jb2RlZA==",
+				Runner:           runnerInfo{ID: 7, Name: "warm-vm-1"},
 			})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected", http.StatusNotFound)
 		}
-	}))
-	defer server.Close()
+	})
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, r)
+			return recorder.Result(), nil
+		}),
+	}
 
-	client, err := New("12345", pemKey, WithHTTPClient(server.Client()))
+	client, err := New("12345", pemKey, WithHTTPClient(httpClient))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	client.apiBase = server.URL
+	client.apiBase = "https://api.github.test"
 	ctx := context.Background()
 
 	installationID, err := client.InstallationID(ctx, "agoodkind", "lmd")

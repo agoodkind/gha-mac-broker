@@ -26,15 +26,15 @@ const maxBodyBytes = 1 << 20
 
 // pooler is the subset of pool.Pool used by the server.
 type pooler interface {
-	Lease(ctx context.Context) (*broker.WarmVM, error)
+	Lease(ctx context.Context, image string) (*broker.WarmVM, error)
 	FreeSlots() int
 	Recycle(ctx context.Context, vm *broker.WarmVM)
 }
 
 // reserver is the subset of reservation.Store used by the server.
 type reserver interface {
-	Reserve(runID string, capacity int) bool
-	Consume(runID string) bool
+	Reserve(runID, image string, capacity int) bool
+	Consume(runID string) (image string, ok bool)
 }
 
 // jobRunner is the subset of broker.Binder used by the server.
@@ -174,12 +174,13 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 	}
 
 	runID := strconv.FormatInt(payload.WorkflowJob.RunID, 10)
-	if !s.store.Consume(runID) && s.pool.FreeSlots() <= 0 {
+	image, ok := s.store.Consume(runID)
+	if !ok {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	vm, err := s.pool.Lease(ctx)
+	vm, err := s.pool.Lease(ctx, image)
 	if err != nil {
 		slog.ErrorContext(ctx, "lease failed", "err", err, "repo", repo)
 		http.Error(w, "no vm available", http.StatusServiceUnavailable)
@@ -216,7 +217,9 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	}
 	repo := r.URL.Query().Get("repo")
 	runID := r.URL.Query().Get("run_id")
-	slog.DebugContext(r.Context(), "capacity request", "repo", repo, "run_id", runID)
+	macos := r.URL.Query().Get("os")
+	xcode := r.URL.Query().Get("xcode")
+	slog.DebugContext(r.Context(), "capacity request", "repo", repo, "run_id", runID, "os", macos, "xcode", xcode)
 	if !s.cfg.RepoAllowed(repo) {
 		writeJSON(w, capacityResponse{Available: false})
 		return
@@ -229,7 +232,12 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "run_id must be numeric", http.StatusBadRequest)
 		return
 	}
-	available := s.store.Reserve(runID, s.pool.FreeSlots())
+	image, ok := s.cfg.ResolveImage(macos, xcode)
+	if !ok {
+		writeJSON(w, capacityResponse{Available: false})
+		return
+	}
+	available := s.store.Reserve(runID, image, s.pool.FreeSlots())
 	writeJSON(w, capacityResponse{Available: available})
 }
 
