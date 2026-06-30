@@ -27,14 +27,15 @@ GO_MK_MODULES := go-build.mk go-release.mk
 # order-only prerequisite before any compile, lint, or test. The link flags live
 # in internal/aria2 #cgo directives (package-scoped), NOT exported here, so
 # building unrelated tools such as golangci-lint does not inherit the libaria2
-# link. Only CGO_ENABLED is exported. The build prefix is stable (not per-arch):
-# each build context targets a single arch, and the #cgo directive references
-# this path SRCDIR-relative.
+# link. Only CGO_ENABLED and the aria2 pkg-config search path are exported. The
+# build prefix is stable (not per-arch): each build context targets a single
+# arch, and pkg-config resolves libaria2 from this prefix.
 export CGO_ENABLED := 1
 ARIA2_VER    := 1.37.0
 ARIA2_DIR    := third_party/aria2
 ARIA2_PREFIX := $(CURDIR)/$(ARIA2_DIR)/.build
 ARIA2_LIB    := $(ARIA2_PREFIX)/lib/libaria2.a
+export PKG_CONFIG_PATH := $(ARIA2_PREFIX)/lib/pkgconfig:$(PKG_CONFIG_PATH)
 GO_MK_GENERATE := libaria2
 
 # bootstrap.mk fetches go.mk + golangci.yml + every module in GO_MK_MODULES at
