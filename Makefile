@@ -22,32 +22,9 @@ BUNDLE_ID ?= io.goodkind.gha-mac-broker
 # `install` subcommand, not a host make module.
 GO_MK_MODULES := go-build.mk go-release.mk
 
-# CGO: a vendored static libaria2 is linked into the binary for the fast
-# parallel base-image pull. GO_MK_GENERATE makes go.mk build libaria2 as an
-# order-only prerequisite before any compile, lint, or test. The link flags live
-# in internal/aria2 #cgo directives (package-scoped), NOT exported here, so
-# building unrelated tools such as golangci-lint does not inherit the libaria2
-# link. Only CGO_ENABLED and the aria2 pkg-config search path are exported. The
-# build prefix is stable (not per-arch): each build context targets a single
-# arch, and pkg-config resolves libaria2 from this prefix.
-export CGO_ENABLED := 1
-ARIA2_VER    := 1.37.0
-ARIA2_DIR    := third_party/aria2
-ARIA2_PREFIX := $(CURDIR)/$(ARIA2_DIR)/.build
-ARIA2_LIB    := $(ARIA2_PREFIX)/lib/libaria2.a
-export PKG_CONFIG_PATH := $(ARIA2_PREFIX)/lib/pkgconfig:$(PKG_CONFIG_PATH)
-GO_MK_GENERATE := libaria2
-
 # bootstrap.mk fetches go.mk + golangci.yml + every module in GO_MK_MODULES at
 # parse time and -includes them. Set GO_MK_DEV_DIR in config.mk to build against
 # a local go-makefile checkout without network access.
 include bootstrap.mk
 
 .DEFAULT_GOAL := check
-
-# Build the vendored static libaria2 into the per-target prefix. Idempotent: an
-# existing archive is left untouched. go.mk runs this before any compile.
-.PHONY: libaria2
-libaria2: $(ARIA2_LIB)
-$(ARIA2_LIB):
-	@bash scripts/build-libaria2.sh "$(ARIA2_DIR)" "$(ARIA2_VER)" "$(ARIA2_PREFIX)"

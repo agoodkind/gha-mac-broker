@@ -32,7 +32,6 @@ import (
 	"syscall"
 	"time"
 
-	"goodkind.io/gha-mac-broker/internal/aria2"
 	"goodkind.io/gha-mac-broker/internal/broker"
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/fastpull"
@@ -42,6 +41,7 @@ import (
 	"goodkind.io/gha-mac-broker/internal/pool"
 	"goodkind.io/gha-mac-broker/internal/reservation"
 	"goodkind.io/gha-mac-broker/internal/server"
+	"goodkind.io/gha-mac-broker/internal/skopeo"
 	"goodkind.io/gha-mac-broker/internal/tart"
 	"goodkind.io/gha-mac-broker/internal/version"
 )
@@ -236,11 +236,8 @@ func fastPullStager(cfg *config.Config) golden.BaseStager {
 		return nil
 	}
 	return fastpull.New(fastpull.Options{
-		Download:         aria2.Download,
-		Dir:              cfg.Tart.FastPullDir,
-		Split:            cfg.Tart.FastPullSplit,
-		MaxConnPerServer: cfg.Tart.FastPullSplit,
-		MaxConcurrent:    cfg.Tart.FastPullConnections,
+		Copier: skopeo.New("skopeo"),
+		Dir:    cfg.Tart.FastPullDir,
 	})
 }
 

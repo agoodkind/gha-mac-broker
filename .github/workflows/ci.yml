@@ -8,9 +8,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   go:
-    # macOS runner: the broker links a static libaria2 with AppleTLS plus the
-    # Security/CoreFoundation frameworks via CGO, which only builds and links on
-    # darwin. The broker is a darwin-only tool, so its CI runs there too.
+    # The broker drives Tart, so its CI runs on macOS.
     uses: agoodkind/go-makefile/.github/workflows/_ci.yml@main
     with:
       runs_on: macos-latest

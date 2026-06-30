@@ -1,14 +1,13 @@
 // Package fastpull stages a Cirrus base image into a loopback OCI registry on
-// [::1] so tart can pull it fast. Blobs download in parallel through the injected
-// downloader (libaria2); the registry is served in-process by
-// go-containerregistry, so tart pulls content-addressed blobs over loopback and
-// does its own decompression. This sidesteps tart's single-stream pull, which
-// ghcr throttles per connection.
+// [::1] so tart can clone it quickly. Skopeo copies the source image into an OCI
+// layout on disk, and go-containerregistry serves that layout's blobs over the
+// loopback registry while tart pulls the tag with --insecure.
 package fastpull
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -16,63 +15,60 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
-
-	"goodkind.io/gha-mac-broker/internal/aria2"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
-	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
 const (
 	loopbackHost      = "[::1]"
 	readHeaderTimeout = 30 * time.Second
 	clientTimeout     = 30 * time.Second
+	targetOS          = "darwin"
+	targetArch        = "arm64"
 )
-
-// DownloadFunc downloads items in parallel; [aria2.Download] satisfies it.
-type DownloadFunc func(ctx context.Context, items []aria2.Item, authHeader string, opts aria2.Options) error
 
 // Options configures a [Stager].
 type Options struct {
-	// Download is the parallel downloader; [aria2.Download] in production.
-	Download DownloadFunc
-	// Dir is the blob directory; the ggcr disk handler reads <Dir>/sha256/<hex>.
+	// Copier copies the source image into an OCI layout. Production passes the
+	// skopeo client; tests provide a tiny fake layout writer.
+	Copier ociCopier
+	// Dir is the OCI layout directory. Blobs live under <Dir>/blobs.
 	Dir string
-	// Split is the number of connections per blob.
-	Split int
-	// MaxConnPerServer caps connections per server per blob.
-	MaxConnPerServer int
-	// MaxConcurrent caps blobs downloaded at once.
-	MaxConcurrent int
+}
+
+type ociCopier interface {
+	CopyToOCILayout(ctx context.Context, srcImageRef, layoutDir, tag, osName, arch string) error
 }
 
 // Stager stages a Cirrus base image into a loopback registry. See the package
 // doc for the mechanism.
 type Stager struct {
-	download         DownloadFunc
-	dir              string
-	split            int
-	maxConnPerServer int
-	maxConcurrent    int
+	copier ociCopier
+	dir    string
+}
+
+type ociIndex struct {
+	SchemaVersion int             `json:"schemaVersion"`
+	Manifests     []ociDescriptor `json:"manifests"`
+}
+
+type ociDescriptor struct {
+	MediaType string `json:"mediaType"`
+	Digest    string `json:"digest"`
+	Size      int64  `json:"size"`
 }
 
 // New returns a Stager configured by opts.
 func New(opts Options) *Stager {
-	return &Stager{
-		download:         opts.Download,
-		dir:              opts.Dir,
-		split:            opts.Split,
-		maxConnPerServer: opts.MaxConnPerServer,
-		maxConcurrent:    opts.MaxConcurrent,
-	}
+	return &Stager{copier: opts.Copier, dir: opts.Dir}
 }
 
-// Stage downloads image's blobs in parallel, serves them from a loopback OCI
-// registry on [::1], and returns a clonable insecure ref plus a stop func that
-// shuts the registry down. The caller clones the returned ref with tart
+// Stage copies image into an OCI layout, serves the layout blobs from a loopback
+// OCI registry on [::1], and returns a clonable insecure ref plus a stop func
+// that shuts the registry down. The caller clones the returned ref with tart
 // --insecure, then calls stop.
 func (s *Stager) Stage(ctx context.Context, image string) (string, func(), error) {
 	ref, err := name.ParseReference(image, name.Insecure)
@@ -86,36 +82,20 @@ func (s *Stager) Stage(ctx context.Context, image string) (string, func(), error
 		slog.ErrorContext(ctx, "fastpull refusing non-cirrus image", "err", err, "image", image)
 		return "", nil, err
 	}
-	tag := ref.Identifier()
-	host := ref.Context().RegistryStr()
-	scheme := ref.Context().Scheme()
-
-	desc, err := remote.Get(ref, remote.WithContext(ctx))
-	if err != nil {
-		slog.ErrorContext(ctx, "fastpull manifest fetch failed", "err", err, "image", image)
-		return "", nil, fmt.Errorf("fastpull: get %s: %w", image, err)
-	}
-
-	img, idxRaw, idxMediaType, archDigest, err := resolveImage(ctx, desc)
-	if err != nil {
+	if s.copier == nil {
+		err := fmt.Errorf("fastpull: missing OCI layout copier")
+		slog.ErrorContext(ctx, "fastpull copier missing", "err", err)
 		return "", nil, err
 	}
 
-	manifest, err := img.Manifest()
-	if err != nil {
-		slog.ErrorContext(ctx, "fastpull read manifest failed", "err", err)
-		return "", nil, fmt.Errorf("fastpull: manifest %s: %w", image, err)
+	tag := ref.Identifier()
+	if err := s.copier.CopyToOCILayout(ctx, image, s.dir, tag, targetOS, targetArch); err != nil {
+		slog.ErrorContext(ctx, "fastpull OCI layout copy failed", "err", err, "image", image)
+		return "", nil, fmt.Errorf("fastpull: copy %s to OCI layout: %w", image, err)
 	}
-	blobs := make([]v1.Descriptor, 0, len(manifest.Layers)+1)
-	blobs = append(blobs, manifest.Config)
-	blobs = append(blobs, manifest.Layers...)
 
 	client := &http.Client{Timeout: clientTimeout}
-	if err := s.downloadBlobs(ctx, client, scheme, host, repo, blobs); err != nil {
-		return "", nil, err
-	}
-
-	handler := registry.New(registry.WithBlobHandler(registry.NewDiskBlobHandler(s.dir)))
+	handler := registry.New(registry.WithBlobHandler(registry.NewDiskBlobHandler(filepath.Join(s.dir, "blobs"))))
 	var listenConfig net.ListenConfig
 	listener, err := listenConfig.Listen(ctx, "tcp", loopbackHost+":0")
 	if err != nil {
@@ -141,125 +121,78 @@ func (s *Stager) Stage(ctx context.Context, image string) (string, func(), error
 	stop := func() { _ = srv.Close() }
 	port := tcpAddr.Port
 
-	if err := s.registerManifests(ctx, client, port, repo, tag, img, archDigest, idxRaw, idxMediaType); err != nil {
+	if err := s.registerManifest(ctx, client, port, repo, tag); err != nil {
 		stop()
 		return "", nil, err
 	}
 
 	localRef := loopbackHost + ":" + strconv.Itoa(port) + "/" + repo + ":" + tag
-	slog.InfoContext(ctx, "fastpull staged base image", "ref", localRef, "blobs", len(blobs))
+	slog.InfoContext(ctx, "fastpull staged base image", "ref", localRef)
 	return localRef, stop, nil
 }
 
-// resolveImage returns the arm64 image to serve. When desc is an index it
-// returns the index raw bytes and media type as well, so the index can be served
-// at the tag; otherwise those are empty and the arm64 image is served at the tag.
-func resolveImage(ctx context.Context, desc *remote.Descriptor) (v1.Image, []byte, string, v1.Hash, error) {
-	if !desc.MediaType.IsIndex() {
-		img, err := desc.Image()
-		if err != nil {
-			slog.ErrorContext(ctx, "fastpull resolve image failed", "err", err)
-			return nil, nil, "", v1.Hash{}, fmt.Errorf("fastpull: image: %w", err)
-		}
-		digest, err := img.Digest()
-		if err != nil {
-			slog.ErrorContext(ctx, "fastpull image digest failed", "err", err)
-			return nil, nil, "", v1.Hash{}, fmt.Errorf("fastpull: image digest: %w", err)
-		}
-		return img, nil, "", digest, nil
-	}
-	idx, err := desc.ImageIndex()
+func (s *Stager) registerManifest(ctx context.Context, client *http.Client, port int, repo, tag string) error {
+	desc, manifestBytes, err := s.readLayoutManifest(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, "fastpull image index failed", "err", err)
-		return nil, nil, "", v1.Hash{}, fmt.Errorf("fastpull: index: %w", err)
+		return err
 	}
-	indexManifest, err := idx.IndexManifest()
-	if err != nil {
-		slog.ErrorContext(ctx, "fastpull index manifest failed", "err", err)
-		return nil, nil, "", v1.Hash{}, fmt.Errorf("fastpull: index manifest: %w", err)
+	base := "http://" + loopbackHost + ":" + strconv.Itoa(port) + "/v2/" + repo + "/manifests/"
+	if err := putManifest(ctx, client, base+desc.Digest, desc.MediaType, manifestBytes); err != nil {
+		return err
 	}
-	archDigest, err := selectArm64(indexManifest.Manifests)
-	if err != nil {
-		slog.ErrorContext(ctx, "fastpull arch select failed", "err", err)
-		return nil, nil, "", v1.Hash{}, err
-	}
-	img, err := idx.Image(archDigest)
-	if err != nil {
-		slog.ErrorContext(ctx, "fastpull index image failed", "err", err)
-		return nil, nil, "", v1.Hash{}, fmt.Errorf("fastpull: index image: %w", err)
-	}
-	idxRaw, err := idx.RawManifest()
-	if err != nil {
-		slog.ErrorContext(ctx, "fastpull index raw failed", "err", err)
-		return nil, nil, "", v1.Hash{}, fmt.Errorf("fastpull: index raw: %w", err)
-	}
-	mediaType, err := idx.MediaType()
-	if err != nil {
-		slog.ErrorContext(ctx, "fastpull index media type failed", "err", err)
-		return nil, nil, "", v1.Hash{}, fmt.Errorf("fastpull: index media type: %w", err)
-	}
-	return img, idxRaw, string(mediaType), archDigest, nil
-}
-
-// downloadBlobs fetches every blob not already present, writing each to
-// <dir>/sha256/<hex>, which is exactly where the ggcr disk handler reads it.
-func (s *Stager) downloadBlobs(ctx context.Context, client *http.Client, scheme, host, repo string, blobs []v1.Descriptor) error {
-	items := make([]aria2.Item, 0, len(blobs))
-	for _, blob := range blobs {
-		outPath := filepath.Join(s.dir, blob.Digest.Algorithm, blob.Digest.Hex)
-		if info, statErr := os.Stat(outPath); statErr == nil && info.Size() == blob.Size {
-			continue
-		}
-		items = append(items, aria2.Item{
-			URL:     scheme + "://" + host + "/v2/" + repo + "/blobs/" + blob.Digest.String(),
-			OutPath: outPath,
-		})
-	}
-	if len(items) == 0 {
-		return nil
-	}
-	token := fetchPullToken(ctx, client, scheme, host, repo)
-	authHeader := ""
-	if token != "" {
-		authHeader = "Authorization: Bearer " + token
-	}
-	if err := s.download(ctx, items, authHeader, aria2.Options{
-		Split:            s.split,
-		MaxConnPerServer: s.maxConnPerServer,
-		MaxConcurrent:    s.maxConcurrent,
-	}); err != nil {
-		slog.ErrorContext(ctx, "fastpull blob download failed", "err", err, "blobs", len(items))
-		return fmt.Errorf("fastpull: download blobs: %w", err)
+	if err := putManifest(ctx, client, base+tag, desc.MediaType, manifestBytes); err != nil {
+		return err
 	}
 	return nil
 }
 
-// registerManifests PUTs the arm64 image manifest by digest, then serves the tag:
-// the index when there is one, otherwise the arm64 image manifest.
-func (s *Stager) registerManifests(ctx context.Context, client *http.Client, port int, repo, tag string, img v1.Image, archDigest v1.Hash, idxRaw []byte, idxMediaType string) error {
-	base := "http://" + loopbackHost + ":" + strconv.Itoa(port) + "/v2/" + repo + "/manifests/"
-	armRaw, err := img.RawManifest()
+func (s *Stager) readLayoutManifest(ctx context.Context) (ociDescriptor, []byte, error) {
+	indexPath := filepath.Join(s.dir, "index.json")
+	indexBytes, err := os.ReadFile(indexPath)
 	if err != nil {
-		slog.ErrorContext(ctx, "fastpull arm raw manifest failed", "err", err)
-		return fmt.Errorf("fastpull: arm raw manifest: %w", err)
+		slog.ErrorContext(ctx, "fastpull read OCI index failed", "err", err, "path", indexPath)
+		return ociDescriptor{}, nil, fmt.Errorf("fastpull: read OCI index %s: %w", indexPath, err)
 	}
-	armMediaType, err := img.MediaType()
+	var index ociIndex
+	if err := json.Unmarshal(indexBytes, &index); err != nil {
+		slog.ErrorContext(ctx, "fastpull parse OCI index failed", "err", err, "path", indexPath)
+		return ociDescriptor{}, nil, fmt.Errorf("fastpull: parse OCI index %s: %w", indexPath, err)
+	}
+	if len(index.Manifests) != 1 {
+		err := fmt.Errorf("fastpull: OCI index has %d manifests, want 1", len(index.Manifests))
+		slog.ErrorContext(ctx, "fastpull OCI index manifest count invalid", "err", err, "path", indexPath)
+		return ociDescriptor{}, nil, err
+	}
+	desc := index.Manifests[0]
+	if desc.MediaType == "" || desc.Digest == "" {
+		err := fmt.Errorf("fastpull: OCI index manifest descriptor missing mediaType or digest")
+		slog.ErrorContext(ctx, "fastpull OCI descriptor invalid", "err", err, "path", indexPath)
+		return ociDescriptor{}, nil, err
+	}
+	manifestPath, err := blobPathForDigest(s.dir, desc.Digest)
 	if err != nil {
-		slog.ErrorContext(ctx, "fastpull arm media type failed", "err", err)
-		return fmt.Errorf("fastpull: arm media type: %w", err)
+		slog.ErrorContext(ctx, "fastpull OCI manifest digest invalid", "err", err, "digest", desc.Digest)
+		return ociDescriptor{}, nil, err
 	}
-	if err := putManifest(ctx, client, base+archDigest.String(), string(armMediaType), armRaw); err != nil {
-		return err
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		slog.ErrorContext(ctx, "fastpull read OCI manifest blob failed", "err", err, "path", manifestPath)
+		return ociDescriptor{}, nil, fmt.Errorf("fastpull: read OCI manifest %s: %w", manifestPath, err)
 	}
-	if idxRaw != nil {
-		return putManifest(ctx, client, base+tag, idxMediaType, idxRaw)
+	return desc, manifestBytes, nil
+}
+
+func blobPathForDigest(layoutDir string, digest string) (string, error) {
+	algorithm, hexValue, found := strings.Cut(digest, ":")
+	if !found || algorithm == "" || hexValue == "" {
+		return "", fmt.Errorf("fastpull: invalid digest %q", digest)
 	}
-	return putManifest(ctx, client, base+tag, string(armMediaType), armRaw)
+	return filepath.Join(layoutDir, "blobs", algorithm, hexValue), nil
 }
 
 // putManifest PUTs raw manifest bytes to the loopback registry.
 func putManifest(ctx context.Context, client *http.Client, url, mediaType string, body []byte) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, mediaTypeReader(body))
 	if err != nil {
 		slog.ErrorContext(ctx, "fastpull build put failed", "err", err, "url", url)
 		return fmt.Errorf("fastpull: build put %s: %w", url, err)
@@ -277,4 +210,8 @@ func putManifest(ctx context.Context, client *http.Client, url, mediaType string
 		return err
 	}
 	return nil
+}
+
+func mediaTypeReader(body []byte) *bytes.Reader {
+	return bytes.NewReader(body)
 }

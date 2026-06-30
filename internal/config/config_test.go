@@ -49,12 +49,6 @@ private_key_path = "/tmp/key.pem"
 	if !*cfg.Tart.FastPull {
 		t.Error("default fast pull should be true")
 	}
-	if cfg.Tart.FastPullSplit != 16 {
-		t.Errorf("default fast pull split = %d", cfg.Tart.FastPullSplit)
-	}
-	if cfg.Tart.FastPullConnections != 8 {
-		t.Errorf("default fast pull connections = %d", cfg.Tart.FastPullConnections)
-	}
 	wantFastPullDir := filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
 	if cfg.Tart.FastPullDir != wantFastPullDir {
 		t.Errorf("default fast pull dir = %q, want %q", cfg.Tart.FastPullDir, wantFastPullDir)
@@ -133,19 +127,17 @@ func TestResolveImageRejectsUnsafeConfiguredTag(t *testing.T) {
 			WebhookCIDRsPath:  "",
 		},
 		Tart: TartConfig{
-			Binary:              "tart",
-			GoldenImage:         "",
-			BaseImage:           DefaultBaseImage,
-			WarmBudget:          2,
-			GoldenBudget:        3,
-			Images:              []ImageMapping{{MacOS: "tahoe", Xcode: "raw", Tag: "docker.io/library/alpine:latest"}},
-			VMNamePrefix:        "gha-runner",
-			CacheDir:            "",
-			FastPull:            nil,
-			FastPullSplit:       0,
-			FastPullConnections: 0,
-			FastPullDir:         "",
-			FastPullKeepBlobs:   nil,
+			Binary:            "tart",
+			GoldenImage:       "",
+			BaseImage:         DefaultBaseImage,
+			WarmBudget:        2,
+			GoldenBudget:      3,
+			Images:            []ImageMapping{{MacOS: "tahoe", Xcode: "raw", Tag: "docker.io/library/alpine:latest"}},
+			VMNamePrefix:      "gha-runner",
+			CacheDir:          "",
+			FastPull:          nil,
+			FastPullDir:       "",
+			FastPullKeepBlobs: nil,
 		},
 		Labels:       []string{"self-hosted"},
 		AllowedRepos: []string{"agoodkind/lmd"},

@@ -8,6 +8,7 @@ package install
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"strings"
@@ -68,6 +69,14 @@ func Uninstall(ctx context.Context, cfg Config) error {
 func command(ctx context.Context, name string, args ...string) *exec.Cmd {
 	slog.DebugContext(ctx, "install command built", "name", name, "args", strings.Join(args, " "))
 	return exec.CommandContext(ctx, name, args...)
+}
+
+func requireHostBinary(ctx context.Context, binary string, installHint string) error {
+	if _, err := exec.LookPath(binary); err != nil {
+		slog.ErrorContext(ctx, "required host binary not found on PATH", "err", err, "binary", binary)
+		return fmt.Errorf("install: %s not found on PATH; install it with `%s`: %w", binary, installHint, err)
+	}
+	return nil
 }
 
 // printOperatorNotice logs the steps the installer cannot perform, so the

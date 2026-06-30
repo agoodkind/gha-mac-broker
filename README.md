@@ -34,6 +34,9 @@ the install location, or `--no-service` to install only the binary. After
 install, set `app.app_id` in the config, place the App private key at
 `app.private_key_path`, and set up the Cloudflare tunnel.
 
+Host prerequisites are Tart and skopeo. On macOS, install them with
+`brew install cirruslabs/cli/tart skopeo`.
+
 ## Build
 
 ```sh

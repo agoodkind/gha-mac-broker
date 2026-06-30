@@ -88,11 +88,7 @@ type TartConfig struct {
 	// FastPull enables the fast parallel base-image pull path when true. Nil
 	// means enabled.
 	FastPull *bool `toml:"fast_pull"`
-	// FastPullSplit is the number of connections used per blob.
-	FastPullSplit int `toml:"fast_pull_split"`
-	// FastPullConnections is the maximum number of blobs downloaded at once.
-	FastPullConnections int `toml:"fast_pull_connections"`
-	// FastPullDir is the directory where downloaded blobs land.
+	// FastPullDir is the OCI layout directory where skopeo stores pulled blobs.
 	FastPullDir string `toml:"fast_pull_dir"`
 	// FastPullKeepBlobs keeps downloaded blobs for fast rebuilds when true. Nil
 	// means true.
@@ -174,12 +170,6 @@ func (c *Config) applyDefaults() {
 	if c.Tart.FastPull == nil {
 		c.Tart.FastPull = new(bool)
 		*c.Tart.FastPull = true
-	}
-	if c.Tart.FastPullSplit == 0 {
-		c.Tart.FastPullSplit = 16
-	}
-	if c.Tart.FastPullConnections == 0 {
-		c.Tart.FastPullConnections = 8
 	}
 	if c.Tart.FastPullDir == "" {
 		if c.Tart.CacheDir != "" {
