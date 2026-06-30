@@ -81,7 +81,10 @@ install_bin() {
 
     url="https://github.com/$REPO/releases/download/$tag/gha-mac-broker_${platform}.tar.gz"
     tmpdir="$(mktemp -d)"
-    trap 'rm -rf "$tmpdir"' RETURN
+    # Expand tmpdir into the trap now and fire on EXIT, so cleanup still runs
+    # when the function exits via die (which calls exit, skipping a RETURN trap).
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" EXIT
 
     tarball="$tmpdir/gha-mac-broker.tar.gz"
     printf 'install.sh: downloading %s\n' "$url"

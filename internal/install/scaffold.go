@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -57,8 +58,13 @@ func ensureConfigDir(ctx context.Context, dir string) error {
 // replacing the placeholder home with the real home. The App ID placeholder is
 // left for the operator to fill.
 func scaffoldConfig(ctx context.Context, cfg Config) error {
-	if _, err := os.Stat(cfg.ConfigPath); err == nil {
+	_, statErr := os.Stat(cfg.ConfigPath)
+	if statErr == nil {
 		return nil
+	}
+	if !errors.Is(statErr, os.ErrNotExist) {
+		slog.ErrorContext(ctx, "stat config failed", "err", statErr, "path", cfg.ConfigPath)
+		return fmt.Errorf("install: stat config %s: %w", cfg.ConfigPath, statErr)
 	}
 	rendered := strings.ReplaceAll(exampleConfig, placeholderHome, cfg.Home)
 	if err := os.WriteFile(cfg.ConfigPath, []byte(rendered), configFileMode); err != nil {
@@ -80,8 +86,13 @@ func ensureSecrets(ctx context.Context, dir string) error {
 // ensureSecret writes a hex-encoded 32-byte random secret at mode 0600 with no
 // trailing newline when the file is absent.
 func ensureSecret(ctx context.Context, path string) error {
-	if _, err := os.Stat(path); err == nil {
+	_, statErr := os.Stat(path)
+	if statErr == nil {
 		return nil
+	}
+	if !errors.Is(statErr, os.ErrNotExist) {
+		slog.ErrorContext(ctx, "stat secret failed", "err", statErr, "path", path)
+		return fmt.Errorf("install: stat secret %s: %w", path, statErr)
 	}
 	buf := make([]byte, secretBytes)
 	if _, err := rand.Read(buf); err != nil {
@@ -107,7 +118,12 @@ type metaResponse struct {
 // install continues.
 func ensureWebhookCIDRs(ctx context.Context, dir string) {
 	path := filepath.Join(dir, "github-webhook-cidrs.txt")
-	if _, err := os.Stat(path); err == nil {
+	_, statErr := os.Stat(path)
+	if statErr == nil {
+		return
+	}
+	if !errors.Is(statErr, os.ErrNotExist) {
+		slog.WarnContext(ctx, "stat github webhook CIDRs failed; continuing", "err", statErr, "path", path)
 		return
 	}
 	cidrs, err := fetchMetaHooks(ctx)
