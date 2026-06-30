@@ -85,6 +85,18 @@ type TartConfig struct {
 	// CacheDir is a host directory shared into each VM so the build cache
 	// survives VM deletion.
 	CacheDir string `toml:"cache_dir"`
+	// FastPull enables the fast parallel base-image pull path when true. Nil
+	// means enabled.
+	FastPull *bool `toml:"fast_pull"`
+	// FastPullSplit is the number of connections used per blob.
+	FastPullSplit int `toml:"fast_pull_split"`
+	// FastPullConnections is the maximum number of blobs downloaded at once.
+	FastPullConnections int `toml:"fast_pull_connections"`
+	// FastPullDir is the directory where downloaded blobs land.
+	FastPullDir string `toml:"fast_pull_dir"`
+	// FastPullKeepBlobs keeps downloaded blobs for fast rebuilds when true. Nil
+	// means true.
+	FastPullKeepBlobs *bool `toml:"fast_pull_keep_blobs"`
 }
 
 // ImageMapping maps a declared macOS and Xcode pair to an approved Cirrus tag.
@@ -150,6 +162,27 @@ func (c *Config) applyDefaults() {
 		c.Tart.Images = []ImageMapping{
 			{MacOS: "tahoe", Xcode: "26.5", Tag: c.Tart.BaseImage},
 		}
+	}
+	if c.Tart.FastPull == nil {
+		c.Tart.FastPull = new(bool)
+		*c.Tart.FastPull = true
+	}
+	if c.Tart.FastPullSplit == 0 {
+		c.Tart.FastPullSplit = 16
+	}
+	if c.Tart.FastPullConnections == 0 {
+		c.Tart.FastPullConnections = 8
+	}
+	if c.Tart.FastPullDir == "" {
+		if c.Tart.CacheDir != "" {
+			c.Tart.FastPullDir = filepath.Join(c.Tart.CacheDir, "fastpull-blobs")
+		} else {
+			c.Tart.FastPullDir = filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
+		}
+	}
+	if c.Tart.FastPullKeepBlobs == nil {
+		c.Tart.FastPullKeepBlobs = new(bool)
+		*c.Tart.FastPullKeepBlobs = true
 	}
 	if len(c.Labels) == 0 {
 		c.Labels = []string{"self-hosted", "macOS", "ARM64", "agk-local-macos-26"}

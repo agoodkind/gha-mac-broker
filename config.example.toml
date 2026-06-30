@@ -27,6 +27,12 @@ warm_budget    = 2
 golden_budget  = 3
 vm_name_prefix = "gha-runner"
 cache_dir      = "/Users/you/.tart/cache"
+# Fast parallel base-image pull (libaria2 plus a loopback registry). Defaults shown.
+fast_pull             = true
+fast_pull_split       = 16
+fast_pull_connections = 8
+fast_pull_keep_blobs  = true
+# fast_pull_dir defaults to <cache_dir>/fastpull-blobs
 # Control of each VM (readiness, job execution, liveness) runs over the
 # tart-exec vsock channel, so there is no SSH key, user, or VM network config
 # here. The VM keeps tart's default NAT only for its own IPv4 egress to GitHub.
