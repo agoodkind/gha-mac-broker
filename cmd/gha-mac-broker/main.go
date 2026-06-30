@@ -9,6 +9,8 @@
 //	jitconfig          mint a repo-scoped JIT runner config (proves App auth)
 //	bind               clone a warm VM, run one ephemeral job, tear it down
 //	serve              run the HTTP daemon with warm pool and webhook handler
+//	install            scaffold config and secrets, build golden, install the service
+//	uninstall          remove the installed service unit
 package main
 
 import (
@@ -23,6 +25,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -32,6 +36,7 @@ import (
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/golden"
+	"goodkind.io/gha-mac-broker/internal/install"
 	"goodkind.io/gha-mac-broker/internal/pool"
 	"goodkind.io/gha-mac-broker/internal/reservation"
 	"goodkind.io/gha-mac-broker/internal/server"
@@ -48,6 +53,8 @@ const (
 	commandBind        commandName = "bind"
 	commandServe       commandName = "serve"
 	commandBuildGolden commandName = "build-golden"
+	commandInstall     commandName = "install"
+	commandUninstall   commandName = "uninstall"
 )
 
 // httpTimeout bounds GitHub API calls.
@@ -85,6 +92,10 @@ func main() {
 		err = runServe(ctx, args)
 	case commandBuildGolden:
 		err = runBuildGolden(ctx, args)
+	case commandInstall:
+		err = runInstall(ctx, args)
+	case commandUninstall:
+		err = runUninstall(ctx, args)
 	default:
 		usage()
 		os.Exit(2)
@@ -96,7 +107,82 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|build-golden> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|build-golden|install|uninstall> [flags]")
+}
+
+// runInstall performs the full host setup: it scaffolds the config and secrets,
+// builds the golden image when missing, and installs the OS service unit.
+func runInstall(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("install", flag.ExitOnError)
+	configPath := fs.String("config", config.DefaultConfigPath(), "path to broker config TOML")
+	exe, err := os.Executable()
+	if err != nil {
+		slog.ErrorContext(ctx, "resolve executable failed", "err", err)
+		return fmt.Errorf("install: resolve executable: %w", err)
+	}
+	binPath := fs.String("bin", exe, "path to the installed broker binary")
+	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "install flag parse failed", "err", err)
+		return fmt.Errorf("install flags: %w", err)
+	}
+	cfg, err := buildInstallConfig(ctx, *configPath, *binPath)
+	if err != nil {
+		return err
+	}
+	if err := install.Install(ctx, cfg); err != nil {
+		return fmt.Errorf("run install: %w", err)
+	}
+	return nil
+}
+
+// runUninstall removes the installed service unit, leaving config and secrets.
+func runUninstall(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
+	configPath := fs.String("config", config.DefaultConfigPath(), "path to broker config TOML")
+	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "uninstall flag parse failed", "err", err)
+		return fmt.Errorf("uninstall flags: %w", err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		slog.ErrorContext(ctx, "resolve executable failed", "err", err)
+		return fmt.Errorf("uninstall: resolve executable: %w", err)
+	}
+	cfg, err := buildInstallConfig(ctx, *configPath, exe)
+	if err != nil {
+		return err
+	}
+	if err := install.Uninstall(ctx, cfg); err != nil {
+		return fmt.Errorf("run uninstall: %w", err)
+	}
+	return nil
+}
+
+// buildInstallConfig resolves the home directory and derives the install paths
+// the installer renders into the service unit and scaffolds on disk.
+func buildInstallConfig(ctx context.Context, configPath, binPath string) (install.Config, error) {
+	var zero install.Config
+	home, err := os.UserHomeDir()
+	if err != nil {
+		slog.ErrorContext(ctx, "resolve home dir failed", "err", err)
+		return zero, fmt.Errorf("resolve home dir: %w", err)
+	}
+	return install.Config{
+		BinPath:    binPath,
+		Home:       home,
+		ConfigDir:  filepath.Dir(configPath),
+		LogPath:    defaultLogPath(home),
+		ConfigPath: configPath,
+	}, nil
+}
+
+// defaultLogPath returns the daemon log path: the macOS Logs directory on
+// darwin, otherwise the XDG state directory.
+func defaultLogPath(home string) string {
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(home, "Library", "Logs", "gha-mac-broker.log")
+	}
+	return filepath.Join(home, ".local", "state", "gha-mac-broker", "gha-mac-broker.log")
 }
 
 // runBuildGolden builds and self-verifies the golden VM image from a Cirrus base
