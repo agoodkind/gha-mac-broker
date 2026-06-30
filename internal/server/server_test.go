@@ -21,14 +21,18 @@ import (
 // --- test stubs ---
 
 type testPool struct {
-	freeSlots int
-	leaseVM   *broker.WarmVM
-	leaseErr  error
-	mu        sync.Mutex
-	recycled  []*broker.WarmVM
+	freeSlots    int
+	leaseVM      *broker.WarmVM
+	leaseErr     error
+	mu           sync.Mutex
+	leasedImages []string
+	recycled     []*broker.WarmVM
 }
 
-func (p *testPool) Lease(_ context.Context) (*broker.WarmVM, error) {
+func (p *testPool) Lease(_ context.Context, image string) (*broker.WarmVM, error) {
+	p.mu.Lock()
+	p.leasedImages = append(p.leasedImages, image)
+	p.mu.Unlock()
 	return p.leaseVM, p.leaseErr
 }
 
@@ -42,27 +46,44 @@ func (p *testPool) Recycle(_ context.Context, vm *broker.WarmVM) {
 
 type testStore struct {
 	mu           sync.Mutex
-	reserved     map[string]struct{}
+	reserved     map[string]string
+	reserveCalls []reserveCall
 	consumed     []string
 	reserveAllow bool
 }
 
-func (s *testStore) Reserve(_ string, _ int) bool {
+type reserveCall struct {
+	RunID    string
+	Image    string
+	Capacity int
+}
+
+func (s *testStore) Reserve(runID, image string, capacity int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reserveCalls = append(s.reserveCalls, reserveCall{RunID: runID, Image: image, Capacity: capacity})
+	if s.reserveAllow {
+		if s.reserved == nil {
+			s.reserved = make(map[string]string)
+		}
+		s.reserved[runID] = image
+	}
 	return s.reserveAllow
 }
 
-func (s *testStore) Consume(runID string) bool {
+func (s *testStore) Consume(runID string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.reserved == nil {
-		return false
+		return "", false
 	}
-	if _, ok := s.reserved[runID]; ok {
+	image, ok := s.reserved[runID]
+	if ok {
 		delete(s.reserved, runID)
 		s.consumed = append(s.consumed, runID)
-		return true
+		return image, true
 	}
-	return false
+	return "", false
 }
 
 type testRunner struct {
@@ -92,10 +113,20 @@ func newTestConfig(allowedRepo string) *config.Config {
 			CapacityTokenPath: "",
 			WebhookCIDRsPath:  "",
 		},
-		Tart:         config.TartConfig{Binary: "tart", GoldenImage: "golden", VMNamePrefix: "gha", CacheDir: ""},
+		Tart: config.TartConfig{
+			Binary:       "tart",
+			GoldenImage:  "",
+			BaseImage:    config.DefaultBaseImage,
+			VMNamePrefix: "gha",
+			CacheDir:     "",
+			WarmBudget:   2,
+			GoldenBudget: 3,
+			Images: []config.ImageMapping{
+				{MacOS: "tahoe", Xcode: "26.5", Tag: config.DefaultBaseImage},
+			},
+		},
 		Labels:       []string{"self-hosted", "macOS"},
 		AllowedRepos: []string{allowedRepo},
-		PoolSize:     2,
 	}
 }
 
@@ -203,10 +234,11 @@ func TestWebhookNoMatchingLabelReturns204(t *testing.T) {
 }
 
 func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
-	vm := &broker.WarmVM{Name: "vm-1"}
+	vm := &broker.WarmVM{Name: "vm-1", Image: config.DefaultBaseImage}
 	pool := &testPool{freeSlots: 2, leaseVM: vm}
 	runner := &testRunner{ran: make(chan struct{}, 1)}
-	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool, &testStore{}, runner)
+	store := &testStore{reserved: map[string]string{"7": config.DefaultBaseImage}}
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool, store, runner)
 
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 7)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
@@ -223,6 +255,29 @@ func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
 	case <-runner.ran:
 	case <-time.After(2 * time.Second):
 		t.Fatal("RunJob was not called within timeout")
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(pool.leasedImages) != 1 || pool.leasedImages[0] != config.DefaultBaseImage {
+		t.Fatalf("leased images = %v, want %q", pool.leasedImages, config.DefaultBaseImage)
+	}
+}
+
+func TestWebhookQueuedWithoutReservationReturns204(t *testing.T) {
+	vm := &broker.WarmVM{Name: "vm-1", Image: config.DefaultBaseImage}
+	pool := &testPool{freeSlots: 2, leaseVM: vm}
+	runner := &testRunner{ran: make(chan struct{}, 1)}
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool, &testStore{}, runner)
+
+	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 7)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", signBody(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 without reservation, got %d", w.Code)
 	}
 }
 
@@ -261,8 +316,9 @@ func TestCapacityDisallowedRepo(t *testing.T) {
 }
 
 func TestCapacityAvailable(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 2}, &testStore{reserveAllow: true}, &testRunner{ran: make(chan struct{}, 1)})
-	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=2", nil)
+	store := &testStore{reserveAllow: true}
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 2}, store, &testRunner{ran: make(chan struct{}, 1)})
+	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=2&os=tahoe&xcode=26.5", nil)
 	req.Header.Set("Authorization", "Bearer test-capacity-token")
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
@@ -275,6 +331,35 @@ func TestCapacityAvailable(t *testing.T) {
 	}
 	if !resp.Available {
 		t.Fatal("expected available=true when pool has free slots")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.reserveCalls) != 1 || store.reserveCalls[0].Image != config.DefaultBaseImage {
+		t.Fatalf("reserve calls = %+v, want image %q", store.reserveCalls, config.DefaultBaseImage)
+	}
+}
+
+func TestCapacityUnmappedImageReturnsUnavailable(t *testing.T) {
+	store := &testStore{reserveAllow: true}
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{freeSlots: 2}, store, &testRunner{ran: make(chan struct{}, 1)})
+	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=22&os=tahoe&xcode=raw", nil)
+	req.Header.Set("Authorization", "Bearer test-capacity-token")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp capacityResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if resp.Available {
+		t.Fatal("expected available=false for unmapped image")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.reserveCalls) != 0 {
+		t.Fatalf("unmapped image should not reserve, got %+v", store.reserveCalls)
 	}
 }
 

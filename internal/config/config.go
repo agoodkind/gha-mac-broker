@@ -20,6 +20,12 @@ import (
 // build Swift; the CLI flag and config.toml both default to this.
 const DefaultBaseImage = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
 
+const (
+	defaultWarmBudget   = 2
+	defaultGoldenBudget = 3
+	cirrusImagePrefix   = "ghcr.io/cirruslabs/"
+)
+
 // Config is the broker's runtime configuration.
 type Config struct {
 	// ListenAddr is the address the webhook and capacity server binds to.
@@ -38,9 +44,6 @@ type Config struct {
 	// AllowedRepos is the owner/repo allowlist the broker will serve. A queued
 	// job for any other repository is ignored.
 	AllowedRepos []string `toml:"allowed_repos"`
-
-	// PoolSize is the number of warm VMs kept booted and idle.
-	PoolSize int `toml:"pool_size"`
 }
 
 // AppConfig holds GitHub App identity and secret references.
@@ -63,18 +66,32 @@ type AppConfig struct {
 type TartConfig struct {
 	// Binary is the tart executable (default "tart").
 	Binary string `toml:"binary"`
-	// GoldenImage is the source VM the pool clones. It has the runner binary
-	// installed but unconfigured.
+	// GoldenImage is kept for compatibility with older configs and manual
+	// build-golden flows; the runtime pool derives per-image golden names from
+	// image tags.
 	GoldenImage string `toml:"golden_image"`
 	// BaseImage is the Cirrus image the golden is built from. Declared here
 	// (not hardcoded in the binary) so the Xcode/base version is operator
 	// policy; defaults to [DefaultBaseImage].
 	BaseImage string `toml:"base_image"`
+	// WarmBudget is the maximum number of idle warm VMs cached across images.
+	WarmBudget int `toml:"warm_budget"`
+	// GoldenBudget is the maximum number of per-image golden VMs cached on disk.
+	GoldenBudget int `toml:"golden_budget"`
+	// Images maps declared macOS and Xcode versions to pullable Cirrus tags.
+	Images []ImageMapping `toml:"images"`
 	// VMNamePrefix prefixes ephemeral clone names.
 	VMNamePrefix string `toml:"vm_name_prefix"`
 	// CacheDir is a host directory shared into each VM so the build cache
 	// survives VM deletion.
 	CacheDir string `toml:"cache_dir"`
+}
+
+// ImageMapping maps a declared macOS and Xcode pair to an approved Cirrus tag.
+type ImageMapping struct {
+	MacOS string `toml:"macos"`
+	Xcode string `toml:"xcode"`
+	Tag   string `toml:"tag"`
 }
 
 // DefaultConfigPath returns the XDG-aware default config file path:
@@ -123,8 +140,16 @@ func (c *Config) applyDefaults() {
 	if c.Tart.BaseImage == "" {
 		c.Tart.BaseImage = DefaultBaseImage
 	}
-	if c.PoolSize == 0 {
-		c.PoolSize = 2
+	if c.Tart.WarmBudget == 0 {
+		c.Tart.WarmBudget = defaultWarmBudget
+	}
+	if c.Tart.GoldenBudget == 0 {
+		c.Tart.GoldenBudget = defaultGoldenBudget
+	}
+	if len(c.Tart.Images) == 0 {
+		c.Tart.Images = []ImageMapping{
+			{MacOS: "tahoe", Xcode: "26.5", Tag: c.Tart.BaseImage},
+		}
 	}
 	if len(c.Labels) == 0 {
 		c.Labels = []string{"self-hosted", "macOS", "ARM64", "agk-local-macos-26"}
@@ -139,16 +164,81 @@ func (c *Config) validate() error {
 	if c.App.PrivateKeyPath == "" {
 		missing = append(missing, "app.private_key_path")
 	}
-	if c.Tart.GoldenImage == "" {
-		missing = append(missing, "tart.golden_image")
-	}
 	if len(c.AllowedRepos) == 0 {
 		missing = append(missing, "allowed_repos")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("config: missing required fields: %s", strings.Join(missing, ", "))
 	}
+	if !safeCirrusImageTag(c.Tart.BaseImage) {
+		return fmt.Errorf("config: tart.base_image must be a ghcr.io/cirruslabs/macos-*-xcode:* tag")
+	}
+	for _, image := range c.Tart.Images {
+		if image.MacOS == "" || image.Xcode == "" || image.Tag == "" {
+			return fmt.Errorf("config: tart.images entries require macos, xcode, and tag")
+		}
+		if !safeCirrusImageTag(image.Tag) {
+			return fmt.Errorf("config: tart.images tag %q must be a ghcr.io/cirruslabs/macos-*-xcode:* tag", image.Tag)
+		}
+	}
 	return nil
+}
+
+// ResolveImage maps a declared macOS and Xcode request to an approved Cirrus
+// image tag. An omitted pair resolves to tart.base_image. Partial, unmapped, or
+// unsafe requests return ok=false.
+func (c *Config) ResolveImage(macos, xcode string) (tag string, ok bool) {
+	macos = normalizeImageKey(macos)
+	xcode = normalizeImageKey(xcode)
+	if macos == "" && xcode == "" {
+		if safeCirrusImageTag(c.Tart.BaseImage) {
+			return c.Tart.BaseImage, true
+		}
+		return "", false
+	}
+	if macos == "" || xcode == "" {
+		return "", false
+	}
+	for _, image := range c.Tart.Images {
+		if normalizeImageKey(image.MacOS) != macos {
+			continue
+		}
+		if normalizeImageKey(image.Xcode) != xcode {
+			continue
+		}
+		if !safeCirrusImageTag(image.Tag) {
+			return "", false
+		}
+		return image.Tag, true
+	}
+	return "", false
+}
+
+func normalizeImageKey(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func safeCirrusImageTag(tag string) bool {
+	tag = strings.TrimSpace(tag)
+	repository, version, ok := strings.Cut(tag, ":")
+	if !ok {
+		return false
+	}
+	if version == "" || strings.ContainsAny(version, "/ \t\r\n") {
+		return false
+	}
+	if !strings.HasPrefix(repository, cirrusImagePrefix+"macos-") {
+		return false
+	}
+	if !strings.HasSuffix(repository, "-xcode") {
+		return false
+	}
+	macosPart := strings.TrimPrefix(repository, cirrusImagePrefix+"macos-")
+	macosPart = strings.TrimSuffix(macosPart, "-xcode")
+	if macosPart == "" {
+		return false
+	}
+	return !strings.ContainsAny(macosPart, "/ \t\r\n")
 }
 
 // RepoAllowed reports whether owner/repo is in the allowlist.

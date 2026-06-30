@@ -1,6 +1,5 @@
-// Package pool maintains a warm pool of pre-booted Tart VMs so jobs skip
-// boot cost. The pool keeps up to size idle VMs and refills automatically as
-// VMs are leased out or recycled after a job completes.
+// Package pool maintains a demand-driven, image-keyed warm cache of Tart VMs so
+// jobs skip boot cost when their declared macOS/Xcode image is hot.
 package pool
 
 import (
@@ -8,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,224 +15,477 @@ import (
 	"goodkind.io/gha-mac-broker/internal/broker"
 )
 
-// warmFailDelay is the back-off pause between a failed Warm call and the next
-// refill signal. It prevents a tight goroutine retry loop when Warm fails
-// persistently (e.g. tart binary missing or golden image unavailable).
+// warmFailDelay is the back-off pause between a failed background Warm call and
+// the next retry. It prevents a tight goroutine loop when Warm fails
+// persistently, for example when tart or a base image is unavailable.
 const warmFailDelay = 5 * time.Second
 
-// Warmer creates and tears down warm VMs, and sweeps orphaned VMs left by a
-// prior process. *broker.Binder satisfies this interface; tests use a stub.
+// Warmer creates and tears down warm VMs, evicts per-image goldens, and sweeps
+// orphaned VMs left by a prior process. *broker.Binder satisfies this
+// interface; tests use a stub.
 type Warmer interface {
-	Warm(ctx context.Context, id string) (*broker.WarmVM, error)
+	Warm(ctx context.Context, image, id string) (*broker.WarmVM, error)
 	Teardown(ctx context.Context, vm *broker.WarmVM)
+	DeleteGolden(ctx context.Context, image string) error
 	SweepOrphans(ctx context.Context)
 }
 
-// Pool keeps up to size idle warm VMs and refills as VMs are leased or
-// recycled. Start must be called once before Lease.
-type Pool struct {
-	size      int
-	warmer    Warmer
-	idle      chan *broker.WarmVM
-	refill    chan struct{}
-	done      chan struct{}
-	mu        sync.Mutex
-	warming   int
-	counter   atomic.Int64
-	runToken  string // per-process token embedded in VM names; prevents cross-restart and cross-process name collisions
-	wg        sync.WaitGroup
-	failDelay time.Duration // overrides warmFailDelay in tests; zero uses warmFailDelay
+type imageState struct {
+	warm       *broker.WarmVM
+	warming    bool
+	warmCancel context.CancelFunc
+	golden     bool
 }
 
-// New returns a Pool of the given size backed by the given Warmer. runToken is a
-// per-process token embedded in every VM name (alongside an incrementing
-// counter), so names never repeat across restarts and never collide between two
-// overlapping processes. Call Start to begin the fill loop.
-func New(size int, w Warmer, runToken string) *Pool {
+// Pool keeps a bounded image-keyed cache of idle warm VMs and per-image golden
+// disks. Start must be called once before Lease.
+type Pool struct {
+	warmBudget   int
+	goldenBudget int
+	warmer       Warmer
+	done         chan struct{}
+	shutdownOnce sync.Once
+	mu           sync.Mutex
+	shuttingDown bool
+	states       map[string]*imageState
+	lru          []string
+	leased       int
+	counter      atomic.Int64
+	runToken     string // per-process token embedded in VM names; prevents cross-restart and cross-process name collisions
+	wg           sync.WaitGroup
+	failDelay    time.Duration // overrides warmFailDelay in tests; zero uses warmFailDelay
+}
+
+// New returns a Pool backed by the given Warmer. warmBudget bounds idle warm
+// VMs across all images, goldenBudget bounds derived golden disks, and runToken
+// is embedded in each VM name beside an incrementing counter so names do not
+// repeat across restarts or overlapping processes.
+func New(warmBudget, goldenBudget int, w Warmer, runToken string) *Pool {
 	return &Pool{
-		size:      size,
-		warmer:    w,
-		idle:      make(chan *broker.WarmVM, size),
-		refill:    make(chan struct{}, 1),
-		done:      make(chan struct{}),
-		mu:        sync.Mutex{},
-		warming:   0,
-		counter:   atomic.Int64{},
-		runToken:  runToken,
-		wg:        sync.WaitGroup{},
-		failDelay: 0,
+		warmBudget:   warmBudget,
+		goldenBudget: goldenBudget,
+		warmer:       w,
+		done:         make(chan struct{}),
+		shutdownOnce: sync.Once{},
+		mu:           sync.Mutex{},
+		shuttingDown: false,
+		states:       make(map[string]*imageState),
+		lru:          nil,
+		leased:       0,
+		counter:      atomic.Int64{},
+		runToken:     runToken,
+		wg:           sync.WaitGroup{},
+		failDelay:    0,
 	}
 }
 
-// Start launches the background fill goroutine. It returns immediately; the
-// fill loop runs until ctx is cancelled or Shutdown is called. The goroutine
-// is tracked by wg so Shutdown waits for it to exit before draining idle VMs.
+// Start launches the orphan-sweep goroutine. It returns immediately; the
+// goroutine is tracked by wg so Shutdown waits for it before returning.
 func (p *Pool) Start(ctx context.Context) {
 	p.wg.Go(func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "fillLoop panic recovered", "err", fmt.Errorf("panic: %v", r))
+				slog.ErrorContext(ctx, "pool start goroutine panic recovered", "err", fmt.Errorf("panic: %v", r))
 			}
 		}()
-		p.fillLoop(ctx)
+		p.warmer.SweepOrphans(ctx)
+		select {
+		case <-ctx.Done():
+		case <-p.done:
+		}
 	})
 }
 
-// Lease returns an idle warm VM, blocking until one is available or ctx is
-// done. A successful Lease decrements the idle count and triggers a refill.
-func (p *Pool) Lease(ctx context.Context) (*broker.WarmVM, error) {
-	select {
-	case vm := <-p.idle:
-		p.sendRefill()
+// Lease returns a VM for image. It uses a matching warm VM when one is cached,
+// otherwise it clones one on demand. Successful leases mark image most recently
+// used and start a background replacement warm when the warm budget permits it.
+func (p *Pool) Lease(ctx context.Context, image string) (*broker.WarmVM, error) {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return nil, fmt.Errorf("pool: lease image is required")
+	}
+	vm, hit, err := p.beginLease(image)
+	if err != nil {
+		return nil, err
+	}
+	if hit {
+		p.startWarmIfNeeded(ctx, image)
 		return vm, nil
-	case <-ctx.Done():
-		slog.ErrorContext(ctx, "lease context done", "err", ctx.Err())
-		return nil, fmt.Errorf("pool: lease: %w", ctx.Err())
 	}
+
+	id := p.nextID()
+	vm, err = p.warmer.Warm(ctx, image, id)
+	if err != nil {
+		p.finishLease()
+		slog.WarnContext(ctx, "on-demand warm failed", "err", err, "image", image, "id", id)
+		return nil, fmt.Errorf("pool: warm %s: %w", image, err)
+	}
+	if vm.Image == "" {
+		vm.Image = image
+	}
+	p.recordGolden(ctx, image)
+	p.startWarmIfNeeded(ctx, image)
+	return vm, nil
 }
 
-// Recycle tears down the VM and triggers a refill so the pool stays at size.
+// Recycle tears down a leased VM, releases its lease slot, and refreshes the
+// image's warm cache entry when the image is still recent.
 func (p *Pool) Recycle(ctx context.Context, vm *broker.WarmVM) {
+	image := vm.Image
 	p.warmer.Teardown(ctx, vm)
-	p.sendRefill()
-}
-
-// Shutdown stops the fill loop, waits for in-flight warm goroutines to finish,
-// and tears down all idle VMs.
-func (p *Pool) Shutdown(ctx context.Context) {
-	close(p.done)
-	p.wg.Wait()
-	for {
-		select {
-		case vm := <-p.idle:
-			p.warmer.Teardown(ctx, vm)
-		default:
-			return
-		}
+	p.finishLease()
+	if image != "" {
+		p.startWarmIfNeeded(ctx, image)
 	}
 }
 
-// FreeSlots returns the count of idle VMs plus in-progress warm goroutines.
-// It is used by the capacity endpoint to indicate available capacity.
+// Shutdown stops background warming, waits for in-flight goroutines, and tears
+// down all cached idle VMs.
+func (p *Pool) Shutdown(ctx context.Context) {
+	p.shutdownOnce.Do(func() {
+		p.mu.Lock()
+		p.shuttingDown = true
+		warmCancels := p.takeWarmCancelsLocked()
+		warmVMs := p.takeAllWarmLocked()
+		p.mu.Unlock()
+
+		for _, cancel := range warmCancels {
+			cancel()
+		}
+		close(p.done)
+		p.wg.Wait()
+		for _, vm := range warmVMs {
+			p.warmer.Teardown(ctx, vm)
+		}
+	})
+}
+
+// FreeSlots returns the remaining active lease capacity. The reservation store
+// uses this as its capacity ceiling so outstanding reservations and running jobs
+// do not overbook the warm budget.
 func (p *Pool) FreeSlots() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.idle) + p.warming
+	freeSlots := p.warmBudget - p.leased
+	if freeSlots < 0 {
+		return 0
+	}
+	return freeSlots
 }
 
-// fillLoop runs until ctx is done or done is closed, triggering tryFill on
-// each refill signal.
-func (p *Pool) fillLoop(ctx context.Context) {
-	// Clear any VMs orphaned by a previous process before filling so a hard
-	// restart cannot leave stale clones behind or collide on a reused name.
-	p.warmer.SweepOrphans(ctx)
-	p.tryFill(ctx)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-p.done:
-			return
-		case <-p.refill:
-			p.tryFill(ctx)
-		}
+func (p *Pool) beginLease(image string) (*broker.WarmVM, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.shuttingDown {
+		return nil, false, fmt.Errorf("pool: shutting down")
+	}
+	if p.warmBudget <= 0 {
+		return nil, false, fmt.Errorf("pool: warm budget is zero")
+	}
+	if p.leased >= p.warmBudget {
+		return nil, false, fmt.Errorf("pool: no free lease slots")
+	}
+	p.leased++
+	state := p.markMRULocked(image)
+	if state.warm == nil {
+		return nil, false, nil
+	}
+	vm := state.warm
+	state.warm = nil
+	p.cleanupStateLocked(image)
+	return vm, true, nil
+}
+
+func (p *Pool) finishLease() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.leased > 0 {
+		p.leased--
 	}
 }
 
-// tryFill starts warm goroutines until the pool is at capacity or done is
-// closed.
-func (p *Pool) tryFill(ctx context.Context) {
-	for {
-		select {
-		case <-p.done:
-			return
-		default:
-		}
-
-		p.mu.Lock()
-		need := p.size - len(p.idle) - p.warming
-		if need <= 0 {
-			p.mu.Unlock()
-			return
-		}
-		p.warming++
-		// Add to wg while the mutex is still held so Shutdown's wg.Wait()
-		// cannot return between the unlock and the goroutine launch.
-		p.wg.Add(1)
-		p.mu.Unlock()
-
-		id := p.runToken + "-" + strconv.FormatInt(p.counter.Add(1), 10)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					slog.ErrorContext(ctx, "warmOne panic recovered", "err", fmt.Errorf("panic: %v", r), "id", id)
-				}
-			}()
-			p.warmOne(ctx, id)
-		}()
-	}
+func (p *Pool) recordGolden(ctx context.Context, image string) {
+	p.mu.Lock()
+	state := p.markMRULocked(image)
+	state.golden = true
+	deletedGoldens := p.evictGoldensLocked()
+	p.mu.Unlock()
+	p.deleteGoldens(ctx, deletedGoldens)
 }
 
-// warmOne calls Warm, decrements the warming counter, and sends the result to
-// idle (or tears it down if the pool is shutting down).
-//
-// warming is decremented explicitly on every path, always before any
-// sendRefill call, so tryFill observes the correct in-flight count.
-func (p *Pool) warmOne(ctx context.Context, id string) {
-	defer p.wg.Done()
-
-	vm, err := p.warmer.Warm(ctx, id)
-	if err != nil {
-		slog.WarnContext(ctx, "warm failed", "err", err, "id", id)
-		// Back off before signalling a refill so a persistent Warm failure
-		// (e.g. tart missing or image unavailable) does not spin goroutines.
-		delay := p.failDelay
-		if delay == 0 {
-			delay = warmFailDelay
-		}
-		retryTimer := time.NewTimer(delay)
-		defer retryTimer.Stop()
-		select {
-		case <-retryTimer.C:
-		case <-p.done:
-			p.mu.Lock()
-			p.warming--
-			p.mu.Unlock()
-			return
-		case <-ctx.Done():
-			p.mu.Lock()
-			p.warming--
-			p.mu.Unlock()
-			return
-		}
-		// Decrement before sending the refill signal so tryFill sees the
-		// correct warming count and spawns a replacement goroutine.
-		p.mu.Lock()
-		p.warming--
+func (p *Pool) startWarmIfNeeded(ctx context.Context, image string) {
+	p.mu.Lock()
+	if p.shuttingDown || p.warmBudget <= 0 {
 		p.mu.Unlock()
-		p.sendRefill()
 		return
 	}
-
-	// Decrement before placing the VM into idle so that a concurrent Lease
-	// (which calls sendRefill) triggers tryFill with the correct count.
-	p.mu.Lock()
-	p.warming--
+	state := p.ensureStateLocked(image)
+	if state.warm != nil || state.warming {
+		p.mu.Unlock()
+		return
+	}
+	evictedWarm := p.evictWarmForSlotLocked()
+	if p.countWarmSlotsLocked() >= p.warmBudget {
+		p.mu.Unlock()
+		p.teardownWarm(context.WithoutCancel(ctx), evictedWarm)
+		return
+	}
+	warmCtx, warmCancel := context.WithCancel(context.WithoutCancel(ctx))
+	state.warming = true
+	state.warmCancel = warmCancel
+	id := p.nextID()
+	p.wg.Add(1)
 	p.mu.Unlock()
 
-	select {
-	case p.idle <- vm:
-	case <-p.done:
+	p.teardownWarm(context.WithoutCancel(ctx), evictedWarm)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(warmCtx, "warm cache goroutine panic recovered", "err", fmt.Errorf("panic: %v", r), "image", image, "id", id)
+			}
+		}()
+		p.warmCache(warmCtx, warmCancel, image, id)
+	}()
+}
+
+func (p *Pool) warmCache(ctx context.Context, cancel context.CancelFunc, image, id string) {
+	defer p.wg.Done()
+	defer cancel()
+
+	vm, err := p.warmer.Warm(ctx, image, id)
+	if err != nil {
+		slog.WarnContext(ctx, "background warm failed", "err", err, "image", image, "id", id)
+		p.clearWarming(image)
+		p.waitBeforeRetry(ctx, image)
+		return
+	}
+	if vm.Image == "" {
+		vm.Image = image
+	}
+
+	p.mu.Lock()
+	state := p.ensureStateLocked(image)
+	state.warming = false
+	state.warmCancel = nil
+	if p.shuttingDown {
+		p.cleanupStateLocked(image)
+		p.mu.Unlock()
 		p.warmer.Teardown(ctx, vm)
+		return
+	}
+	duplicateWarm := state.warm
+	state.warm = vm
+	state.golden = true
+	evictedWarm := p.evictWarmOverBudgetLocked()
+	deletedGoldens := p.evictGoldensLocked()
+	p.mu.Unlock()
+
+	if duplicateWarm != nil {
+		p.warmer.Teardown(ctx, duplicateWarm)
+	}
+	p.teardownWarm(ctx, evictedWarm)
+	p.deleteGoldens(ctx, deletedGoldens)
+}
+
+func (p *Pool) clearWarming(image string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	state := p.ensureStateLocked(image)
+	state.warming = false
+	state.warmCancel = nil
+	p.cleanupStateLocked(image)
+}
+
+func (p *Pool) waitBeforeRetry(ctx context.Context, image string) {
+	delay := p.failDelay
+	if delay == 0 {
+		delay = warmFailDelay
+	}
+	retryTimer := time.NewTimer(delay)
+	defer retryTimer.Stop()
+	select {
+	case <-retryTimer.C:
+	case <-p.done:
+		return
 	case <-ctx.Done():
+		return
+	}
+	p.startWarmIfNeeded(ctx, image)
+}
+
+func (p *Pool) nextID() string {
+	return p.runToken + "-" + strconv.FormatInt(p.counter.Add(1), 10)
+}
+
+func (p *Pool) markMRULocked(image string) *imageState {
+	state := p.ensureStateLocked(image)
+	p.removeFromLRULocked(image)
+	p.lru = append(p.lru, image)
+	return state
+}
+
+func (p *Pool) ensureStateLocked(image string) *imageState {
+	state, ok := p.states[image]
+	if ok {
+		return state
+	}
+	state = &imageState{
+		warm:       nil,
+		warming:    false,
+		warmCancel: nil,
+		golden:     false,
+	}
+	p.states[image] = state
+	p.lru = append(p.lru, image)
+	return state
+}
+
+func (p *Pool) removeFromLRULocked(image string) {
+	for index, value := range p.lru {
+		if value != image {
+			continue
+		}
+		p.lru = append(p.lru[:index], p.lru[index+1:]...)
+		return
+	}
+}
+
+func (p *Pool) cleanupStateLocked(image string) {
+	state, ok := p.states[image]
+	if !ok {
+		return
+	}
+	if state.warm != nil || state.warming || state.golden {
+		return
+	}
+	delete(p.states, image)
+	p.removeFromLRULocked(image)
+}
+
+func (p *Pool) countWarmSlotsLocked() int {
+	count := 0
+	for _, state := range p.states {
+		if state.warm != nil {
+			count++
+		}
+		if state.warming {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *Pool) countGoldensLocked() int {
+	count := 0
+	for _, state := range p.states {
+		if state.golden {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *Pool) evictWarmForSlotLocked() []*broker.WarmVM {
+	var evicted []*broker.WarmVM
+	for p.countWarmSlotsLocked() >= p.warmBudget {
+		vm := p.popLeastRecentWarmLocked()
+		if vm == nil {
+			return evicted
+		}
+		evicted = append(evicted, vm)
+	}
+	return evicted
+}
+
+func (p *Pool) evictWarmOverBudgetLocked() []*broker.WarmVM {
+	var evicted []*broker.WarmVM
+	for p.countWarmSlotsLocked() > p.warmBudget {
+		vm := p.popLeastRecentWarmLocked()
+		if vm == nil {
+			return evicted
+		}
+		evicted = append(evicted, vm)
+	}
+	return evicted
+}
+
+func (p *Pool) popLeastRecentWarmLocked() *broker.WarmVM {
+	for _, image := range p.lru {
+		state := p.states[image]
+		if state == nil || state.warm == nil {
+			continue
+		}
+		vm := state.warm
+		state.warm = nil
+		p.cleanupStateLocked(image)
+		return vm
+	}
+	return nil
+}
+
+func (p *Pool) evictGoldensLocked() []string {
+	if p.goldenBudget <= 0 {
+		return nil
+	}
+	var deleted []string
+	for p.countGoldensLocked() > p.goldenBudget {
+		image := p.popLeastRecentGoldenLocked()
+		if image == "" {
+			return deleted
+		}
+		deleted = append(deleted, image)
+	}
+	return deleted
+}
+
+func (p *Pool) popLeastRecentGoldenLocked() string {
+	for _, image := range p.lru {
+		state := p.states[image]
+		if state == nil || !state.golden {
+			continue
+		}
+		state.golden = false
+		p.cleanupStateLocked(image)
+		return image
+	}
+	return ""
+}
+
+func (p *Pool) takeAllWarmLocked() []*broker.WarmVM {
+	var warmVMs []*broker.WarmVM
+	for image, state := range p.states {
+		if state.warm == nil {
+			continue
+		}
+		warmVMs = append(warmVMs, state.warm)
+		state.warm = nil
+		p.cleanupStateLocked(image)
+	}
+	return warmVMs
+}
+
+func (p *Pool) takeWarmCancelsLocked() []context.CancelFunc {
+	var cancels []context.CancelFunc
+	for _, state := range p.states {
+		if state.warmCancel == nil {
+			continue
+		}
+		cancels = append(cancels, state.warmCancel)
+		state.warmCancel = nil
+	}
+	return cancels
+}
+
+func (p *Pool) teardownWarm(ctx context.Context, warmVMs []*broker.WarmVM) {
+	for _, vm := range warmVMs {
 		p.warmer.Teardown(ctx, vm)
 	}
 }
 
-// sendRefill sends a non-blocking signal to the fill loop.
-func (p *Pool) sendRefill() {
-	select {
-	case p.refill <- struct{}{}:
-	default:
+func (p *Pool) deleteGoldens(ctx context.Context, images []string) {
+	for _, image := range images {
+		if err := p.warmer.DeleteGolden(ctx, image); err != nil {
+			slog.WarnContext(ctx, "delete golden failed", "err", err, "image", image)
+		}
 	}
 }

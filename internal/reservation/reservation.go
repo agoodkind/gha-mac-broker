@@ -13,6 +13,7 @@ const defaultTTL = 5 * time.Minute
 
 // entry records when a reservation was made.
 type entry struct {
+	image      string
 	reservedAt time.Time
 }
 
@@ -35,11 +36,11 @@ func New() *Store {
 	}
 }
 
-// Reserve records a reservation for runID if there is capacity. capacity is
+// Reserve records a reservation for runID and image if there is capacity. capacity is
 // typically pool.FreeSlots(). It returns false if the number of outstanding
 // (non-expired) reservations already meets or exceeds capacity, or if runID
 // already has a live reservation.
-func (s *Store) Reserve(runID string, capacity int) bool {
+func (s *Store) Reserve(runID, image string, capacity int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweep()
@@ -49,26 +50,25 @@ func (s *Store) Reserve(runID string, capacity int) bool {
 	if _, ok := s.m[runID]; ok {
 		return false
 	}
-	s.m[runID] = entry{reservedAt: s.now()}
+	s.m[runID] = entry{image: image, reservedAt: s.now()}
 	return true
 }
 
-// Consume removes and returns whether a live (non-expired) reservation exists
-// for runID. It returns false if runID was never reserved or the reservation
-// has expired.
-func (s *Store) Consume(runID string) bool {
+// Consume removes and returns the image for a live (non-expired) reservation.
+// It returns ok=false if runID was never reserved or the reservation has expired.
+func (s *Store) Consume(runID string) (image string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.m[runID]
 	if !ok {
-		return false
+		return "", false
 	}
 	if s.now().Sub(e.reservedAt) > s.ttl {
 		delete(s.m, runID)
-		return false
+		return "", false
 	}
 	delete(s.m, runID)
-	return true
+	return e.image, true
 }
 
 // sweep removes expired entries. It must be called with s.mu held.

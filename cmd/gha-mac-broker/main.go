@@ -414,7 +414,7 @@ func runServe(ctx context.Context, args []string) error {
 		return fmt.Errorf("serve: generate run token entropy: %w", err)
 	}
 	runToken := time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:])
-	p := pool.New(cfg.PoolSize, binder, runToken)
+	p := pool.New(cfg.Tart.WarmBudget, cfg.Tart.GoldenBudget, binder, runToken)
 	store := reservation.New()
 	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, store, binder)
 
