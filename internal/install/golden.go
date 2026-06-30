@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os/exec"
 
+	"goodkind.io/gha-mac-broker/internal/aria2"
 	"goodkind.io/gha-mac-broker/internal/config"
+	"goodkind.io/gha-mac-broker/internal/fastpull"
 	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/tart"
 )
@@ -30,7 +32,7 @@ func buildGoldenIfAbsent(ctx context.Context, configPath string) error {
 	}
 
 	vm := tart.New(cfg.Tart.Binary)
-	builder := golden.New(vm)
+	builder := golden.New(vm, golden.WithBaseStager(fastPullStager(cfg)))
 	goldenName := golden.NameForImage(cfg.Tart.BaseImage)
 	if _, err := builder.EnsureGolden(ctx, golden.EnsureOptions{
 		Image:         cfg.Tart.BaseImage,
@@ -42,4 +44,20 @@ func buildGoldenIfAbsent(ctx context.Context, configPath string) error {
 	}
 	slog.InfoContext(ctx, "golden ready", "golden", goldenName)
 	return nil
+}
+
+// fastPullStager returns the base-image stager configured by cfg, or nil when
+// fast pull is disabled. The nil return is an untyped nil interface, so the
+// golden builder treats it as absent and clones the base ref directly.
+func fastPullStager(cfg *config.Config) golden.BaseStager {
+	if cfg.Tart.FastPull != nil && !*cfg.Tart.FastPull {
+		return nil
+	}
+	return fastpull.New(fastpull.Options{
+		Download:         aria2.Download,
+		Dir:              cfg.Tart.FastPullDir,
+		Split:            cfg.Tart.FastPullSplit,
+		MaxConnPerServer: cfg.Tart.FastPullSplit,
+		MaxConcurrent:    cfg.Tart.FastPullConnections,
+	})
 }

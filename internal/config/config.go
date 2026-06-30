@@ -139,6 +139,14 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// Default returns a Config with defaults applied and no file loaded. It suits a
+// bare-host bootstrap (build-golden) where no config file exists yet.
+func Default() *Config {
+	var cfg Config
+	cfg.applyDefaults()
+	return &cfg
+}
+
 func (c *Config) applyDefaults() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = "[::1]:8080"
