@@ -16,8 +16,10 @@ import (
 )
 
 const (
-	// defaultBaseImage is the Cirrus base the golden build clones.
-	defaultBaseImage = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
+	// defaultBaseImage is the Cirrus base the golden build clones. It is the
+	// Xcode-bearing image (pinned) so a one-touch install produces a golden that
+	// can actually build Swift, with no manual base-image override.
+	defaultBaseImage = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
 	// buildVMSuffix names the scratch VM used during the golden build.
 	buildVMSuffix = "-build"
 	// runnerLatestURL returns the latest actions/runner release.
