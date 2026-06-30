@@ -250,8 +250,8 @@ func (b *Builder) verify(ctx context.Context, golden, verifyVM string) error {
 	// A golden that cannot build Swift is useless, so fail loudly here rather
 	// than ship an image whose first real build dies at Xcode selection.
 	if _, err := b.vm.Exec(ctx, verifyVM, "bash", "-lc", "xcodebuild -version"); err != nil {
-		slog.ErrorContext(ctx, "verify failed: Xcode build toolchain missing", "err", err, "golden", golden)
-		return fmt.Errorf("golden: verify %s: Xcode build toolchain missing (xcodebuild -version failed): %w", golden, err)
+		slog.ErrorContext(ctx, "verify failed: xcodebuild -version did not succeed", "err", err, "golden", golden)
+		return fmt.Errorf("golden: verify %s: xcodebuild -version failed (Xcode absent, not selected, or license/first-run pending): %w", golden, err)
 	}
 	slog.InfoContext(ctx, "golden verified", "golden", golden)
 	return nil
