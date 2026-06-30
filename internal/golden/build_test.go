@@ -47,6 +47,23 @@ func TestInstallRunnerURL(t *testing.T) {
 	}
 }
 
+func TestVerifyChecksRunnerWatchdogAndXcode(t *testing.T) {
+	s := &stubTart{}
+	b := New(s)
+	if err := b.verify(context.Background(), "gha-golden", "gha-golden-verify"); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	all := ""
+	for _, call := range s.execCalls {
+		all += strings.Join(call, " ") + "\n"
+	}
+	for _, want := range []string{"test -f ~/actions-runner/run.sh", "io.goodkind.gha-broker-watchdog", "xcodebuild -version"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("verify missing check %q in:\n%s", want, all)
+		}
+	}
+}
+
 func TestInstallWatchdogWritesBothAssets(t *testing.T) {
 	s := &stubTart{}
 	b := New(s)

@@ -191,7 +191,7 @@ func defaultLogPath(home string) string {
 func runBuildGolden(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("build-golden", flag.ExitOnError)
 	tartBin := fs.String("tart", "tart", "tart binary")
-	baseImage := fs.String("base-image", "ghcr.io/cirruslabs/macos-tahoe-base:latest", "Cirrus base image to clone")
+	baseImage := fs.String("base-image", config.DefaultBaseImage, "Cirrus base image to clone (manual override; install reads tart.base_image from config)")
 	goldenName := fs.String("golden", "gha-golden", "golden image name to (re)build")
 	buildVM := fs.String("build-vm", "gha-golden-build", "scratch VM name used during the build")
 	runnerVersion := fs.String("runner-version", "", "actions/runner version to install (default: latest)")

@@ -15,6 +15,11 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
+// DefaultBaseImage is the Cirrus base the golden is built from when config does
+// not override it. It is the Xcode-bearing image (pinned) so the golden can
+// build Swift; the CLI flag and config.toml both default to this.
+const DefaultBaseImage = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
+
 // Config is the broker's runtime configuration.
 type Config struct {
 	// ListenAddr is the address the webhook and capacity server binds to.
@@ -61,6 +66,10 @@ type TartConfig struct {
 	// GoldenImage is the source VM the pool clones. It has the runner binary
 	// installed but unconfigured.
 	GoldenImage string `toml:"golden_image"`
+	// BaseImage is the Cirrus image the golden is built from. Declared here
+	// (not hardcoded in the binary) so the Xcode/base version is operator
+	// policy; defaults to [DefaultBaseImage].
+	BaseImage string `toml:"base_image"`
 	// VMNamePrefix prefixes ephemeral clone names.
 	VMNamePrefix string `toml:"vm_name_prefix"`
 	// CacheDir is a host directory shared into each VM so the build cache
@@ -110,6 +119,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Tart.VMNamePrefix == "" {
 		c.Tart.VMNamePrefix = "gha-runner"
+	}
+	if c.Tart.BaseImage == "" {
+		c.Tart.BaseImage = DefaultBaseImage
 	}
 	if c.PoolSize == 0 {
 		c.PoolSize = 2
