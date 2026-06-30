@@ -209,7 +209,7 @@ func runBuildGolden(ctx context.Context, args []string) error {
 		version = resolved
 	}
 
-	builder := golden.New(tart.New(*tartBin))
+	builder := golden.New(tart.New(*tartBin), golden.WithBaseStager(nil))
 	if err := builder.Build(ctx, golden.Options{
 		BaseImage:     *baseImage,
 		GoldenName:    *goldenName,

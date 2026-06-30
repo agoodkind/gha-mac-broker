@@ -47,14 +47,37 @@ type tarter interface {
 	Delete(ctx context.Context, name string) error
 }
 
+// BaseStager stages a base image into a local registry and returns a clonable
+// ref plus a stop func that shuts the registry down.
+type BaseStager interface {
+	Stage(ctx context.Context, image string) (ref string, stop func(), err error)
+}
+
+// Option configures a Builder.
+type Option func(*Builder)
+
+// WithBaseStager sets the base-image stager used to fast-pull the base before
+// cloning. When unset, Build clones the configured base ref directly.
+func WithBaseStager(s BaseStager) Option {
+	return func(b *Builder) { b.base = s }
+}
+
 // Builder builds and self-verifies the golden image.
 type Builder struct {
-	vm tarter
+	vm   tarter
+	base BaseStager
 }
 
 // New returns a Builder driving the given VM substrate.
-func New(vm tarter) *Builder {
-	return &Builder{vm: vm}
+func New(vm tarter, opts ...Option) *Builder {
+	builder := &Builder{
+		vm:   vm,
+		base: nil,
+	}
+	for _, opt := range opts {
+		opt(builder)
+	}
+	return builder
 }
 
 // Options configures a golden build.
@@ -181,7 +204,17 @@ func ResolveRunnerVersion(ctx context.Context) (string, error) {
 func (b *Builder) Build(ctx context.Context, opts Options) error {
 	slog.InfoContext(ctx, "building golden", "base", opts.BaseImage, "golden", opts.GoldenName, "runner", opts.RunnerVersion)
 
-	boot, err := b.cloneAndBoot(ctx, opts.BaseImage, opts.BuildVM, false)
+	cloneSource, insecure := opts.BaseImage, false
+	if b.base != nil {
+		ref, stop, err := b.base.Stage(ctx, opts.BaseImage)
+		if err != nil {
+			slog.WarnContext(ctx, "fast-pull stage failed; cloning base directly", "err", err, "image", opts.BaseImage)
+		} else {
+			defer stop()
+			cloneSource, insecure = ref, true
+		}
+	}
+	boot, err := b.cloneAndBoot(ctx, cloneSource, opts.BuildVM, insecure)
 	if err != nil {
 		return err
 	}
