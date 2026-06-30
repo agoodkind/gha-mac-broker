@@ -135,7 +135,7 @@ func getBody(ctx context.Context, t *testing.T, url string) (int, []byte) {
 
 func requireLoopbackListen(t *testing.T) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "[::1]:0")
+	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Skipf("loopback listen unavailable in this environment: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestStageServesOCILayoutManifestAndBlobsOnLoopback(t *testing.T) {
 	}
 	defer stop()
 
-	if !strings.HasPrefix(ref, "[::1]:") || !strings.HasSuffix(ref, "/cirruslabs/macos-tahoe-xcode:26.5") {
+	if !strings.HasPrefix(ref, "localhost:") || !strings.HasSuffix(ref, "/cirruslabs/macos-tahoe-xcode:26.5") {
 		t.Fatalf("unexpected ref %q", ref)
 	}
 	if len(copier.calls) != 1 {

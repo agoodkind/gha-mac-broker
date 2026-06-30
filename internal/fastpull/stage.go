@@ -1,5 +1,5 @@
 // Package fastpull stages a Cirrus base image into a loopback OCI registry on
-// [::1] so tart can clone it quickly. Skopeo copies the source image into an OCI
+// the localhost loopback so tart can clone it quickly. Skopeo copies the source image into an OCI
 // layout on disk, and go-containerregistry serves that layout's blobs over the
 // loopback registry while tart pulls the tag with --insecure.
 package fastpull
@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	loopbackHost      = "[::1]"
+	loopbackHost      = "localhost"
 	readHeaderTimeout = 30 * time.Second
 	clientTimeout     = 30 * time.Second
 	targetOS          = "darwin"
@@ -67,7 +67,7 @@ func New(opts Options) *Stager {
 }
 
 // Stage copies image into an OCI layout, serves the layout blobs from a loopback
-// OCI registry on [::1], and returns a clonable insecure ref plus a stop func
+// OCI registry on the localhost loopback, and returns a clonable insecure ref plus a stop func
 // that shuts the registry down. The caller clones the returned ref with tart
 // --insecure, then calls stop.
 func (s *Stager) Stage(ctx context.Context, image string) (string, func(), error) {
