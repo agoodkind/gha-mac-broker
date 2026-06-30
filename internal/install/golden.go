@@ -16,10 +16,6 @@ import (
 )
 
 const (
-	// defaultBaseImage is the Cirrus base the golden build clones. It is the
-	// Xcode-bearing image (pinned) so a one-touch install produces a golden that
-	// can actually build Swift, with no manual base-image override.
-	defaultBaseImage = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
 	// buildVMSuffix names the scratch VM used during the golden build.
 	buildVMSuffix = "-build"
 	// runnerLatestURL returns the latest actions/runner release.
@@ -55,7 +51,7 @@ func buildGoldenIfAbsent(ctx context.Context, configPath string) error {
 	}
 	builder := golden.New(vm)
 	if err := builder.Build(ctx, golden.Options{
-		BaseImage:     defaultBaseImage,
+		BaseImage:     cfg.Tart.BaseImage,
 		GoldenName:    cfg.Tart.GoldenImage,
 		BuildVM:       cfg.Tart.GoldenImage + buildVMSuffix,
 		RunnerVersion: runnerVersion,
