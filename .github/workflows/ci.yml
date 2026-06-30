@@ -14,6 +14,10 @@ jobs:
     uses: agoodkind/go-makefile/.github/workflows/_ci.yml@main
     with:
       runs_on: macos-latest
+      # macOS build signs the output binary; CI has no Developer ID cert, so
+      # sign ad-hoc. Real Developer ID signing happens in the release via quill.
+      pre_make_commands: |
+        echo "CODESIGN_IDENTITY=-" >> "$GITHUB_ENV"
     permissions:
       contents: read
       id-token: write
