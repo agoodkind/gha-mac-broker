@@ -192,14 +192,17 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 		image = fallbackImage
 	}
 
-	vm, err := s.pool.Lease(ctx, image)
+	// Lease on a detached context: an on-demand warm boots `tart run` as a
+	// CommandContext child, so tying it to the request context would kill the VM
+	// the instant this handler returns 202, before RunJob can exec into it.
+	jobCtx := context.WithoutCancel(ctx)
+	vm, err := s.pool.Lease(jobCtx, image)
 	if err != nil {
 		slog.ErrorContext(ctx, "lease failed", "err", err, "repo", repo)
 		http.Error(w, "no vm available", http.StatusServiceUnavailable)
 		return
 	}
 
-	jobCtx := context.WithoutCancel(ctx)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
