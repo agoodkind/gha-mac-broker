@@ -8,14 +8,14 @@ concurrency:
   cancel-in-progress: true
 jobs:
   go:
-    # The broker drives Tart, so its CI runs on macOS.
+    # The broker's Go build, lint, and tests are platform-portable (no build
+    # tags, no *_darwin.go), so CI runs on fast, plentiful ubuntu runners rather
+    # than the scarce macOS pool. The darwin/arm64 binary is built and Developer
+    # ID signed + notarized in the release (_release.yml), which is the only step
+    # that actually needs macOS; codesign is a no-op off darwin.
     uses: agoodkind/go-makefile/.github/workflows/_ci.yml@main
     with:
-      runs_on: macos-latest
-      # macOS build signs the output binary; CI has no Developer ID cert, so
-      # sign ad-hoc. Real Developer ID signing happens in the release via quill.
-      pre_make_commands: |
-        echo "CODESIGN_IDENTITY=-" >> "$GITHUB_ENV"
+      runs_on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
