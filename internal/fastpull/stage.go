@@ -28,6 +28,10 @@ const (
 	clientTimeout     = 30 * time.Second
 	targetOS          = "darwin"
 	targetArch        = "arm64"
+	// cirrusRegistry is the only registry host the fast pull serves from, so a
+	// cirrus-shaped repo path on a different host (docker.io/cirruslabs/...)
+	// cannot slip past the allowlist.
+	cirrusRegistry = "ghcr.io"
 )
 
 // Options configures a [Stager].
@@ -76,10 +80,11 @@ func (s *Stager) Stage(ctx context.Context, image string) (string, func(), error
 		slog.ErrorContext(ctx, "fastpull parse ref failed", "err", err, "image", image)
 		return "", nil, fmt.Errorf("fastpull: parse %s: %w", image, err)
 	}
+	host := ref.Context().RegistryStr()
 	repo := ref.Context().RepositoryStr()
-	if !isCirrusXcodeRepo(repo) {
+	if host != cirrusRegistry || !isCirrusXcodeRepo(repo) {
 		err := fmt.Errorf("fastpull: refusing non-cirrus image %q", image)
-		slog.ErrorContext(ctx, "fastpull refusing non-cirrus image", "err", err, "image", image)
+		slog.ErrorContext(ctx, "fastpull refusing non-cirrus image", "err", err, "image", image, "host", host)
 		return "", nil, err
 	}
 	if s.copier == nil {

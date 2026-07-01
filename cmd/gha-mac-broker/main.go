@@ -213,6 +213,9 @@ func runBuildGolden(ctx context.Context, args []string) error {
 
 	cfg, err := config.Load(config.DefaultConfigPath())
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("build-golden: load config %s: %w", config.DefaultConfigPath(), err)
+		}
 		cfg = config.Default()
 	}
 	builder := golden.New(tart.New(*tartBin), golden.WithBaseStager(fastPullStager(cfg)))

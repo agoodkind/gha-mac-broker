@@ -89,10 +89,8 @@ type TartConfig struct {
 	// means enabled.
 	FastPull *bool `toml:"fast_pull"`
 	// FastPullDir is the OCI layout directory where skopeo stores pulled blobs.
+	// skopeo is idempotent, so the layout is kept across runs for fast rebuilds.
 	FastPullDir string `toml:"fast_pull_dir"`
-	// FastPullKeepBlobs keeps downloaded blobs for fast rebuilds when true. Nil
-	// means true.
-	FastPullKeepBlobs *bool `toml:"fast_pull_keep_blobs"`
 }
 
 // ImageMapping maps a declared macOS and Xcode pair to an approved Cirrus tag.
@@ -177,10 +175,6 @@ func (c *Config) applyDefaults() {
 		} else {
 			c.Tart.FastPullDir = filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
 		}
-	}
-	if c.Tart.FastPullKeepBlobs == nil {
-		c.Tart.FastPullKeepBlobs = new(bool)
-		*c.Tart.FastPullKeepBlobs = true
 	}
 	if len(c.Labels) == 0 {
 		c.Labels = []string{"self-hosted", "macOS", "ARM64", "agk-local-macos-26"}

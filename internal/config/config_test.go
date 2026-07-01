@@ -53,12 +53,6 @@ private_key_path = "/tmp/key.pem"
 	if cfg.Tart.FastPullDir != wantFastPullDir {
 		t.Errorf("default fast pull dir = %q, want %q", cfg.Tart.FastPullDir, wantFastPullDir)
 	}
-	if cfg.Tart.FastPullKeepBlobs == nil {
-		t.Fatal("default fast pull keep blobs should be set")
-	}
-	if !*cfg.Tart.FastPullKeepBlobs {
-		t.Error("default fast pull keep blobs should be true")
-	}
 	image, ok := cfg.ResolveImage("", "")
 	if !ok {
 		t.Fatal("empty request should resolve to default base image")
@@ -127,17 +121,16 @@ func TestResolveImageRejectsUnsafeConfiguredTag(t *testing.T) {
 			WebhookCIDRsPath:  "",
 		},
 		Tart: TartConfig{
-			Binary:            "tart",
-			GoldenImage:       "",
-			BaseImage:         DefaultBaseImage,
-			WarmBudget:        2,
-			GoldenBudget:      3,
-			Images:            []ImageMapping{{MacOS: "tahoe", Xcode: "raw", Tag: "docker.io/library/alpine:latest"}},
-			VMNamePrefix:      "gha-runner",
-			CacheDir:          "",
-			FastPull:          nil,
-			FastPullDir:       "",
-			FastPullKeepBlobs: nil,
+			Binary:       "tart",
+			GoldenImage:  "",
+			BaseImage:    DefaultBaseImage,
+			WarmBudget:   2,
+			GoldenBudget: 3,
+			Images:       []ImageMapping{{MacOS: "tahoe", Xcode: "raw", Tag: "docker.io/library/alpine:latest"}},
+			VMNamePrefix: "gha-runner",
+			CacheDir:     "",
+			FastPull:     nil,
+			FastPullDir:  "",
 		},
 		Labels:       []string{"self-hosted"},
 		AllowedRepos: []string{"agoodkind/lmd"},

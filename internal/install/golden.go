@@ -29,12 +29,18 @@ func buildGoldenIfAbsent(ctx context.Context, configPath string) error {
 	if err := requireHostBinary(ctx, cfg.Tart.Binary, "brew install cirruslabs/cli/tart"); err != nil {
 		return err
 	}
-	if err := requireHostBinary(ctx, "skopeo", "brew install skopeo"); err != nil {
-		return err
+	stager := fastPullStager(cfg)
+	// skopeo is only needed by the fast-pull stager; a host that disabled
+	// fast_pull builds the golden by cloning the base ref directly, so it must
+	// not fail install for a missing skopeo it never calls.
+	if stager != nil {
+		if err := requireHostBinary(ctx, "skopeo", "brew install skopeo"); err != nil {
+			return err
+		}
 	}
 
 	vm := tart.New(cfg.Tart.Binary)
-	builder := golden.New(vm, golden.WithBaseStager(fastPullStager(cfg)))
+	builder := golden.New(vm, golden.WithBaseStager(stager))
 	goldenName := golden.NameForImage(cfg.Tart.BaseImage)
 	if _, err := builder.EnsureGolden(ctx, golden.EnsureOptions{
 		Image:         cfg.Tart.BaseImage,
