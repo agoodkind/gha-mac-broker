@@ -24,6 +24,10 @@ const (
 	defaultWarmBudget   = 2
 	defaultGoldenBudget = 3
 	cirrusImagePrefix   = "ghcr.io/cirruslabs/"
+	// defaultFastPullParallel is the skopeo layer-copy concurrency used when
+	// fast_pull_parallel is unset. ghcr throttles each connection, so more
+	// concurrent streams raise the cold-pull rate.
+	defaultFastPullParallel = 16
 )
 
 // Config is the broker's runtime configuration.
@@ -91,6 +95,10 @@ type TartConfig struct {
 	// FastPullDir is the OCI layout directory where skopeo stores pulled blobs.
 	// skopeo is idempotent, so the layout is kept across runs for fast rebuilds.
 	FastPullDir string `toml:"fast_pull_dir"`
+	// FastPullParallel is how many image layers skopeo pulls simultaneously.
+	// ghcr throttles each connection, so a higher count raises the cold-pull
+	// rate. Zero or unset defaults to defaultFastPullParallel.
+	FastPullParallel int `toml:"fast_pull_parallel"`
 }
 
 // ImageMapping maps a declared macOS and Xcode pair to an approved Cirrus tag.
@@ -175,6 +183,9 @@ func (c *Config) applyDefaults() {
 		} else {
 			c.Tart.FastPullDir = filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
 		}
+	}
+	if c.Tart.FastPullParallel <= 0 {
+		c.Tart.FastPullParallel = defaultFastPullParallel
 	}
 	if len(c.Labels) == 0 {
 		c.Labels = []string{"self-hosted", "macOS", "ARM64", "agk-local-macos-26"}

@@ -9,8 +9,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"strconv"
 	"strings"
 )
+
+// defaultParallelCopies is the layer-copy concurrency used when a Client is
+// created with a non-positive value. ghcr throttles each connection, so more
+// concurrent streams raise the cold-pull rate above the containers/image
+// default of 6.
+const defaultParallelCopies = 16
 
 // CommandRunner runs `skopeo <args...>` and returns combined output. It is a
 // field so tests can stub the CLI.
@@ -19,16 +26,22 @@ type CommandRunner func(ctx context.Context, bin string, args ...string) ([]byte
 // Client drives the skopeo binary. The run field is swappable in white-box
 // tests.
 type Client struct {
-	bin string
-	run CommandRunner
+	bin            string
+	parallelCopies int
+	run            CommandRunner
 }
 
-// New returns a Client that invokes the given binary (default "skopeo").
-func New(bin string) *Client {
+// New returns a Client that invokes the given binary (default "skopeo") and
+// pulls parallelCopies image layers at a time. A non-positive parallelCopies
+// falls back to defaultParallelCopies.
+func New(bin string, parallelCopies int) *Client {
 	if bin == "" {
 		bin = "skopeo"
 	}
-	return &Client{bin: bin, run: execRunner}
+	if parallelCopies <= 0 {
+		parallelCopies = defaultParallelCopies
+	}
+	return &Client{bin: bin, parallelCopies: parallelCopies, run: execRunner}
 }
 
 // command builds an [exec.Cmd] for the skopeo binary. Centralizing construction
@@ -55,6 +68,8 @@ func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error)
 func (c *Client) CopyToOCILayout(ctx context.Context, srcImageRef, layoutDir, tag, osName, arch string) error {
 	args := []string{
 		"copy",
+		"--image-parallel-copies",
+		strconv.Itoa(c.parallelCopies),
 		"--override-os",
 		osName,
 		"--override-arch",

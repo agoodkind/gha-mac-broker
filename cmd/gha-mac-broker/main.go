@@ -239,7 +239,7 @@ func fastPullStager(cfg *config.Config) golden.BaseStager {
 		return nil
 	}
 	return fastpull.New(fastpull.Options{
-		Copier: skopeo.New("skopeo"),
+		Copier: skopeo.New("skopeo", cfg.Tart.FastPullParallel),
 		Dir:    cfg.Tart.FastPullDir,
 	})
 }
