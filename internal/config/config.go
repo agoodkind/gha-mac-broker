@@ -85,6 +85,12 @@ type TartConfig struct {
 	// CacheDir is a host directory shared into each VM so the build cache
 	// survives VM deletion.
 	CacheDir string `toml:"cache_dir"`
+	// FastPull enables the fast parallel base-image pull path when true. Nil
+	// means enabled.
+	FastPull *bool `toml:"fast_pull"`
+	// FastPullDir is the OCI layout directory where skopeo stores pulled blobs.
+	// skopeo is idempotent, so the layout is kept across runs for fast rebuilds.
+	FastPullDir string `toml:"fast_pull_dir"`
 }
 
 // ImageMapping maps a declared macOS and Xcode pair to an approved Cirrus tag.
@@ -127,6 +133,14 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// Default returns a Config with defaults applied and no file loaded. It suits a
+// bare-host bootstrap (build-golden) where no config file exists yet.
+func Default() *Config {
+	var cfg Config
+	cfg.applyDefaults()
+	return &cfg
+}
+
 func (c *Config) applyDefaults() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = "[::1]:8080"
@@ -149,6 +163,17 @@ func (c *Config) applyDefaults() {
 	if len(c.Tart.Images) == 0 {
 		c.Tart.Images = []ImageMapping{
 			{MacOS: "tahoe", Xcode: "26.5", Tag: c.Tart.BaseImage},
+		}
+	}
+	if c.Tart.FastPull == nil {
+		c.Tart.FastPull = new(bool)
+		*c.Tart.FastPull = true
+	}
+	if c.Tart.FastPullDir == "" {
+		if c.Tart.CacheDir != "" {
+			c.Tart.FastPullDir = filepath.Join(c.Tart.CacheDir, "fastpull-blobs")
+		} else {
+			c.Tart.FastPullDir = filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
 		}
 	}
 	if len(c.Labels) == 0 {

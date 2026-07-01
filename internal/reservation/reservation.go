@@ -8,8 +8,11 @@ import (
 	"time"
 )
 
-// defaultTTL is how long a reservation is held before it expires.
-const defaultTTL = 5 * time.Minute
+// defaultTTL is how long a reservation is held before it expires. It must
+// comfortably exceed the gap between a planner's /capacity check and the
+// matching workflow_job webhook, which a reusable-workflow gate plus GitHub
+// scheduling can stretch well past a few minutes.
+const defaultTTL = 30 * time.Minute
 
 // entry records when a reservation was made.
 type entry struct {

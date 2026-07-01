@@ -8,7 +8,14 @@ concurrency:
   cancel-in-progress: true
 jobs:
   go:
+    # The broker's Go build, lint, and tests are platform-portable (no build
+    # tags, no *_darwin.go), so CI runs on fast, plentiful ubuntu runners rather
+    # than the scarce macOS pool. The darwin/arm64 binary is built and Developer
+    # ID signed + notarized in the release (_release.yml), which is the only step
+    # that actually needs macOS; codesign is a no-op off darwin.
     uses: agoodkind/go-makefile/.github/workflows/_ci.yml@main
+    with:
+      runs_on: ubuntu-latest
     permissions:
       contents: read
       id-token: write

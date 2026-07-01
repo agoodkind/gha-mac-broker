@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -62,6 +63,28 @@ func TestEmbeddedConfigMatchesRepoRoot(t *testing.T) {
 	}
 	if !bytes.Equal(embedded, root) {
 		t.Error("internal/install/config.example.toml drifted from the repo-root copy; keep them identical")
+	}
+}
+
+func TestRequireHostBinaryReportsInstallHint(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	err := requireHostBinary(context.Background(), "skopeo", "brew install skopeo")
+	if err == nil {
+		t.Fatal("expected missing binary error")
+	}
+	for _, want := range []string{"skopeo", "brew install skopeo"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err.Error(), want)
+		}
+	}
+
+	tartPath := filepath.Join(dir, "tart")
+	if err := os.WriteFile(tartPath, []byte("#!/usr/bin/env bash\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+	if err := requireHostBinary(context.Background(), "tart", "brew install cirruslabs/cli/tart"); err != nil {
+		t.Fatalf("requireHostBinary with fake tart: %v", err)
 	}
 }
 

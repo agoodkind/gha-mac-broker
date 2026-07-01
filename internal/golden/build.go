@@ -40,21 +40,44 @@ const (
 // an interface so tests can stub the tart CLI.
 type tarter interface {
 	List(ctx context.Context) ([]string, error)
-	Clone(ctx context.Context, source, name string) error
+	Clone(ctx context.Context, source, name string, insecure bool) error
 	BootCommand(ctx context.Context, name string, opts tart.BootOptions) *exec.Cmd
 	Exec(ctx context.Context, name string, argv ...string) ([]byte, error)
 	Stop(ctx context.Context, name string) error
 	Delete(ctx context.Context, name string) error
 }
 
+// BaseStager stages a base image into a local registry and returns a clonable
+// ref plus a stop func that shuts the registry down.
+type BaseStager interface {
+	Stage(ctx context.Context, image string) (ref string, stop func(), err error)
+}
+
+// Option configures a Builder.
+type Option func(*Builder)
+
+// WithBaseStager sets the base-image stager used to fast-pull the base before
+// cloning. When unset, Build clones the configured base ref directly.
+func WithBaseStager(s BaseStager) Option {
+	return func(b *Builder) { b.base = s }
+}
+
 // Builder builds and self-verifies the golden image.
 type Builder struct {
-	vm tarter
+	vm   tarter
+	base BaseStager
 }
 
 // New returns a Builder driving the given VM substrate.
-func New(vm tarter) *Builder {
-	return &Builder{vm: vm}
+func New(vm tarter, opts ...Option) *Builder {
+	builder := &Builder{
+		vm:   vm,
+		base: nil,
+	}
+	for _, opt := range opts {
+		opt(builder)
+	}
+	return builder
 }
 
 // Options configures a golden build.
@@ -181,7 +204,17 @@ func ResolveRunnerVersion(ctx context.Context) (string, error) {
 func (b *Builder) Build(ctx context.Context, opts Options) error {
 	slog.InfoContext(ctx, "building golden", "base", opts.BaseImage, "golden", opts.GoldenName, "runner", opts.RunnerVersion)
 
-	boot, err := b.cloneAndBoot(ctx, opts.BaseImage, opts.BuildVM)
+	cloneSource, insecure := opts.BaseImage, false
+	if b.base != nil {
+		ref, stop, err := b.base.Stage(ctx, opts.BaseImage)
+		if err != nil {
+			slog.WarnContext(ctx, "fast-pull stage failed; cloning base directly", "err", err, "image", opts.BaseImage)
+		} else {
+			defer stop()
+			cloneSource, insecure = ref, true
+		}
+	}
+	boot, err := b.cloneAndBoot(ctx, cloneSource, opts.BuildVM, insecure)
 	if err != nil {
 		return err
 	}
@@ -220,7 +253,7 @@ func (b *Builder) snapshot(ctx context.Context, buildVM, golden string) error {
 	if err := b.vm.Delete(ctx, golden); err != nil {
 		slog.DebugContext(ctx, "delete old golden (ignored if absent)", "err", err, "golden", golden)
 	}
-	if err := b.vm.Clone(ctx, buildVM, golden); err != nil {
+	if err := b.vm.Clone(ctx, buildVM, golden, false); err != nil {
 		slog.ErrorContext(ctx, "snapshot golden failed", "err", err, "golden", golden)
 		return fmt.Errorf("golden: snapshot %s: %w", golden, err)
 	}
@@ -232,11 +265,11 @@ func (b *Builder) snapshot(ctx context.Context, buildVM, golden string) error {
 
 // cloneAndBoot clones source to name, boots it headless, and waits for the vsock
 // channel. The returned boot process must be killed by the caller.
-func (b *Builder) cloneAndBoot(ctx context.Context, source, name string) (*exec.Cmd, error) {
+func (b *Builder) cloneAndBoot(ctx context.Context, source, name string, insecure bool) (*exec.Cmd, error) {
 	if err := b.vm.Delete(ctx, name); err != nil {
 		slog.DebugContext(ctx, "pre-clone delete (ignored if absent)", "err", err, "vm", name)
 	}
-	if err := b.vm.Clone(ctx, source, name); err != nil {
+	if err := b.vm.Clone(ctx, source, name, insecure); err != nil {
 		slog.ErrorContext(ctx, "clone failed", "err", err, "vm", name, "source", source)
 		return nil, fmt.Errorf("golden: clone %s from %s: %w", name, source, err)
 	}
@@ -342,7 +375,7 @@ func (b *Builder) cleanShutdown(ctx context.Context, name string) error {
 // otherwise. The verify VM is always torn down.
 func (b *Builder) verify(ctx context.Context, golden, verifyVM string) error {
 	slog.InfoContext(ctx, "verifying golden", "golden", golden)
-	boot, err := b.cloneAndBoot(ctx, golden, verifyVM)
+	boot, err := b.cloneAndBoot(ctx, golden, verifyVM, false)
 	if err != nil {
 		return fmt.Errorf("golden: verify boot: %w", err)
 	}

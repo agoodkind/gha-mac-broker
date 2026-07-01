@@ -43,6 +43,16 @@ private_key_path = "/tmp/key.pem"
 	if cfg.Tart.Binary != "tart" {
 		t.Errorf("default tart binary = %q", cfg.Tart.Binary)
 	}
+	if cfg.Tart.FastPull == nil {
+		t.Fatal("default fast pull should be set")
+	}
+	if !*cfg.Tart.FastPull {
+		t.Error("default fast pull should be true")
+	}
+	wantFastPullDir := filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
+	if cfg.Tart.FastPullDir != wantFastPullDir {
+		t.Errorf("default fast pull dir = %q, want %q", cfg.Tart.FastPullDir, wantFastPullDir)
+	}
 	image, ok := cfg.ResolveImage("", "")
 	if !ok {
 		t.Fatal("empty request should resolve to default base image")
@@ -102,9 +112,26 @@ tag = "ghcr.io/cirruslabs/macos-ventura-xcode:15.4"
 
 func TestResolveImageRejectsUnsafeConfiguredTag(t *testing.T) {
 	cfg := &Config{
-		ListenAddr:   "[::1]:8080",
-		App:          AppConfig{AppID: "1", PrivateKeyPath: "/tmp/key.pem", WebhookSecretPath: "", CapacityTokenPath: "", WebhookCIDRsPath: ""},
-		Tart:         TartConfig{Binary: "tart", GoldenImage: "", BaseImage: DefaultBaseImage, VMNamePrefix: "gha-runner", CacheDir: "", WarmBudget: 2, GoldenBudget: 3, Images: []ImageMapping{{MacOS: "tahoe", Xcode: "raw", Tag: "docker.io/library/alpine:latest"}}},
+		ListenAddr: "[::1]:8080",
+		App: AppConfig{
+			AppID:             "1",
+			PrivateKeyPath:    "/tmp/key.pem",
+			WebhookSecretPath: "",
+			CapacityTokenPath: "",
+			WebhookCIDRsPath:  "",
+		},
+		Tart: TartConfig{
+			Binary:       "tart",
+			GoldenImage:  "",
+			BaseImage:    DefaultBaseImage,
+			WarmBudget:   2,
+			GoldenBudget: 3,
+			Images:       []ImageMapping{{MacOS: "tahoe", Xcode: "raw", Tag: "docker.io/library/alpine:latest"}},
+			VMNamePrefix: "gha-runner",
+			CacheDir:     "",
+			FastPull:     nil,
+			FastPullDir:  "",
+		},
 		Labels:       []string{"self-hosted"},
 		AllowedRepos: []string{"agoodkind/lmd"},
 	}

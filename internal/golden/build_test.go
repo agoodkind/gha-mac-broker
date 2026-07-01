@@ -13,18 +13,33 @@ import (
 // stubTart records Exec calls and satisfies the tarter interface for white-box
 // command-construction tests.
 type stubTart struct {
-	execCalls [][]string
-	cloneFrom []string
-	cloneTo   []string
-	names     []string
-	shutdown  map[string]bool
+	execCalls     [][]string
+	cloneFrom     []string
+	cloneTo       []string
+	cloneInsecure []bool
+	names         []string
+	shutdown      map[string]bool
+}
+
+type stubStager struct {
+	ref     string
+	err     error
+	stopped bool
+}
+
+func (s *stubStager) Stage(_ context.Context, _ string) (string, func(), error) {
+	if s.err != nil {
+		return "", nil, s.err
+	}
+	return s.ref, func() { s.stopped = true }, nil
 }
 
 func (s *stubTart) List(_ context.Context) ([]string, error) { return s.names, nil }
 
-func (s *stubTart) Clone(_ context.Context, source, name string) error {
+func (s *stubTart) Clone(_ context.Context, source, name string, insecure bool) error {
 	s.cloneFrom = append(s.cloneFrom, source)
 	s.cloneTo = append(s.cloneTo, name)
+	s.cloneInsecure = append(s.cloneInsecure, insecure)
 	return nil
 }
 
@@ -102,6 +117,72 @@ func TestEnsureGoldenBuildsMissingGoldenFromImage(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(s.cloneTo, "\n"), goldenName) {
 		t.Fatalf("clone targets should include derived golden %q, got %v", goldenName, s.cloneTo)
+	}
+}
+
+func TestBuildStagesBaseBeforeFirstClone(t *testing.T) {
+	image := "ghcr.io/cirruslabs/macos-sonoma-xcode:15.4"
+	goldenName := NameForImage(image)
+	stagedRef := "[::1]:51000/cirruslabs/macos-tahoe-xcode:26.5"
+	tartStub := &stubTart{}
+	stager := &stubStager{
+		ref:     stagedRef,
+		err:     nil,
+		stopped: false,
+	}
+	builder := New(tartStub, WithBaseStager(stager))
+
+	err := builder.Build(context.Background(), Options{
+		BaseImage:     image,
+		GoldenName:    goldenName,
+		BuildVM:       goldenName + "-build",
+		RunnerVersion: "2.99.0",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(tartStub.cloneFrom) == 0 {
+		t.Fatalf("Build made no clone calls")
+	}
+	if got := tartStub.cloneFrom[0]; got != stagedRef {
+		t.Fatalf("first clone source = %q, want %q", got, stagedRef)
+	}
+	if got := tartStub.cloneInsecure[0]; !got {
+		t.Fatalf("first clone insecure = %t, want true", got)
+	}
+	if !stager.stopped {
+		t.Fatalf("stager stop was not called")
+	}
+}
+
+func TestBuildFallsBackToBaseImageWhenStageFails(t *testing.T) {
+	image := "ghcr.io/cirruslabs/macos-sonoma-xcode:15.4"
+	goldenName := NameForImage(image)
+	tartStub := &stubTart{}
+	stager := &stubStager{
+		ref:     "",
+		err:     errors.New("stage failed"),
+		stopped: false,
+	}
+	builder := New(tartStub, WithBaseStager(stager))
+
+	err := builder.Build(context.Background(), Options{
+		BaseImage:     image,
+		GoldenName:    goldenName,
+		BuildVM:       goldenName + "-build",
+		RunnerVersion: "2.99.0",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(tartStub.cloneFrom) == 0 {
+		t.Fatalf("Build made no clone calls")
+	}
+	if got := tartStub.cloneFrom[0]; got != image {
+		t.Fatalf("first clone source = %q, want %q", got, image)
+	}
+	if got := tartStub.cloneInsecure[0]; got {
+		t.Fatalf("first clone insecure = %t, want false", got)
 	}
 }
 

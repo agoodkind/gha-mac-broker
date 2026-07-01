@@ -78,8 +78,13 @@ func (t *Tart) List(ctx context.Context) ([]string, error) {
 }
 
 // Clone makes a copy-on-write clone of source under name.
-func (t *Tart) Clone(ctx context.Context, source, name string) error {
-	_, err := t.run(ctx, t.bin, "clone", source, name)
+func (t *Tart) Clone(ctx context.Context, source, name string, insecure bool) error {
+	args := []string{"clone"}
+	if insecure {
+		args = append(args, "--insecure")
+	}
+	args = append(args, source, name)
+	_, err := t.run(ctx, t.bin, args...)
 	return err
 }
 

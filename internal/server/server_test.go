@@ -117,13 +117,15 @@ func newTestConfig(allowedRepo string) *config.Config {
 			Binary:       "tart",
 			GoldenImage:  "",
 			BaseImage:    config.DefaultBaseImage,
-			VMNamePrefix: "gha",
-			CacheDir:     "",
 			WarmBudget:   2,
 			GoldenBudget: 3,
 			Images: []config.ImageMapping{
 				{MacOS: "tahoe", Xcode: "26.5", Tag: config.DefaultBaseImage},
 			},
+			VMNamePrefix: "gha",
+			CacheDir:     "",
+			FastPull:     nil,
+			FastPullDir:  "",
 		},
 		Labels:       []string{"self-hosted", "macOS"},
 		AllowedRepos: []string{allowedRepo},
@@ -264,7 +266,9 @@ func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
 	}
 }
 
-func TestWebhookQueuedWithoutReservationReturns204(t *testing.T) {
+func TestWebhookQueuedWithoutReservationServesDefaultImage(t *testing.T) {
+	// A pool-labeled job whose reservation expired before its webhook arrived is
+	// still served on the default image so slow delivery never strands it.
 	vm := &broker.WarmVM{Name: "vm-1", Image: config.DefaultBaseImage}
 	pool := &testPool{freeSlots: 2, leaseVM: vm}
 	runner := &testRunner{ran: make(chan struct{}, 1)}
@@ -276,8 +280,18 @@ func TestWebhookQueuedWithoutReservationReturns204(t *testing.T) {
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("expected 204 without reservation, got %d", w.Code)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 serving the default image without a reservation, got %d", w.Code)
+	}
+	select {
+	case <-runner.ran:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunJob was not called within timeout")
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(pool.leasedImages) != 1 || pool.leasedImages[0] != config.DefaultBaseImage {
+		t.Fatalf("leased images = %v, want %q", pool.leasedImages, config.DefaultBaseImage)
 	}
 }
 

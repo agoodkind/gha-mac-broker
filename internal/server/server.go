@@ -176,18 +176,33 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 	runID := strconv.FormatInt(payload.WorkflowJob.RunID, 10)
 	image, ok := s.store.Consume(runID)
 	if !ok {
-		w.WriteHeader(http.StatusNoContent)
-		return
+		// The job carries a broker label, so the planner already routed it to the
+		// pool. A missing reservation means the capacity promise expired between
+		// the planner's /capacity check and this webhook delivery, which strands
+		// the job: it has no other runner and the queued job waits forever. Serve
+		// it on the default image so slow delivery never strands a pool job; Lease
+		// still enforces the warm budget, so this cannot overbook.
+		fallbackImage, resolved := s.cfg.ResolveImage("", "")
+		if !resolved {
+			slog.WarnContext(ctx, "no reservation and no default image; ignoring job", "repo", repo, "run_id", runID)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		slog.InfoContext(ctx, "no live reservation; serving pool-labeled job on default image", "repo", repo, "run_id", runID, "image", fallbackImage)
+		image = fallbackImage
 	}
 
-	vm, err := s.pool.Lease(ctx, image)
+	// Lease on a detached context: an on-demand warm boots `tart run` as a
+	// CommandContext child, so tying it to the request context would kill the VM
+	// the instant this handler returns 202, before RunJob can exec into it.
+	jobCtx := context.WithoutCancel(ctx)
+	vm, err := s.pool.Lease(jobCtx, image)
 	if err != nil {
 		slog.ErrorContext(ctx, "lease failed", "err", err, "repo", repo)
 		http.Error(w, "no vm available", http.StatusServiceUnavailable)
 		return
 	}
 
-	jobCtx := context.WithoutCancel(ctx)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
