@@ -14,7 +14,7 @@ func TestCopyToOCILayoutArgs(t *testing.T) {
 		gotArgs = slices.Clone(args)
 		return nil, nil
 	}
-	client := New("skopeo")
+	client := New("skopeo", 16)
 	client.run = stub
 
 	err := client.CopyToOCILayout(
@@ -34,6 +34,8 @@ func TestCopyToOCILayoutArgs(t *testing.T) {
 	}
 	wantArgs := []string{
 		"copy",
+		"--image-parallel-copies",
+		"16",
 		"--override-os",
 		"darwin",
 		"--override-arch",
