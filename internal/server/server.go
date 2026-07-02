@@ -261,7 +261,7 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 	}
 
 	runID := strconv.FormatInt(payload.WorkflowJob.RunID, 10)
-	s.recordPendingDelivery(repo, payload.WorkflowJob.RunID)
+	s.recordPendingDelivery(repo, payload.WorkflowJob.ID, payload.WorkflowJob.RunID)
 	image, ok := s.store.Consume(runID)
 	if !ok {
 		// The job carries a broker label, so the planner already routed it to the
@@ -312,12 +312,11 @@ func (s *Server) handleJobInProgress(ctx context.Context, payload webhookPayload
 		slog.DebugContext(ctx, "in_progress webhook ignored", "reason", "repo not allowed", "repo", repo)
 		return
 	}
-	s.markDelivered(repo, payload.WorkflowJob.RunID, payload.WorkflowJob.RunnerName, payload.WorkflowJob.RunnerID)
+	s.markDelivered(repo, payload.WorkflowJob.ID, payload.WorkflowJob.RunnerName, payload.WorkflowJob.RunnerID)
 }
 
 type pendingKey struct {
-	repo  string
-	runID int64
+	jobID int64
 }
 
 type pendingDelivery struct {
@@ -331,10 +330,11 @@ type expiredDelivery struct {
 	delivery pendingDelivery
 }
 
-func (s *Server) recordPendingDelivery(repo string, runID int64) {
-	if runID == 0 {
+func (s *Server) recordPendingDelivery(repo string, jobID int64, runID int64) {
+	if jobID == 0 || runID == 0 {
 		return
 	}
+	key := pendingKey{jobID: jobID}
 	delivery := pendingDelivery{
 		repo:     repo,
 		runID:    runID,
@@ -342,21 +342,25 @@ func (s *Server) recordPendingDelivery(repo string, runID int64) {
 	}
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	s.pending[pendingKey{repo: repo, runID: runID}] = delivery
-}
-
-func (s *Server) markDelivered(repo string, runID int64, runnerName string, runnerID int64) {
-	if runID == 0 || !s.isPoolRunner(runnerName) {
+	if _, ok := s.pending[key]; ok {
 		return
 	}
-	key := pendingKey{repo: repo, runID: runID}
+	s.pending[key] = delivery
+}
+
+func (s *Server) markDelivered(repo string, jobID int64, runnerName string, runnerID int64) {
+	if jobID == 0 || !s.isPoolRunner(runnerName) {
+		return
+	}
+	key := pendingKey{jobID: jobID}
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	if _, ok := s.pending[key]; !ok {
+	delivery, ok := s.pending[key]
+	if !ok || delivery.repo != repo {
 		return
 	}
 	delete(s.pending, key)
-	slog.Info("workflow run delivered to pool runner", "repo", repo, "run_id", runID, "runner", runnerName, "runner_id", runnerID)
+	slog.Info("workflow job delivered to pool runner", "repo", repo, "run_id", delivery.runID, "job_id", jobID, "runner", runnerName, "runner_id", runnerID)
 }
 
 func (s *Server) isPoolRunner(runnerName string) bool {
