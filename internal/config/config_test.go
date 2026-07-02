@@ -53,6 +53,13 @@ private_key_path = "/tmp/key.pem"
 	if cfg.Tart.FastPullDir != wantFastPullDir {
 		t.Errorf("default fast pull dir = %q, want %q", cfg.Tart.FastPullDir, wantFastPullDir)
 	}
+	wantCacheDir := filepath.Join(os.TempDir(), "gha-mac-broker-pool-cache")
+	if home, err := os.UserHomeDir(); err == nil {
+		wantCacheDir = filepath.Join(home, "pool-cache")
+	}
+	if cfg.Tart.CacheDir != wantCacheDir {
+		t.Errorf("default cache dir = %q, want %q", cfg.Tart.CacheDir, wantCacheDir)
+	}
 	image, ok := cfg.ResolveImage("", "")
 	if !ok {
 		t.Fatal("empty request should resolve to default base image")
