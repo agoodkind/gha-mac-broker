@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -52,6 +53,13 @@ private_key_path = "/tmp/key.pem"
 	wantFastPullDir := filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
 	if cfg.Tart.FastPullDir != wantFastPullDir {
 		t.Errorf("default fast pull dir = %q, want %q", cfg.Tart.FastPullDir, wantFastPullDir)
+	}
+	wantCacheDir := filepath.Join(os.TempDir(), "gha-mac-broker-pool-cache")
+	if home, err := os.UserHomeDir(); err == nil {
+		wantCacheDir = filepath.Join(home, "pool-cache")
+	}
+	if cfg.Tart.CacheDir != wantCacheDir {
+		t.Errorf("default cache dir = %q, want %q", cfg.Tart.CacheDir, wantCacheDir)
 	}
 	image, ok := cfg.ResolveImage("", "")
 	if !ok {
@@ -148,5 +156,26 @@ app_id = "12345"
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for missing required fields")
+	}
+}
+
+func TestLoadRejectsFastPullDirInsideCacheDir(t *testing.T) {
+	path := writeConfig(t, `
+allowed_repos = ["agoodkind/lmd"]
+
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[tart]
+cache_dir = "/tmp/pool-cache"
+fast_pull_dir = "/tmp/pool-cache/fastpull-blobs"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for fast_pull_dir inside cache_dir")
+	}
+	if !strings.Contains(err.Error(), "must not be inside") {
+		t.Errorf("error = %q, want it to mention the containment violation", err.Error())
 	}
 }

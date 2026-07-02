@@ -26,11 +26,16 @@ base_image     = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
 warm_budget    = 2
 golden_budget  = 3
 vm_name_prefix = "gha-runner"
-cache_dir      = "/Users/you/.tart/cache"
+# cache_dir is mounted into every VM (guest /Volumes/My Shared Files/cache) so the
+# build cache survives VM deletion. Keep it dedicated; do NOT point it at tart's
+# own store. Empty defaults to <home>/pool-cache, or a temp dir if the home
+# dir cannot be resolved.
+cache_dir      = "/Users/you/pool-cache"
 # Fast base-image pull through skopeo into a loopback OCI registry. Defaults shown.
 fast_pull            = true
 fast_pull_parallel   = 16
-# fast_pull_dir defaults to <cache_dir>/fastpull-blobs
+# fast_pull_dir holds the multi-GB base-image blobs and defaults to a temp dir,
+# kept out of cache_dir so it is never mounted into a build VM.
 # fast_pull_parallel is how many image layers skopeo pulls at once (default 16).
 # Control of each VM (readiness, job execution, liveness) runs over the
 # tart-exec vsock channel, so there is no SSH key, user, or VM network config
