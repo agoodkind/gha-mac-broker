@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -127,7 +128,7 @@ func preflightMaintenanceCommand(ctx context.Context, commandLine string) {
 		return
 	}
 	binary := fields[0]
-	if _, err := lookPath(binary); err != nil {
+	if _, err := exec.LookPath(binary); err != nil {
 		slog.WarnContext(ctx, "maintenance command binary not found on PATH; continuing", "err", err, "binary", binary)
 	}
 }

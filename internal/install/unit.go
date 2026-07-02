@@ -39,7 +39,11 @@ const (
 	osLinux  = "linux"
 )
 
-func renderTemplate(ctx context.Context, name string, templateText string, data any) ([]byte, error) {
+type templateData interface {
+	Config | maintenanceTemplateData
+}
+
+func renderTemplate[T templateData](ctx context.Context, name string, templateText string, data T) ([]byte, error) {
 	tmpl, err := template.New(name).Parse(templateText)
 	if err != nil {
 		slog.ErrorContext(ctx, "parse template failed", "err", err, "template", name)

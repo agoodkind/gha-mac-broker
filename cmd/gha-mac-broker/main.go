@@ -175,6 +175,10 @@ func buildInstallConfig(ctx context.Context, configPath, binPath string) (instal
 		ConfigDir:  filepath.Dir(configPath),
 		LogPath:    defaultLogPath(home),
 		ConfigPath: configPath,
+		Maintenance: config.MaintenanceConfig{
+			Command:         "",
+			IntervalSeconds: 0,
+		},
 	}, nil
 }
 

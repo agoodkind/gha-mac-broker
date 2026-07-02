@@ -96,15 +96,11 @@ func command(ctx context.Context, name string, args ...string) *exec.Cmd {
 }
 
 func requireHostBinary(ctx context.Context, binary string, installHint string) error {
-	if _, err := lookPath(binary); err != nil {
+	if _, err := exec.LookPath(binary); err != nil {
 		slog.ErrorContext(ctx, "required host binary not found on PATH", "err", err, "binary", binary)
 		return fmt.Errorf("install: %s not found on PATH; install it with `%s`: %w", binary, installHint, err)
 	}
 	return nil
-}
-
-func lookPath(binary string) (string, error) {
-	return exec.LookPath(binary)
 }
 
 // printOperatorNotice logs the steps the installer cannot perform, so the
