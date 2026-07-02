@@ -20,12 +20,22 @@ import (
 // persistently, for example when tart or a base image is unavailable.
 const warmFailDelay = 5 * time.Second
 
+// warmFailureThreshold opens the capacity circuit after consecutive warm or
+// liveness failures.
+const warmFailureThreshold = 3
+
+// reconcileInterval is the default cadence for checking cached warm VMs
+// against Tart's current VM list.
+const reconcileInterval = 60 * time.Second
+
 // Warmer creates and tears down warm VMs, evicts per-image goldens, and sweeps
 // orphaned VMs left by a prior process. *broker.Binder satisfies this
 // interface; tests use a stub.
 type Warmer interface {
 	Warm(ctx context.Context, image, id string) (*broker.WarmVM, error)
 	Teardown(ctx context.Context, vm *broker.WarmVM)
+	CheckAlive(ctx context.Context, vm *broker.WarmVM) error
+	List(ctx context.Context) ([]string, error)
 	DeleteGolden(ctx context.Context, image string) error
 	SweepOrphans(ctx context.Context)
 }
@@ -50,6 +60,8 @@ type Pool struct {
 	states       map[string]*imageState
 	lru          []string
 	leased       int
+	warmFailures int
+	lastWarmOK   bool
 	counter      atomic.Int64
 	runToken     string // per-process token embedded in VM names; prevents cross-restart and cross-process name collisions
 	wg           sync.WaitGroup
@@ -72,6 +84,8 @@ func New(warmBudget, goldenBudget int, w Warmer, runToken string) *Pool {
 		states:       make(map[string]*imageState),
 		lru:          nil,
 		leased:       0,
+		warmFailures: 0,
+		lastWarmOK:   true,
 		counter:      atomic.Int64{},
 		runToken:     runToken,
 		wg:           sync.WaitGroup{},
@@ -96,6 +110,35 @@ func (p *Pool) Start(ctx context.Context) {
 	})
 }
 
+// StartReconcile launches the periodic warm-cache reconciliation goroutine. A
+// non-positive interval uses the default cadence.
+func (p *Pool) StartReconcile(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = reconcileInterval
+	}
+	p.wg.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(ctx, "pool reconcile goroutine panic recovered", "err", fmt.Errorf("panic: %v", r))
+			}
+		}()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.done:
+				return
+			case <-ticker.C:
+				if err := p.Reconcile(ctx); err != nil {
+					slog.WarnContext(ctx, "pool reconcile failed", "err", err)
+				}
+			}
+		}
+	})
+}
+
 // Lease returns a VM for image. It uses a matching warm VM when one is cached,
 // otherwise it clones one on demand. Successful leases mark image most recently
 // used and start a background replacement warm when the warm budget permits it.
@@ -109,20 +152,28 @@ func (p *Pool) Lease(ctx context.Context, image string) (*broker.WarmVM, error) 
 		return nil, err
 	}
 	if hit {
-		p.startWarmIfNeeded(ctx, image)
-		return vm, nil
+		if err := p.warmer.CheckAlive(ctx, vm); err == nil {
+			p.startWarmIfNeeded(ctx, image)
+			return vm, nil
+		} else {
+			slog.WarnContext(ctx, "cached warm vm failed liveness check", "err", err, "vm", vm.Name, "image", image)
+			p.recordWarmOutcome(false)
+			p.warmer.Teardown(ctx, vm)
+		}
 	}
 
 	id := p.nextID()
 	vm, err = p.warmer.Warm(ctx, image, id)
 	if err != nil {
 		p.finishLease()
+		p.recordWarmOutcome(false)
 		slog.WarnContext(ctx, "on-demand warm failed", "err", err, "image", image, "id", id)
 		return nil, fmt.Errorf("pool: warm %s: %w", image, err)
 	}
 	if vm.Image == "" {
 		vm.Image = image
 	}
+	p.recordWarmOutcome(true)
 	p.recordGolden(ctx, image)
 	p.startWarmIfNeeded(ctx, image)
 	return vm, nil
@@ -166,11 +217,41 @@ func (p *Pool) Shutdown(ctx context.Context) {
 func (p *Pool) FreeSlots() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.circuitOpenLocked() {
+		return 0
+	}
 	freeSlots := p.warmBudget - p.leased
 	if freeSlots < 0 {
 		return 0
 	}
 	return freeSlots
+}
+
+// Reconcile removes cached warm entries that no longer exist in Tart or no
+// longer answer a liveness probe, then starts replacement warming as needed.
+func (p *Pool) Reconcile(ctx context.Context) error {
+	names, err := p.warmer.List(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "list warm vms failed", "err", err)
+		return fmt.Errorf("pool: list warm vms: %w", err)
+	}
+	present := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		present[name] = struct{}{}
+	}
+
+	entries := p.warmEntries()
+	for _, entry := range entries {
+		if _, ok := present[entry.vm.Name]; !ok {
+			p.evictWarm(ctx, entry.image, entry.vm, "missing")
+			continue
+		}
+		if err := p.warmer.CheckAlive(ctx, entry.vm); err != nil {
+			slog.WarnContext(ctx, "warm vm liveness check failed", "err", err, "vm", entry.vm.Name, "image", entry.image)
+			p.evictWarm(ctx, entry.image, entry.vm, "liveness")
+		}
+	}
+	return nil
 }
 
 func (p *Pool) beginLease(image string) (*broker.WarmVM, bool, error) {
@@ -196,12 +277,74 @@ func (p *Pool) beginLease(image string) (*broker.WarmVM, bool, error) {
 	return vm, true, nil
 }
 
+type warmEntry struct {
+	image string
+	vm    *broker.WarmVM
+}
+
+func (p *Pool) warmEntries() []warmEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entries := make([]warmEntry, 0, len(p.states))
+	for image, state := range p.states {
+		if state.warm == nil {
+			continue
+		}
+		entries = append(entries, warmEntry{image: image, vm: state.warm})
+	}
+	return entries
+}
+
 func (p *Pool) finishLease() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.leased > 0 {
 		p.leased--
 	}
+}
+
+func (p *Pool) recordWarmOutcome(success bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.recordWarmOutcomeLocked(success)
+}
+
+func (p *Pool) recordWarmOutcomeLocked(success bool) {
+	if success {
+		p.warmFailures = 0
+		p.lastWarmOK = true
+		return
+	}
+	p.warmFailures++
+	p.lastWarmOK = false
+}
+
+func (p *Pool) circuitOpenLocked() bool {
+	return !p.lastWarmOK && p.warmFailures >= warmFailureThreshold
+}
+
+func (p *Pool) evictWarm(ctx context.Context, image string, vm *broker.WarmVM, reason string) {
+	evicted := p.removeWarm(image, vm.Name)
+	if evicted == nil {
+		return
+	}
+	p.recordWarmOutcome(false)
+	slog.WarnContext(ctx, "evicting warm vm", "vm", evicted.Name, "image", image, "reason", reason)
+	p.warmer.Teardown(ctx, evicted)
+	p.startWarmIfNeeded(ctx, image)
+}
+
+func (p *Pool) removeWarm(image, vmName string) *broker.WarmVM {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	state, ok := p.states[image]
+	if !ok || state.warm == nil || state.warm.Name != vmName {
+		return nil
+	}
+	vm := state.warm
+	state.warm = nil
+	p.cleanupStateLocked(image)
+	return vm
 }
 
 func (p *Pool) recordGolden(ctx context.Context, image string) {
@@ -254,6 +397,7 @@ func (p *Pool) warmCache(ctx context.Context, cancel context.CancelFunc, image, 
 
 	vm, err := p.warmer.Warm(ctx, image, id)
 	if err != nil {
+		p.recordWarmOutcome(false)
 		slog.WarnContext(ctx, "background warm failed", "err", err, "image", image, "id", id)
 		p.clearWarming(image)
 		p.waitBeforeRetry(ctx, image)
@@ -262,6 +406,7 @@ func (p *Pool) warmCache(ctx context.Context, cancel context.CancelFunc, image, 
 	if vm.Image == "" {
 		vm.Image = image
 	}
+	p.recordWarmOutcome(true)
 
 	p.mu.Lock()
 	state := p.ensureStateLocked(image)

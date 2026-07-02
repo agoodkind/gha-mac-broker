@@ -197,7 +197,7 @@ func (c *Client) InstallationToken(ctx context.Context, installationID int64, re
 	path := fmt.Sprintf("/app/installations/%d/access_tokens", installationID)
 	reqBody := accessTokenRequest{
 		Repositories: []string{repo},
-		Permissions:  tokenPermissions{Administration: "write", Actions: "read"},
+		Permissions:  tokenPermissions{Administration: "write", Actions: "write"},
 	}
 	encoded, err := json.Marshal(reqBody)
 	if err != nil {
@@ -231,6 +231,23 @@ type jitConfigRequest struct {
 type runnerInfo struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
+}
+
+// Runner describes one repository runner returned by the GitHub REST API.
+type Runner struct {
+	// ID is the GitHub runner id used for deletion.
+	ID int64 `json:"id"`
+	// Name is the registered runner name.
+	Name string `json:"name"`
+	// Status is the GitHub runner status, usually "online" or "offline".
+	Status string `json:"status"`
+	// Busy reports whether GitHub currently has a job assigned to the runner.
+	Busy bool `json:"busy"`
+}
+
+type runnerListResponse struct {
+	TotalCount int      `json:"total_count"`
+	Runners    []Runner `json:"runners"`
 }
 
 // JITConfig is the result of generate-jitconfig.
@@ -269,6 +286,73 @@ func (c *Client) GenerateJITConfig(ctx context.Context, token, owner, repo, name
 		return nil, errors.New("ghapp: empty encoded_jit_config")
 	}
 	return &out, nil
+}
+
+// CancelRun cancels one workflow run in repo.
+func (c *Client) CancelRun(ctx context.Context, repo string, runID int64) error {
+	owner, repoName, token, err := c.repoToken(ctx, repo)
+	if err != nil {
+		slog.ErrorContext(ctx, "ghapp prepare cancel run failed", "err", err, "repo", repo, "run_id", runID)
+		return fmt.Errorf("ghapp: prepare cancel run %s#%d: %w", repo, runID, err)
+	}
+	path := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/cancel", owner, repoName, runID)
+	if _, err := c.do(ctx, http.MethodPost, path, "token "+token, nil); err != nil {
+		slog.ErrorContext(ctx, "ghapp cancel run failed", "err", err, "repo", repo, "run_id", runID)
+		return fmt.Errorf("ghapp: cancel run %s#%d: %w", repo, runID, err)
+	}
+	return nil
+}
+
+// ListRunners lists the repository runners registered for repo.
+func (c *Client) ListRunners(ctx context.Context, repo string) ([]Runner, error) {
+	owner, repoName, token, err := c.repoToken(ctx, repo)
+	if err != nil {
+		slog.ErrorContext(ctx, "ghapp prepare runner list failed", "err", err, "repo", repo)
+		return nil, fmt.Errorf("ghapp: prepare runner list %s: %w", repo, err)
+	}
+	path := fmt.Sprintf("/repos/%s/%s/actions/runners", owner, repoName)
+	body, err := c.do(ctx, http.MethodGet, path, "token "+token, nil)
+	if err != nil {
+		slog.ErrorContext(ctx, "ghapp runner list failed", "err", err, "repo", repo)
+		return nil, fmt.Errorf("ghapp: list runners %s: %w", repo, err)
+	}
+	var out runnerListResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		slog.ErrorContext(ctx, "ghapp decode runners failed", "err", err, "repo", repo)
+		return nil, fmt.Errorf("ghapp: decode runners %s: %w", repo, err)
+	}
+	return out.Runners, nil
+}
+
+// DeleteRunner deregisters one repository runner by id.
+func (c *Client) DeleteRunner(ctx context.Context, repo string, runnerID int64) error {
+	owner, repoName, token, err := c.repoToken(ctx, repo)
+	if err != nil {
+		slog.ErrorContext(ctx, "ghapp prepare runner delete failed", "err", err, "repo", repo, "runner_id", runnerID)
+		return fmt.Errorf("ghapp: prepare runner delete %s#%d: %w", repo, runnerID, err)
+	}
+	path := fmt.Sprintf("/repos/%s/%s/actions/runners/%d", owner, repoName, runnerID)
+	if _, err := c.do(ctx, http.MethodDelete, path, "token "+token, nil); err != nil {
+		slog.ErrorContext(ctx, "ghapp runner delete failed", "err", err, "repo", repo, "runner_id", runnerID)
+		return fmt.Errorf("ghapp: delete runner %s#%d: %w", repo, runnerID, err)
+	}
+	return nil
+}
+
+func (c *Client) repoToken(ctx context.Context, fullRepo string) (string, string, string, error) {
+	owner, repoName, ok := strings.Cut(fullRepo, "/")
+	if !ok || owner == "" || repoName == "" {
+		return "", "", "", fmt.Errorf("repo must be owner/repo, got %q", fullRepo)
+	}
+	installationID, err := c.InstallationID(ctx, owner, repoName)
+	if err != nil {
+		return "", "", "", fmt.Errorf("installation lookup: %w", err)
+	}
+	token, err := c.InstallationToken(ctx, installationID, repoName)
+	if err != nil {
+		return "", "", "", fmt.Errorf("installation token: %w", err)
+	}
+	return owner, repoName, token, nil
 }
 
 // do performs one authenticated REST call and returns the raw response body.

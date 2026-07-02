@@ -22,6 +22,10 @@ type stubWarmer struct {
 	calls          []warmCall
 	torn           []string
 	deletedGoldens []string
+	alive          map[string]bool
+	listNames      []string
+	listErr        error
+	checkErr       error
 	warmErr        error
 	failN          int
 	swept          int
@@ -47,13 +51,20 @@ func (s *stubWarmer) Warm(ctx context.Context, image, id string) (*broker.WarmVM
 		return nil, errors.New("transient warm error")
 	}
 	s.calls = append(s.calls, warmCall{Image: image, ID: id})
-	return &broker.WarmVM{Name: "vm-" + id, Image: image}, nil
+	vmName := "vm-" + id
+	if s.alive != nil {
+		s.alive[vmName] = true
+	}
+	return &broker.WarmVM{Name: vmName, Image: image}, nil
 }
 
 func (s *stubWarmer) Teardown(_ context.Context, vm *broker.WarmVM) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.torn = append(s.torn, vm.Image)
+	s.torn = append(s.torn, vm.Name)
+	if s.alive != nil {
+		s.alive[vm.Name] = false
+	}
 }
 
 func (s *stubWarmer) DeleteGolden(_ context.Context, image string) error {
@@ -67,6 +78,43 @@ func (s *stubWarmer) SweepOrphans(_ context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.swept++
+}
+
+func (s *stubWarmer) CheckAlive(_ context.Context, vm *broker.WarmVM) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.checkErr != nil {
+		return s.checkErr
+	}
+	if s.alive == nil {
+		return nil
+	}
+	if s.alive[vm.Name] {
+		return nil
+	}
+	return errors.New("vm is not alive")
+}
+
+func (s *stubWarmer) List(_ context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	if s.listNames != nil {
+		names := append([]string(nil), s.listNames...)
+		return names, nil
+	}
+	if s.alive == nil {
+		return nil, nil
+	}
+	var names []string
+	for name, alive := range s.alive {
+		if alive {
+			names = append(names, name)
+		}
+	}
+	return names, nil
 }
 
 func waitFor(t *testing.T, cond func() bool) {
@@ -104,6 +152,16 @@ func imageWarmCount(p *Pool) int {
 		}
 	}
 	return count
+}
+
+func imageWarmName(p *Pool, image string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	state, ok := p.states[image]
+	if !ok || state.warm == nil {
+		return ""
+	}
+	return state.warm.Name
 }
 
 func TestPoolSweepsAndNamesCarryRunToken(t *testing.T) {
@@ -183,6 +241,112 @@ func TestPoolKeepsRequestedImageWarmAfterLease(t *testing.T) {
 	waitFor(t, func() bool {
 		return imageHasWarmVM(p, "image-a")
 	})
+}
+
+func TestPoolLeaseEvictsDeadCachedWarmAndWarmsReplacement(t *testing.T) {
+	w := &stubWarmer{alive: map[string]bool{}}
+	p := New(1, 3, w, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	vm, err := p.Lease(ctx, "image-a")
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	p.Recycle(ctx, vm)
+	waitFor(t, func() bool {
+		return imageHasWarmVM(p, "image-a")
+	})
+	deadWarmName := imageWarmName(p, "image-a")
+	if deadWarmName == "" {
+		t.Fatal("expected warm VM name")
+	}
+	w.mu.Lock()
+	w.alive[deadWarmName] = false
+	w.mu.Unlock()
+
+	replacement, err := p.Lease(ctx, "image-a")
+	if err != nil {
+		t.Fatalf("Lease after dead cached warm: %v", err)
+	}
+	defer p.Recycle(ctx, replacement)
+	if replacement.Name == deadWarmName {
+		t.Fatalf("lease returned dead cached VM %q", deadWarmName)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !strings.Contains(strings.Join(w.torn, "\n"), deadWarmName) {
+		t.Fatalf("dead warm VM %q was not torn down, torn=%v", deadWarmName, w.torn)
+	}
+}
+
+func TestPoolCircuitBreakerClosesCapacityAfterFailuresAndRecovers(t *testing.T) {
+	w := &stubWarmer{warmErr: errors.New("golden is broken")}
+	p := New(1, 1, w, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	for i := 0; i < warmFailureThreshold; i++ {
+		if _, err := p.Lease(ctx, "image-a"); err == nil {
+			t.Fatalf("Lease attempt %d should fail", i+1)
+		}
+	}
+	if slots := p.FreeSlots(); slots != 0 {
+		t.Fatalf("FreeSlots with open circuit = %d, want 0", slots)
+	}
+
+	w.mu.Lock()
+	w.warmErr = nil
+	w.mu.Unlock()
+	vm, err := p.Lease(ctx, "image-a")
+	if err != nil {
+		t.Fatalf("Lease after warm recovery: %v", err)
+	}
+	if slots := p.FreeSlots(); slots != 0 {
+		t.Fatalf("FreeSlots during recovered lease = %d, want 0", slots)
+	}
+	p.Recycle(ctx, vm)
+	if slots := p.FreeSlots(); slots != 1 {
+		t.Fatalf("FreeSlots after warm recovery = %d, want 1", slots)
+	}
+}
+
+func TestPoolReconcileEvictsMissingWarmEntryAndStartsReplacement(t *testing.T) {
+	w := &stubWarmer{alive: map[string]bool{}}
+	p := New(1, 3, w, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	vm, err := p.Lease(ctx, "image-a")
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	p.Recycle(ctx, vm)
+	waitFor(t, func() bool {
+		return imageHasWarmVM(p, "image-a")
+	})
+	missingWarmName := imageWarmName(p, "image-a")
+	w.mu.Lock()
+	w.listNames = []string{}
+	w.mu.Unlock()
+
+	if err := p.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	waitFor(t, func() bool {
+		replacementName := imageWarmName(p, "image-a")
+		return replacementName != "" && replacementName != missingWarmName
+	})
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !strings.Contains(strings.Join(w.torn, "\n"), missingWarmName) {
+		t.Fatalf("missing warm VM %q was not torn down, torn=%v", missingWarmName, w.torn)
+	}
 }
 
 func TestPoolLRUEvictionOrder(t *testing.T) {
