@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -218,7 +219,13 @@ func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
 func (b *Binder) bootCommand(ctx context.Context, vmName string) *exec.Cmd {
 	var dirs []tart.DirMount
 	if b.cfg.Tart.CacheDir != "" {
-		dirs = []tart.DirMount{{Name: "cache", Path: b.cfg.Tart.CacheDir}}
+		// tart --dir requires the host path to exist, so create it before the
+		// mount. MkdirAll is idempotent and cheap on the warm path.
+		if err := os.MkdirAll(b.cfg.Tart.CacheDir, 0o755); err != nil {
+			slog.WarnContext(ctx, "create cache dir failed; booting without cache mount", "err", err, "dir", b.cfg.Tart.CacheDir)
+		} else {
+			dirs = []tart.DirMount{{Name: "cache", Path: b.cfg.Tart.CacheDir}}
+		}
 	}
 	return b.vm.BootCommand(ctx, vmName, tart.BootOptions{NoGraphics: true, Dirs: dirs})
 }

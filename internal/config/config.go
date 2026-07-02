@@ -86,8 +86,10 @@ type TartConfig struct {
 	Images []ImageMapping `toml:"images"`
 	// VMNamePrefix prefixes ephemeral clone names.
 	VMNamePrefix string `toml:"vm_name_prefix"`
-	// CacheDir is a host directory shared into each VM so the build cache
-	// survives VM deletion.
+	// CacheDir is a host directory shared into each VM (virtiofs, guest path
+	// /Volumes/My Shared Files/cache) so the build cache survives VM deletion.
+	// Empty defaults to <home>/pool-cache. It must not hold the base-image
+	// blobs (see FastPullDir), which stay out of the mount.
 	CacheDir string `toml:"cache_dir"`
 	// FastPull enables the fast parallel base-image pull path when true. Nil
 	// means enabled.
@@ -177,12 +179,18 @@ func (c *Config) applyDefaults() {
 		c.Tart.FastPull = new(bool)
 		*c.Tart.FastPull = true
 	}
-	if c.Tart.FastPullDir == "" {
-		if c.Tart.CacheDir != "" {
-			c.Tart.FastPullDir = filepath.Join(c.Tart.CacheDir, "fastpull-blobs")
+	if c.Tart.CacheDir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			c.Tart.CacheDir = filepath.Join(home, "pool-cache")
 		} else {
-			c.Tart.FastPullDir = filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
+			c.Tart.CacheDir = filepath.Join(os.TempDir(), "gha-mac-broker-pool-cache")
 		}
+	}
+	if c.Tart.FastPullDir == "" {
+		// FastPullDir holds the multi-GB base-image blobs and must stay OUT of
+		// CacheDir, because CacheDir is mounted into every guest and the image
+		// blobs have no business inside a build VM.
+		c.Tart.FastPullDir = filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
 	}
 	if c.Tart.FastPullParallel <= 0 {
 		c.Tart.FastPullParallel = defaultFastPullParallel
