@@ -160,6 +160,25 @@ func (b *Binder) Teardown(ctx context.Context, vm *WarmVM) {
 	b.teardown(ctx, vm.Name)
 }
 
+// CheckAlive verifies that a cached warm VM still answers over vsock.
+func (b *Binder) CheckAlive(ctx context.Context, vm *WarmVM) error {
+	if _, err := b.vm.Exec(ctx, vm.Name, "touch", heartbeatFile); err != nil {
+		slog.WarnContext(ctx, "warm vm liveness probe failed", "err", err, "vm", vm.Name)
+		return fmt.Errorf("broker: check alive %s: %w", vm.Name, err)
+	}
+	return nil
+}
+
+// List returns the Tart VM names visible to the broker host.
+func (b *Binder) List(ctx context.Context) ([]string, error) {
+	names, err := b.vm.List(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "list tart vms failed", "err", err)
+		return nil, fmt.Errorf("broker: list tart vms: %w", err)
+	}
+	return names, nil
+}
+
 // DeleteGolden removes the derived golden for image from disk.
 func (b *Binder) DeleteGolden(ctx context.Context, image string) error {
 	goldenName := golden.NameForImage(image)

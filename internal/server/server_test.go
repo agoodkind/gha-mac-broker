@@ -96,6 +96,45 @@ func (r *testRunner) RunJob(_ context.Context, _ *broker.WarmVM, _, _ string) er
 	return r.err
 }
 
+type cancelCall struct {
+	Repo  string
+	RunID int64
+}
+
+type testCanceller struct {
+	mu        sync.Mutex
+	calls     []cancelCall
+	cancelErr error
+}
+
+func (c *testCanceller) CancelRun(_ context.Context, repo string, runID int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, cancelCall{Repo: repo, RunID: runID})
+	return c.cancelErr
+}
+
+type mutableClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newMutableClock(now time.Time) *mutableClock {
+	return &mutableClock{mu: sync.Mutex{}, now: now}
+}
+
+func (c *mutableClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *mutableClock) Advance(delta time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(delta)
+}
+
 // testSecret is the webhook HMAC secret used across all handler tests.
 var testSecret = []byte("test-secret")
 
@@ -178,13 +217,39 @@ func TestVerifySignatureWrongSecret(t *testing.T) {
 // --- webhook handler tests ---
 
 func webhookBody(action, repo string, labels []string, runID int64) []byte {
+	return webhookBodyWithJobID(action, repo, labels, runID, 7000+runID)
+}
+
+func webhookBodyWithJobID(action, repo string, labels []string, runID int64, jobID int64) []byte {
+	return webhookBodyWithJobIDAndRunner(action, repo, labels, runID, jobID, "", 0)
+}
+
+func webhookBodyWithRunner(action, repo string, labels []string, runID int64, runnerName string, runnerID int64) []byte {
+	return webhookBodyWithJobIDAndRunner(action, repo, labels, runID, 7000+runID, runnerName, runnerID)
+}
+
+func webhookBodyWithJobIDAndRunner(action, repo string, labels []string, runID int64, jobID int64, runnerName string, runnerID int64) []byte {
 	payload := webhookPayload{
-		Action:      action,
-		Repository:  webhookRepo{FullName: repo},
-		WorkflowJob: webhookJobField{Labels: labels, RunID: runID},
+		Action:     webhookAction(action),
+		Repository: webhookRepo{FullName: repo},
+		WorkflowJob: webhookJobField{
+			ID:         jobID,
+			Labels:     labels,
+			RunID:      runID,
+			Status:     action,
+			Conclusion: "",
+			RunnerName: runnerName,
+			RunnerID:   runnerID,
+		},
 	}
 	b, _ := json.Marshal(payload)
 	return b
+}
+
+func pendingDeliveryCount(s *Server) int {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return len(s.pending)
 }
 
 func TestWebhookBadSignatureReturns401(t *testing.T) {
@@ -263,6 +328,244 @@ func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
 	defer pool.mu.Unlock()
 	if len(pool.leasedImages) != 1 || pool.leasedImages[0] != config.DefaultBaseImage {
 		t.Fatalf("leased images = %v, want %q", pool.leasedImages, config.DefaultBaseImage)
+	}
+}
+
+func TestWebhookQueuedRecordsPendingDelivery(t *testing.T) {
+	vm := &broker.WarmVM{Name: "gha-vm-1", Image: config.DefaultBaseImage}
+	pool := &testPool{freeSlots: 2, leaseVM: vm}
+	runner := &testRunner{ran: make(chan struct{}, 1)}
+	store := &testStore{reserved: map[string]string{"7": config.DefaultBaseImage}}
+	clock := newMutableClock(time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
+	srv := New(
+		testSecret,
+		newTestConfig("owner/repo"),
+		nil,
+		nil,
+		pool,
+		store,
+		runner,
+		WithClock(clock.Now),
+	)
+
+	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 7)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", signBody(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", w.Code)
+	}
+	if got := pendingDeliveryCount(srv); got != 1 {
+		t.Fatalf("pending delivery count = %d, want 1", got)
+	}
+}
+
+func TestWebhookInProgressClearsOnlyMatchingPendingWorkflowJob(t *testing.T) {
+	vm := &broker.WarmVM{Name: "gha-vm-1", Image: config.DefaultBaseImage}
+	pool := &testPool{freeSlots: 2, leaseVM: vm}
+	runner := &testRunner{ran: make(chan struct{}, 2)}
+	store := &testStore{reserved: map[string]string{"42": config.DefaultBaseImage}}
+	clock := newMutableClock(time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
+	canceller := &testCanceller{}
+	srv := New(
+		testSecret,
+		newTestConfig("owner/repo"),
+		nil,
+		nil,
+		pool,
+		store,
+		runner,
+		WithClock(clock.Now),
+		WithRunCanceller(canceller),
+	)
+
+	firstJob := webhookBodyWithJobID("queued", "owner/repo", []string{"self-hosted"}, 42, 1001)
+	firstReq := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(firstJob)))
+	firstReq.Header.Set("X-Hub-Signature-256", signBody(firstJob))
+	firstResp := httptest.NewRecorder()
+	srv.ServeHTTP(firstResp, firstReq)
+	if firstResp.Code != http.StatusAccepted {
+		t.Fatalf("first queued webhook status = %d, want 202", firstResp.Code)
+	}
+
+	secondJob := webhookBodyWithJobID("queued", "owner/repo", []string{"self-hosted"}, 42, 1002)
+	secondReq := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(secondJob)))
+	secondReq.Header.Set("X-Hub-Signature-256", signBody(secondJob))
+	secondResp := httptest.NewRecorder()
+	srv.ServeHTTP(secondResp, secondReq)
+	if secondResp.Code != http.StatusAccepted {
+		t.Fatalf("second queued webhook status = %d, want 202", secondResp.Code)
+	}
+	if got := pendingDeliveryCount(srv); got != 2 {
+		t.Fatalf("pending delivery count after two jobs in one run = %d, want 2", got)
+	}
+
+	deliveredJob := webhookBodyWithJobIDAndRunner("in_progress", "owner/repo", []string{"self-hosted"}, 42, 1001, "gha-vm-1", 4242)
+	deliveredReq := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(deliveredJob)))
+	deliveredReq.Header.Set("X-Hub-Signature-256", signBody(deliveredJob))
+	deliveredResp := httptest.NewRecorder()
+	srv.ServeHTTP(deliveredResp, deliveredReq)
+	if deliveredResp.Code != http.StatusNoContent {
+		t.Fatalf("in_progress webhook status = %d, want 204", deliveredResp.Code)
+	}
+	if got := pendingDeliveryCount(srv); got != 1 {
+		t.Fatalf("pending delivery count after one job is delivered = %d, want 1", got)
+	}
+
+	clock.Advance(servingDeadline + time.Second)
+	srv.sweepPendingDeliveries(context.Background())
+
+	canceller.mu.Lock()
+	defer canceller.mu.Unlock()
+	if len(canceller.calls) != 1 {
+		t.Fatalf("cancel calls = %+v, want one", canceller.calls)
+	}
+	if canceller.calls[0].Repo != "owner/repo" || canceller.calls[0].RunID != 42 {
+		t.Fatalf("cancel call = %+v, want owner/repo run 42", canceller.calls[0])
+	}
+}
+
+func TestWebhookQueuedRetryKeepsOriginalPendingDeadline(t *testing.T) {
+	vm := &broker.WarmVM{Name: "gha-vm-1", Image: config.DefaultBaseImage}
+	pool := &testPool{freeSlots: 2, leaseVM: vm}
+	runner := &testRunner{ran: make(chan struct{}, 2)}
+	store := &testStore{reserved: map[string]string{"42": config.DefaultBaseImage}}
+	clock := newMutableClock(time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
+	canceller := &testCanceller{}
+	srv := New(
+		testSecret,
+		newTestConfig("owner/repo"),
+		nil,
+		nil,
+		pool,
+		store,
+		runner,
+		WithClock(clock.Now),
+		WithRunCanceller(canceller),
+	)
+
+	body := webhookBodyWithJobID("queued", "owner/repo", []string{"self-hosted"}, 42, 1001)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", signBody(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("first queued webhook status = %d, want 202", w.Code)
+	}
+
+	clock.Advance(servingDeadline - time.Second)
+	retryReq := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	retryReq.Header.Set("X-Hub-Signature-256", signBody(body))
+	retryResp := httptest.NewRecorder()
+	srv.ServeHTTP(retryResp, retryReq)
+	if retryResp.Code != http.StatusAccepted {
+		t.Fatalf("retry queued webhook status = %d, want 202", retryResp.Code)
+	}
+
+	clock.Advance(2 * time.Second)
+	srv.sweepPendingDeliveries(context.Background())
+
+	canceller.mu.Lock()
+	defer canceller.mu.Unlock()
+	if len(canceller.calls) != 1 {
+		t.Fatalf("cancel calls after original deadline = %+v, want one", canceller.calls)
+	}
+	if canceller.calls[0].Repo != "owner/repo" || canceller.calls[0].RunID != 42 {
+		t.Fatalf("cancel call = %+v, want owner/repo run 42", canceller.calls[0])
+	}
+}
+
+func TestDeliverySweeperCancelsExpiredPendingRun(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
+	canceller := &testCanceller{}
+	srv := New(
+		testSecret,
+		newTestConfig("owner/repo"),
+		nil,
+		nil,
+		&testPool{},
+		&testStore{},
+		&testRunner{ran: make(chan struct{}, 1)},
+		WithClock(clock.Now),
+		WithRunCanceller(canceller),
+	)
+	srv.recordPendingDelivery("owner/repo", 4200, 42)
+	clock.Advance(servingDeadline + time.Second)
+
+	srv.sweepPendingDeliveries(context.Background())
+
+	canceller.mu.Lock()
+	defer canceller.mu.Unlock()
+	if len(canceller.calls) != 1 {
+		t.Fatalf("cancel calls = %+v, want one", canceller.calls)
+	}
+	if canceller.calls[0].Repo != "owner/repo" || canceller.calls[0].RunID != 42 {
+		t.Fatalf("cancel call = %+v, want owner/repo run 42", canceller.calls[0])
+	}
+	if got := pendingDeliveryCount(srv); got != 0 {
+		t.Fatalf("pending delivery count after cancel = %d, want 0", got)
+	}
+}
+
+func TestDeliverySweeperDoesNotCancelDeliveredRun(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
+	canceller := &testCanceller{}
+	srv := New(
+		testSecret,
+		newTestConfig("owner/repo"),
+		nil,
+		nil,
+		&testPool{},
+		&testStore{},
+		&testRunner{ran: make(chan struct{}, 1)},
+		WithClock(clock.Now),
+		WithRunCanceller(canceller),
+	)
+	srv.recordPendingDelivery("owner/repo", 4200, 42)
+	srv.markDelivered("owner/repo", 4200, "gha-vm-42", 4242)
+	clock.Advance(servingDeadline + time.Second)
+
+	srv.sweepPendingDeliveries(context.Background())
+
+	canceller.mu.Lock()
+	defer canceller.mu.Unlock()
+	if len(canceller.calls) != 0 {
+		t.Fatalf("cancel calls = %+v, want none", canceller.calls)
+	}
+	if got := pendingDeliveryCount(srv); got != 0 {
+		t.Fatalf("pending delivery count after delivery = %d, want 0", got)
+	}
+}
+
+func TestWebhookInProgressClearsPendingDelivery(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
+	canceller := &testCanceller{}
+	srv := New(
+		testSecret,
+		newTestConfig("owner/repo"),
+		nil,
+		nil,
+		&testPool{},
+		&testStore{},
+		&testRunner{ran: make(chan struct{}, 1)},
+		WithClock(clock.Now),
+		WithRunCanceller(canceller),
+	)
+	srv.recordPendingDelivery("owner/repo", 7042, 42)
+
+	body := webhookBodyWithRunner("in_progress", "owner/repo", []string{"self-hosted"}, 42, "gha-vm-42", 4242)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", signBody(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", w.Code)
+	}
+	if got := pendingDeliveryCount(srv); got != 0 {
+		t.Fatalf("pending delivery count after in_progress = %d, want 0", got)
 	}
 }
 

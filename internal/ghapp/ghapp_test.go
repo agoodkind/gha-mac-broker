@@ -154,3 +154,158 @@ func TestGenerateJITConfigFlow(t *testing.T) {
 		t.Errorf("runner name = %q", jit.Runner.Name)
 	}
 }
+
+func TestRunManagementFlow(t *testing.T) {
+	pemKey, _ := testKeyPEM(t)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/installation":
+			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				t.Errorf("installation lookup must use App JWT bearer, got %q", r.Header.Get("Authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(installationResponse{ID: 999})
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/999/access_tokens":
+			var body accessTokenRequest
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if len(body.Repositories) != 1 || body.Repositories[0] != "lmd" {
+				t.Errorf("token repositories = %v, want lmd", body.Repositories)
+			}
+			if body.Permissions.Administration != "write" {
+				t.Errorf("administration permission = %q, want write", body.Permissions.Administration)
+			}
+			if body.Permissions.Actions != "write" {
+				t.Errorf("actions permission = %q, want write", body.Permissions.Actions)
+			}
+			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "ghs_installationtoken"})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/agoodkind/lmd/actions/runs/321/cancel":
+			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
+				t.Errorf("cancel must use installation token, got %q", got)
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/actions/runners":
+			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
+				t.Errorf("runner list must use installation token, got %q", got)
+			}
+			_ = json.NewEncoder(w).Encode(runnerListResponse{
+				TotalCount: 2,
+				Runners: []Runner{
+					{ID: 11, Name: "gha-old", Status: "offline", Busy: false},
+					{ID: 12, Name: "gha-new", Status: "online", Busy: true},
+				},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/repos/agoodkind/lmd/actions/runners/11":
+			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
+				t.Errorf("runner delete must use installation token, got %q", got)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	})
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, r)
+			return recorder.Result(), nil
+		}),
+	}
+
+	client, err := New("12345", pemKey, WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client.apiBase = "https://api.github.test"
+	ctx := context.Background()
+
+	if err := client.CancelRun(ctx, "agoodkind/lmd", 321); err != nil {
+		t.Fatalf("CancelRun: %v", err)
+	}
+	runners, err := client.ListRunners(ctx, "agoodkind/lmd")
+	if err != nil {
+		t.Fatalf("ListRunners: %v", err)
+	}
+	if len(runners) != 2 {
+		t.Fatalf("runner count = %d, want 2", len(runners))
+	}
+	if runners[0].Status != "offline" {
+		t.Fatalf("first runner status = %q, want offline", runners[0].Status)
+	}
+	if err := client.DeleteRunner(ctx, "agoodkind/lmd", 11); err != nil {
+		t.Fatalf("DeleteRunner: %v", err)
+	}
+}
+
+func TestListRunnersReadsAllPages(t *testing.T) {
+	pemKey, _ := testKeyPEM(t)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/installation":
+			_ = json.NewEncoder(w).Encode(installationResponse{ID: 999})
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/999/access_tokens":
+			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "ghs_installationtoken"})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/actions/runners":
+			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
+				t.Errorf("runner list must use installation token, got %q", got)
+			}
+			if got := r.URL.Query().Get("per_page"); got != "100" {
+				t.Errorf("per_page = %q, want 100", got)
+			}
+			page := r.URL.Query().Get("page")
+			if page == "" {
+				page = "1"
+			}
+			switch page {
+			case "1":
+				_ = json.NewEncoder(w).Encode(runnerListResponse{
+					TotalCount: 3,
+					Runners: []Runner{
+						{ID: 11, Name: "gha-old", Status: "offline", Busy: false},
+						{ID: 12, Name: "gha-new", Status: "online", Busy: true},
+					},
+				})
+			case "2":
+				_ = json.NewEncoder(w).Encode(runnerListResponse{
+					TotalCount: 3,
+					Runners: []Runner{
+						{ID: 13, Name: "gha-third", Status: "offline", Busy: false},
+					},
+				})
+			default:
+				_ = json.NewEncoder(w).Encode(runnerListResponse{
+					TotalCount: 3,
+					Runners:    []Runner{},
+				})
+			}
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	})
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, r)
+			return recorder.Result(), nil
+		}),
+	}
+
+	client, err := New("12345", pemKey, WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client.apiBase = "https://api.github.test"
+
+	runners, err := client.ListRunners(context.Background(), "agoodkind/lmd")
+	if err != nil {
+		t.Fatalf("ListRunners: %v", err)
+	}
+	if len(runners) != 3 {
+		t.Fatalf("runner count = %d, want 3", len(runners))
+	}
+	if runners[2].ID != 13 {
+		t.Fatalf("third runner id = %d, want 13", runners[2].ID)
+	}
+}

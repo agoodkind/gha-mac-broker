@@ -385,6 +385,39 @@ func runBind(ctx context.Context, args []string) error {
 	return nil
 }
 
+type staleRunnerCleaner interface {
+	ListRunners(ctx context.Context, repo string) ([]ghapp.Runner, error)
+	DeleteRunner(ctx context.Context, repo string, runnerID int64) error
+}
+
+func deleteStaleRunners(ctx context.Context, cfg *config.Config, cleaner staleRunnerCleaner) {
+	totalDeleted := 0
+	runnerNamePrefix := cfg.Tart.VMNamePrefix
+	for _, repo := range cfg.AllowedRepos {
+		runners, err := cleaner.ListRunners(ctx, repo)
+		if err != nil {
+			slog.WarnContext(ctx, "stale runner list failed; continuing startup", "err", err, "repo", repo)
+			continue
+		}
+		for _, runner := range runners {
+			if !strings.EqualFold(runner.Status, "offline") {
+				continue
+			}
+			if !strings.HasPrefix(runner.Name, runnerNamePrefix) {
+				continue
+			}
+			if err := cleaner.DeleteRunner(ctx, repo, runner.ID); err != nil {
+				slog.WarnContext(ctx, "stale runner delete failed; continuing startup", "err", err, "repo", repo, "runner", runner.Name, "runner_id", runner.ID)
+				continue
+			}
+			totalDeleted++
+		}
+	}
+	if totalDeleted > 0 {
+		slog.InfoContext(ctx, "stale offline runners deleted", "count", totalDeleted)
+	}
+}
+
 // runServe loads config, builds the pool, reservation store, and HTTP server,
 // starts the fill loop, and listens until SIGINT or SIGTERM triggers a
 // graceful shutdown.
@@ -438,12 +471,15 @@ func runServe(ctx context.Context, args []string) error {
 	runToken := time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:])
 	p := pool.New(cfg.Tart.WarmBudget, cfg.Tart.GoldenBudget, binder, runToken)
 	store := reservation.New()
-	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, store, binder)
+	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, store, binder, server.WithRunCanceller(gh), server.WithClock(time.Now))
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	deleteStaleRunners(ctx, cfg, gh)
 	p.Start(ctx)
+	p.StartReconcile(ctx, 0)
+	srv.StartDeliverySweeper(ctx)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
