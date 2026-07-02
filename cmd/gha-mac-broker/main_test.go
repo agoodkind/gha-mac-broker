@@ -50,6 +50,10 @@ func testServeConfig() *config.Config {
 			FastPullDir:      "",
 			FastPullParallel: 16,
 		},
+		Maintenance: config.MaintenanceConfig{
+			Command:         "",
+			IntervalSeconds: 0,
+		},
 		Labels:       []string{"self-hosted", "macOS"},
 		AllowedRepos: []string{"owner/repo"},
 	}

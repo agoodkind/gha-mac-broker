@@ -21,9 +21,10 @@ import (
 const DefaultBaseImage = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
 
 const (
-	defaultWarmBudget   = 2
-	defaultGoldenBudget = 3
-	cirrusImagePrefix   = "ghcr.io/cirruslabs/"
+	defaultWarmBudget                 = 2
+	defaultGoldenBudget               = 3
+	defaultMaintenanceIntervalSeconds = 3600
+	cirrusImagePrefix                 = "ghcr.io/cirruslabs/"
 	// defaultFastPullParallel is the skopeo layer-copy concurrency used when
 	// fast_pull_parallel is unset. ghcr throttles each connection, so more
 	// concurrent streams raise the cold-pull rate.
@@ -40,6 +41,9 @@ type Config struct {
 
 	// Tart configures the VM pool substrate.
 	Tart TartConfig `toml:"tart"`
+
+	// Maintenance configures the optional host maintenance launchd timer.
+	Maintenance MaintenanceConfig `toml:"maintenance"`
 
 	// Labels are the runner labels every JIT runner registers with. The
 	// self-hosted job in CI targets one of these.
@@ -102,6 +106,15 @@ type TartConfig struct {
 	// ghcr throttles each connection, so a higher count raises the cold-pull
 	// rate. Zero or unset defaults to defaultFastPullParallel.
 	FastPullParallel int `toml:"fast_pull_parallel"`
+}
+
+// MaintenanceConfig configures a host-side command run by an installer-managed
+// launchd timer. An empty command disables the timer.
+type MaintenanceConfig struct {
+	// Command is the shell line the launchd timer runs. Empty disables it.
+	Command string `toml:"command"`
+	// IntervalSeconds is the launchd StartInterval value in seconds.
+	IntervalSeconds int `toml:"interval_seconds"`
 }
 
 // ImageMapping maps a declared macOS and Xcode pair to an approved Cirrus tag.
@@ -195,6 +208,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Tart.FastPullParallel <= 0 {
 		c.Tart.FastPullParallel = defaultFastPullParallel
+	}
+	if c.Maintenance.IntervalSeconds <= 0 {
+		c.Maintenance.IntervalSeconds = defaultMaintenanceIntervalSeconds
 	}
 	if len(c.Labels) == 0 {
 		c.Labels = []string{"self-hosted", "macOS", "ARM64", "agk-local-macos-26"}
