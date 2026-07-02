@@ -166,6 +166,10 @@ func newTestConfig(allowedRepo string) *config.Config {
 			FastPull:     nil,
 			FastPullDir:  "",
 		},
+		Maintenance: config.MaintenanceConfig{
+			Command:         "",
+			IntervalSeconds: 0,
+		},
 		Labels:       []string{"self-hosted", "macOS"},
 		AllowedRepos: []string{allowedRepo},
 	}

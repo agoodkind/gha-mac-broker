@@ -39,19 +39,23 @@ const (
 	osLinux  = "linux"
 )
 
-// renderUnit renders a service-unit template with cfg.
-func renderUnit(ctx context.Context, templateText string, cfg Config) ([]byte, error) {
-	tmpl, err := template.New("unit").Parse(templateText)
+func renderTemplate(ctx context.Context, name string, templateText string, data any) ([]byte, error) {
+	tmpl, err := template.New(name).Parse(templateText)
 	if err != nil {
-		slog.ErrorContext(ctx, "parse unit template failed", "err", err)
-		return nil, fmt.Errorf("install: parse unit template: %w", err)
+		slog.ErrorContext(ctx, "parse template failed", "err", err, "template", name)
+		return nil, fmt.Errorf("install: parse %s template: %w", name, err)
 	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, cfg); err != nil {
-		slog.ErrorContext(ctx, "execute unit template failed", "err", err)
-		return nil, fmt.Errorf("install: execute unit template: %w", err)
+	if err := tmpl.Execute(&buf, data); err != nil {
+		slog.ErrorContext(ctx, "execute template failed", "err", err, "template", name)
+		return nil, fmt.Errorf("install: execute %s template: %w", name, err)
 	}
 	return buf.Bytes(), nil
+}
+
+// renderUnit renders a service-unit template with cfg.
+func renderUnit(ctx context.Context, templateText string, cfg Config) ([]byte, error) {
+	return renderTemplate(ctx, "unit", templateText, cfg)
 }
 
 // installUnit renders and bootstraps the OS-appropriate service unit.
@@ -105,11 +109,11 @@ func installLaunchd(ctx context.Context, cfg Config) error {
 	}
 
 	target := fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel)
-	if out, err := command(ctx, "launchctl", "bootout", target).CombinedOutput(); err != nil {
+	if out, err := commandRunner(ctx, "launchctl", "bootout", target).CombinedOutput(); err != nil {
 		slog.DebugContext(ctx, "launchctl bootout ignored (likely not loaded)", "err", err, "out", string(out))
 	}
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	if out, err := command(ctx, "launchctl", "bootstrap", domain, plistPath).CombinedOutput(); err != nil {
+	if out, err := commandRunner(ctx, "launchctl", "bootstrap", domain, plistPath).CombinedOutput(); err != nil {
 		slog.ErrorContext(ctx, "launchctl bootstrap failed", "err", err, "out", string(out))
 		return fmt.Errorf("install: launchctl bootstrap: %w", err)
 	}
@@ -133,11 +137,11 @@ func installSystemd(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("install: write unit %s: %w", unitPath, err)
 	}
 
-	if out, err := command(ctx, "systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
+	if out, err := commandRunner(ctx, "systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
 		slog.ErrorContext(ctx, "systemctl daemon-reload failed", "err", err, "out", string(out))
 		return fmt.Errorf("install: systemctl daemon-reload: %w", err)
 	}
-	if out, err := command(ctx, "systemctl", "--user", "enable", "--now", systemdUnit).CombinedOutput(); err != nil {
+	if out, err := commandRunner(ctx, "systemctl", "--user", "enable", "--now", systemdUnit).CombinedOutput(); err != nil {
 		slog.ErrorContext(ctx, "systemctl enable --now failed", "err", err, "out", string(out))
 		return fmt.Errorf("install: systemctl enable --now: %w", err)
 	}
@@ -148,7 +152,7 @@ func installSystemd(ctx context.Context, cfg Config) error {
 // uninstallLaunchd boots out the job (ignoring not-loaded) and removes the plist.
 func uninstallLaunchd(ctx context.Context, cfg Config) error {
 	target := fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel)
-	if out, err := command(ctx, "launchctl", "bootout", target).CombinedOutput(); err != nil {
+	if out, err := commandRunner(ctx, "launchctl", "bootout", target).CombinedOutput(); err != nil {
 		slog.WarnContext(ctx, "launchctl bootout ignored (likely not loaded)", "err", err, "out", string(out))
 	}
 	plistPath := filepath.Join(cfg.Home, "Library", "LaunchAgents", launchdLabel+".plist")
@@ -162,7 +166,7 @@ func uninstallLaunchd(ctx context.Context, cfg Config) error {
 
 // uninstallSystemd disables the unit (ignoring not-loaded) and removes the file.
 func uninstallSystemd(ctx context.Context, cfg Config) error {
-	if out, err := command(ctx, "systemctl", "--user", "disable", "--now", systemdUnit).CombinedOutput(); err != nil {
+	if out, err := commandRunner(ctx, "systemctl", "--user", "disable", "--now", systemdUnit).CombinedOutput(); err != nil {
 		slog.WarnContext(ctx, "systemctl disable --now ignored (likely not loaded)", "err", err, "out", string(out))
 	}
 	unitPath := filepath.Join(cfg.Home, ".config", "systemd", "user", systemdUnit)

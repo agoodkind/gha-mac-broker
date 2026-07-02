@@ -20,12 +20,7 @@ const (
 // buildGoldenIfAbsent builds the configured golden image when it is not already
 // present. It requires tart and skopeo on PATH and fails with install hints
 // otherwise.
-func buildGoldenIfAbsent(ctx context.Context, configPath string) error {
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		slog.ErrorContext(ctx, "load config for golden failed", "err", err, "path", configPath)
-		return fmt.Errorf("install: load config: %w", err)
-	}
+func buildGoldenIfAbsent(ctx context.Context, cfg *config.Config) error {
 	if err := requireHostBinary(ctx, cfg.Tart.Binary, "brew install cirruslabs/cli/tart"); err != nil {
 		return err
 	}

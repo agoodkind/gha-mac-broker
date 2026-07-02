@@ -61,6 +61,12 @@ private_key_path = "/tmp/key.pem"
 	if cfg.Tart.CacheDir != wantCacheDir {
 		t.Errorf("default cache dir = %q, want %q", cfg.Tart.CacheDir, wantCacheDir)
 	}
+	if cfg.Maintenance.Command != "" {
+		t.Errorf("default maintenance command = %q, want empty", cfg.Maintenance.Command)
+	}
+	if cfg.Maintenance.IntervalSeconds != 3600 {
+		t.Errorf("default maintenance interval = %d, want 3600", cfg.Maintenance.IntervalSeconds)
+	}
 	image, ok := cfg.ResolveImage("", "")
 	if !ok {
 		t.Fatal("empty request should resolve to default base image")
@@ -80,6 +86,33 @@ private_key_path = "/tmp/key.pem"
 	}
 	if cfg.RepoAllowed("agoodkind/secret") {
 		t.Error("non-listed repo must not be allowed")
+	}
+}
+
+func TestLoadMaintenanceConfig(t *testing.T) {
+	path := writeConfig(t, `
+allowed_repos = ["agoodkind/lmd"]
+
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[maintenance]
+command = "printf hello"
+interval_seconds = 900
+
+[tart]
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Maintenance.Command != "printf hello" {
+		t.Errorf("maintenance command = %q, want %q", cfg.Maintenance.Command, "printf hello")
+	}
+	if cfg.Maintenance.IntervalSeconds != 900 {
+		t.Errorf("maintenance interval = %d, want 900", cfg.Maintenance.IntervalSeconds)
 	}
 }
 
@@ -139,6 +172,10 @@ func TestResolveImageRejectsUnsafeConfiguredTag(t *testing.T) {
 			CacheDir:     "",
 			FastPull:     nil,
 			FastPullDir:  "",
+		},
+		Maintenance: MaintenanceConfig{
+			Command:         "",
+			IntervalSeconds: 0,
 		},
 		Labels:       []string{"self-hosted"},
 		AllowedRepos: []string{"agoodkind/lmd"},
