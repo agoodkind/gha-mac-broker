@@ -38,6 +38,9 @@ const jwtTTL = 9 * time.Minute
 // maxResponseBytes caps how much of a response body is read.
 const maxResponseBytes = 1 << 20
 
+// runnerListPageSize is the largest page size accepted by GitHub's runners API.
+const runnerListPageSize = 100
+
 // Client authenticates as one GitHub App.
 type Client struct {
 	appID      string
@@ -310,18 +313,24 @@ func (c *Client) ListRunners(ctx context.Context, repo string) ([]Runner, error)
 		slog.ErrorContext(ctx, "ghapp prepare runner list failed", "err", err, "repo", repo)
 		return nil, fmt.Errorf("ghapp: prepare runner list %s: %w", repo, err)
 	}
-	path := fmt.Sprintf("/repos/%s/%s/actions/runners", owner, repoName)
-	body, err := c.do(ctx, http.MethodGet, path, "token "+token, nil)
-	if err != nil {
-		slog.ErrorContext(ctx, "ghapp runner list failed", "err", err, "repo", repo)
-		return nil, fmt.Errorf("ghapp: list runners %s: %w", repo, err)
+	var runners []Runner
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/repos/%s/%s/actions/runners?per_page=%d&page=%d", owner, repoName, runnerListPageSize, page)
+		body, err := c.do(ctx, http.MethodGet, path, "token "+token, nil)
+		if err != nil {
+			slog.ErrorContext(ctx, "ghapp runner list failed", "err", err, "repo", repo, "page", page)
+			return nil, fmt.Errorf("ghapp: list runners %s page %d: %w", repo, page, err)
+		}
+		var out runnerListResponse
+		if err := json.Unmarshal(body, &out); err != nil {
+			slog.ErrorContext(ctx, "ghapp decode runners failed", "err", err, "repo", repo, "page", page)
+			return nil, fmt.Errorf("ghapp: decode runners %s page %d: %w", repo, page, err)
+		}
+		runners = append(runners, out.Runners...)
+		if len(out.Runners) == 0 || len(runners) >= out.TotalCount {
+			return runners, nil
+		}
 	}
-	var out runnerListResponse
-	if err := json.Unmarshal(body, &out); err != nil {
-		slog.ErrorContext(ctx, "ghapp decode runners failed", "err", err, "repo", repo)
-		return nil, fmt.Errorf("ghapp: decode runners %s: %w", repo, err)
-	}
-	return out.Runners, nil
 }
 
 // DeleteRunner deregisters one repository runner by id.

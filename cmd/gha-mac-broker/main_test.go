@@ -75,6 +75,29 @@ func TestDeleteStaleRunnersDeletesOfflineRunners(t *testing.T) {
 	}
 }
 
+func TestDeleteStaleRunnersOnlyDeletesOfflineRunnersWithConfiguredPrefix(t *testing.T) {
+	cfg := testServeConfig()
+	cfg.Tart.VMNamePrefix = "broker-managed"
+	client := &staleRunnerClient{
+		runners: []ghapp.Runner{
+			{ID: 11, Name: "broker-managed-old", Status: "offline", Busy: false},
+			{ID: 12, Name: "external-runner", Status: "offline", Busy: false},
+			{ID: 13, Name: "broker-managed-new", Status: "online", Busy: true},
+		},
+		listErr: nil,
+		deleted: nil,
+	}
+
+	deleteStaleRunners(context.Background(), cfg, client)
+
+	if len(client.deleted) != 1 {
+		t.Fatalf("deleted runners = %v, want [11]", client.deleted)
+	}
+	if client.deleted[0] != 11 {
+		t.Fatalf("deleted runner = %d, want 11", client.deleted[0])
+	}
+}
+
 func TestDeleteStaleRunnersListErrorDoesNotBlockStartup(t *testing.T) {
 	client := &staleRunnerClient{
 		runners: nil,

@@ -392,6 +392,7 @@ type staleRunnerCleaner interface {
 
 func deleteStaleRunners(ctx context.Context, cfg *config.Config, cleaner staleRunnerCleaner) {
 	totalDeleted := 0
+	runnerNamePrefix := cfg.Tart.VMNamePrefix
 	for _, repo := range cfg.AllowedRepos {
 		runners, err := cleaner.ListRunners(ctx, repo)
 		if err != nil {
@@ -400,6 +401,9 @@ func deleteStaleRunners(ctx context.Context, cfg *config.Config, cleaner staleRu
 		}
 		for _, runner := range runners {
 			if !strings.EqualFold(runner.Status, "offline") {
+				continue
+			}
+			if !strings.HasPrefix(runner.Name, runnerNamePrefix) {
 				continue
 			}
 			if err := cleaner.DeleteRunner(ctx, repo, runner.ID); err != nil {
