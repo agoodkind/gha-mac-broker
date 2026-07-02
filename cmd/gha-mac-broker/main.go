@@ -391,6 +391,7 @@ type staleRunnerCleaner interface {
 }
 
 func deleteStaleRunners(ctx context.Context, cfg *config.Config, cleaner staleRunnerCleaner) {
+	totalDeleted := 0
 	for _, repo := range cfg.AllowedRepos {
 		runners, err := cleaner.ListRunners(ctx, repo)
 		if err != nil {
@@ -405,8 +406,11 @@ func deleteStaleRunners(ctx context.Context, cfg *config.Config, cleaner staleRu
 				slog.WarnContext(ctx, "stale runner delete failed; continuing startup", "err", err, "repo", repo, "runner", runner.Name, "runner_id", runner.ID)
 				continue
 			}
-			slog.InfoContext(ctx, "stale offline runner deleted", "repo", repo, "runner", runner.Name, "runner_id", runner.ID)
+			totalDeleted++
 		}
+	}
+	if totalDeleted > 0 {
+		slog.InfoContext(ctx, "stale offline runners deleted", "count", totalDeleted)
 	}
 }
 
@@ -463,7 +467,7 @@ func runServe(ctx context.Context, args []string) error {
 	runToken := time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:])
 	p := pool.New(cfg.Tart.WarmBudget, cfg.Tart.GoldenBudget, binder, runToken)
 	store := reservation.New()
-	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, store, binder, server.WithRunCanceller(gh))
+	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, store, binder, server.WithRunCanceller(gh), server.WithClock(time.Now))
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -56,6 +56,14 @@ type runCanceller interface {
 	CancelRun(ctx context.Context, repo string, runID int64) error
 }
 
+type webhookAction string
+
+const (
+	webhookActionQueued     webhookAction = "queued"
+	webhookActionInProgress webhookAction = "in_progress"
+	webhookActionCompleted  webhookAction = "completed"
+)
+
 // Option configures optional server collaborators.
 type Option func(*Server)
 
@@ -75,7 +83,7 @@ func WithRunCanceller(canceller runCanceller) Option {
 
 // webhookPayload is the relevant subset of a GitHub workflow_job webhook body.
 type webhookPayload struct {
-	Action      string          `json:"action"`
+	Action      webhookAction   `json:"action"`
 	Repository  webhookRepo     `json:"repository"`
 	WorkflowJob webhookJobField `json:"workflow_job"`
 }
@@ -203,12 +211,12 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch payload.Action {
-	case "queued":
+	case webhookActionQueued:
 		s.dispatchJob(w, r, payload)
-	case "in_progress":
+	case webhookActionInProgress:
 		s.handleJobInProgress(r.Context(), payload)
 		w.WriteHeader(http.StatusNoContent)
-	case "completed":
+	case webhookActionCompleted:
 		slog.DebugContext(r.Context(), "workflow job completed", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "status", payload.WorkflowJob.Status, "conclusion", payload.WorkflowJob.Conclusion)
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -354,12 +362,6 @@ func (s *Server) markDelivered(repo string, runID int64, runnerName string, runn
 func (s *Server) isPoolRunner(runnerName string) bool {
 	prefix := s.cfg.Tart.VMNamePrefix + "-"
 	return strings.HasPrefix(runnerName, prefix)
-}
-
-func (s *Server) pendingDeliveryCount() int {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	return len(s.pending)
 }
 
 func (s *Server) sweepPendingDeliveries(ctx context.Context) {

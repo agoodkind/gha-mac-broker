@@ -152,14 +152,14 @@ func (p *Pool) Lease(ctx context.Context, image string) (*broker.WarmVM, error) 
 		return nil, err
 	}
 	if hit {
-		if err := p.warmer.CheckAlive(ctx, vm); err == nil {
+		err := p.warmer.CheckAlive(ctx, vm)
+		if err == nil {
 			p.startWarmIfNeeded(ctx, image)
 			return vm, nil
-		} else {
-			slog.WarnContext(ctx, "cached warm vm failed liveness check", "err", err, "vm", vm.Name, "image", image)
-			p.recordWarmOutcome(false)
-			p.warmer.Teardown(ctx, vm)
 		}
+		slog.WarnContext(ctx, "cached warm vm failed liveness check", "err", err, "vm", vm.Name, "image", image)
+		p.recordWarmOutcome(false)
+		p.warmer.Teardown(ctx, vm)
 	}
 
 	id := p.nextID()

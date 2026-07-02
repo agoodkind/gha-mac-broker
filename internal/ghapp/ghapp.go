@@ -342,14 +342,18 @@ func (c *Client) DeleteRunner(ctx context.Context, repo string, runnerID int64) 
 func (c *Client) repoToken(ctx context.Context, fullRepo string) (string, string, string, error) {
 	owner, repoName, ok := strings.Cut(fullRepo, "/")
 	if !ok || owner == "" || repoName == "" {
-		return "", "", "", fmt.Errorf("repo must be owner/repo, got %q", fullRepo)
+		err := fmt.Errorf("repo must be owner/repo, got %q", fullRepo)
+		slog.ErrorContext(ctx, "ghapp repo parse failed", "err", err, "repo", fullRepo)
+		return "", "", "", err
 	}
 	installationID, err := c.InstallationID(ctx, owner, repoName)
 	if err != nil {
+		slog.ErrorContext(ctx, "ghapp repo installation lookup failed", "err", err, "repo", fullRepo)
 		return "", "", "", fmt.Errorf("installation lookup: %w", err)
 	}
 	token, err := c.InstallationToken(ctx, installationID, repoName)
 	if err != nil {
+		slog.ErrorContext(ctx, "ghapp repo installation token failed", "err", err, "repo", fullRepo)
 		return "", "", "", fmt.Errorf("installation token: %w", err)
 	}
 	return owner, repoName, token, nil

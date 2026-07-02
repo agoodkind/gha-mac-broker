@@ -218,7 +218,7 @@ func TestVerifySignatureWrongSecret(t *testing.T) {
 
 func webhookBody(action, repo string, labels []string, runID int64) []byte {
 	payload := webhookPayload{
-		Action:     action,
+		Action:     webhookAction(action),
 		Repository: webhookRepo{FullName: repo},
 		WorkflowJob: webhookJobField{
 			ID:         7000 + runID,
@@ -236,7 +236,7 @@ func webhookBody(action, repo string, labels []string, runID int64) []byte {
 
 func webhookBodyWithRunner(action, repo string, labels []string, runID int64, runnerName string, runnerID int64) []byte {
 	payload := webhookPayload{
-		Action:     action,
+		Action:     webhookAction(action),
 		Repository: webhookRepo{FullName: repo},
 		WorkflowJob: webhookJobField{
 			ID:         7000 + runID,
@@ -250,6 +250,12 @@ func webhookBodyWithRunner(action, repo string, labels []string, runID int64, ru
 	}
 	b, _ := json.Marshal(payload)
 	return b
+}
+
+func pendingDeliveryCount(s *Server) int {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return len(s.pending)
 }
 
 func TestWebhookBadSignatureReturns401(t *testing.T) {
@@ -357,7 +363,7 @@ func TestWebhookQueuedRecordsPendingDelivery(t *testing.T) {
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("expected 202, got %d", w.Code)
 	}
-	if got := srv.pendingDeliveryCount(); got != 1 {
+	if got := pendingDeliveryCount(srv); got != 1 {
 		t.Fatalf("pending delivery count = %d, want 1", got)
 	}
 }
@@ -389,7 +395,7 @@ func TestDeliverySweeperCancelsExpiredPendingRun(t *testing.T) {
 	if canceller.calls[0].Repo != "owner/repo" || canceller.calls[0].RunID != 42 {
 		t.Fatalf("cancel call = %+v, want owner/repo run 42", canceller.calls[0])
 	}
-	if got := srv.pendingDeliveryCount(); got != 0 {
+	if got := pendingDeliveryCount(srv); got != 0 {
 		t.Fatalf("pending delivery count after cancel = %d, want 0", got)
 	}
 }
@@ -419,7 +425,7 @@ func TestDeliverySweeperDoesNotCancelDeliveredRun(t *testing.T) {
 	if len(canceller.calls) != 0 {
 		t.Fatalf("cancel calls = %+v, want none", canceller.calls)
 	}
-	if got := srv.pendingDeliveryCount(); got != 0 {
+	if got := pendingDeliveryCount(srv); got != 0 {
 		t.Fatalf("pending delivery count after delivery = %d, want 0", got)
 	}
 }
@@ -449,7 +455,7 @@ func TestWebhookInProgressClearsPendingDelivery(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", w.Code)
 	}
-	if got := srv.pendingDeliveryCount(); got != 0 {
+	if got := pendingDeliveryCount(srv); got != 0 {
 		t.Fatalf("pending delivery count after in_progress = %d, want 0", got)
 	}
 }
