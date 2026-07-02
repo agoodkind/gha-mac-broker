@@ -72,7 +72,7 @@ const shutdownTimeout = 30 * time.Second
 const webhookWriteTimeout = 120 * time.Second
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	setupLogging()
 	ctx := context.Background()
 	slog.LogAttrs(ctx, slog.LevelInfo, "gha-mac-broker invocation", version.Attrs()...)
 
