@@ -30,12 +30,17 @@ The script downloads the signed binary from the latest release into
 scaffolds the config and secrets, builds the golden Tart image when missing,
 and installs the launchd (macOS) or systemd (Linux) user service. Every step is
 idempotent. Pass `--version <tag>` to pin a release, `--bin-dir <dir>` to change
-the install location, or `--no-service` to install only the binary. After
-install, set `app.app_id` in the config, place the App private key at
+the install location, `--no-service` to install only the binary, or
+`--no-swift-mk` to skip the default maintenance tool installer. After install,
+set `app.app_id` in the config, place the App private key at
 `app.private_key_path`, and set up the Cloudflare tunnel.
 
-Host prerequisites are Tart and skopeo. On macOS, install them with
-`brew install cirruslabs/cli/tart skopeo`.
+Host prerequisites are Tart, skopeo, and swift-mk. On macOS, install Tart and
+skopeo with `brew install cirruslabs/cli/tart skopeo`. Install swift-mk with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/agoodkind/swift-makefile/main/install.sh | bash
+```
 
 ## Build
 
@@ -66,6 +71,12 @@ tilde expansion), never inlined.
 | `tart.ssh_key_path` | private key the broker uses to control the VM |
 | `allowed_repos` | `owner/repo` allowlist the broker will serve |
 | `pool_size` | number of warm VMs kept booted |
+
+### Maintenance timer
+
+The installer provisions a macOS launchd timer from the `[maintenance]` config
+section. `command` is the shell line to run, and `interval_seconds` is the
+launchd interval in seconds. Set `command = ""` to disable the timer.
 
 ## Subcommands
 

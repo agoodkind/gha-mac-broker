@@ -15,6 +15,7 @@
 #   --bin-dir DIR     override binary install dir (default: $XDG_BIN_HOME or
 #                     $HOME/.local/bin)
 #   --no-service      install the binary only; skip `gha-mac-broker install`
+#   --no-swift-mk     skip the default maintenance tool installer
 #   -h, --help        show this help
 #
 # Exit codes:
@@ -28,9 +29,10 @@ REPO="agoodkind/gha-mac-broker"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 VERSION=""
 DO_SERVICE=1
+DO_SWIFT_MK=1
 
 usage() {
-    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -101,11 +103,25 @@ install_bin() {
     printf 'install.sh: installed %s (%s)\n' "$BIN_DIR/gha-mac-broker" "$tag"
 }
 
+install_swift_mk() {
+    if [[ "$DO_SWIFT_MK" -ne 1 ]]; then
+        return
+    fi
+
+    printf 'install.sh: installing swift-mk for the default maintenance command\n'
+    if curl -fsSL https://raw.githubusercontent.com/agoodkind/swift-makefile/main/install.sh | bash; then
+        printf 'install.sh: swift-mk installer completed\n'
+    else
+        printf 'install.sh: swift-mk installer failed; continuing because maintenance preflight will warn if needed\n' >&2
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version)    shift; VERSION="${1:?--version requires a value}" ;;
         --bin-dir)    shift; BIN_DIR="${1:?--bin-dir requires a value}" ;;
         --no-service) DO_SERVICE=0 ;;
+        --no-swift-mk) DO_SWIFT_MK=0 ;;
         -h|--help)    usage; exit 0 ;;
         *) die "unknown flag: $1 (try --help)" ;;
     esac
@@ -116,6 +132,7 @@ need curl
 need tar
 
 install_bin
+install_swift_mk
 
 if [[ "$DO_SERVICE" -eq 1 ]]; then
     "$BIN_DIR/gha-mac-broker" install || die "gha-mac-broker install failed"
