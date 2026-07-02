@@ -28,7 +28,8 @@ golden_budget  = 3
 vm_name_prefix = "gha-runner"
 # cache_dir is mounted into every VM (guest /Volumes/My Shared Files/cache) so the
 # build cache survives VM deletion. Keep it dedicated; do NOT point it at tart's
-# own store. Empty defaults to <home>/pool-cache.
+# own store. Empty defaults to <home>/pool-cache, or a temp dir if the home
+# dir cannot be resolved.
 cache_dir      = "/Users/you/pool-cache"
 # Fast base-image pull through skopeo into a loopback OCI registry. Defaults shown.
 fast_pull            = true

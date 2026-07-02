@@ -220,12 +220,17 @@ func (b *Binder) bootCommand(ctx context.Context, vmName string) *exec.Cmd {
 	var dirs []tart.DirMount
 	if b.cfg.Tart.CacheDir != "" {
 		// tart --dir requires the host path to exist, so create it before the
-		// mount. MkdirAll is idempotent and cheap on the warm path. Mode 0700
-		// keeps the build cache, which can hold proprietary source and
-		// artifacts, private to the owner on a multi-user host.
+		// mount. MkdirAll is idempotent and cheap on the warm path.
 		if err := os.MkdirAll(b.cfg.Tart.CacheDir, 0o700); err != nil {
 			slog.WarnContext(ctx, "create cache dir failed; booting without cache mount", "err", err, "dir", b.cfg.Tart.CacheDir)
 		} else {
+			// Chmod after MkdirAll: MkdirAll applies 0700 only to dirs it
+			// creates, so tighten an existing looser dir too. The build cache
+			// can hold proprietary source and artifacts, so keep it private to
+			// the owner on a multi-user host.
+			if err := os.Chmod(b.cfg.Tart.CacheDir, 0o700); err != nil {
+				slog.WarnContext(ctx, "chmod cache dir failed; continuing with existing perms", "err", err, "dir", b.cfg.Tart.CacheDir)
+			}
 			dirs = []tart.DirMount{{Name: "cache", Path: b.cfg.Tart.CacheDir}}
 		}
 	}

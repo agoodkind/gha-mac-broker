@@ -88,7 +88,8 @@ type TartConfig struct {
 	VMNamePrefix string `toml:"vm_name_prefix"`
 	// CacheDir is a host directory shared into each VM (virtiofs, guest path
 	// /Volumes/My Shared Files/cache) so the build cache survives VM deletion.
-	// Empty defaults to <home>/pool-cache. It must not hold the base-image
+	// Empty defaults to <home>/pool-cache, or <tmp>/gha-mac-broker-pool-cache
+	// when the home dir cannot be resolved. It must not hold the base-image
 	// blobs (see FastPullDir), which stay out of the mount.
 	CacheDir string `toml:"cache_dir"`
 	// FastPull enables the fast parallel base-image pull path when true. Nil
@@ -225,7 +226,31 @@ func (c *Config) validate() error {
 			return fmt.Errorf("config: tart.images tag %q must be a ghcr.io/cirruslabs/macos-*-xcode:* tag", image.Tag)
 		}
 	}
+	// CacheDir is mounted into every guest, so the multi-GB base-image blob
+	// store must not live under it, whether an operator set fast_pull_dir
+	// explicitly or a default placed it there.
+	if c.Tart.CacheDir != "" && c.Tart.FastPullDir != "" && isWithin(c.Tart.FastPullDir, c.Tart.CacheDir) {
+		return fmt.Errorf("config: tart.fast_pull_dir %q must not be inside tart.cache_dir %q (cache_dir is mounted into every VM)", c.Tart.FastPullDir, c.Tart.CacheDir)
+	}
 	return nil
+}
+
+// isWithin reports whether path is at or below root, comparing cleaned absolute
+// paths so a relative or dot-laden entry cannot slip past the containment check.
+func isWithin(path, root string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return false
+	}
+	return rel == "." || !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".."
 }
 
 // ResolveImage maps a declared macOS and Xcode request to an approved Cirrus
