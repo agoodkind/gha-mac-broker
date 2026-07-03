@@ -11,6 +11,7 @@
 //	serve              run the HTTP daemon with warm pool and webhook handler
 //	install            scaffold config and secrets, build golden, install the service
 //	uninstall          remove the installed service unit
+//	update             check, apply, or show release update state
 package main
 
 import (
@@ -21,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -42,7 +44,9 @@ import (
 	"goodkind.io/gha-mac-broker/internal/server"
 	"goodkind.io/gha-mac-broker/internal/skopeo"
 	"goodkind.io/gha-mac-broker/internal/tart"
+	"goodkind.io/gha-mac-broker/internal/updateopts"
 	"goodkind.io/gha-mac-broker/internal/version"
+	"goodkind.io/go-makefile/selfupdate"
 )
 
 // commandName is the broker's top-level subcommand.
@@ -56,6 +60,15 @@ const (
 	commandBuildGolden commandName = "build-golden"
 	commandInstall     commandName = "install"
 	commandUninstall   commandName = "uninstall"
+	commandUpdate      commandName = "update"
+)
+
+type updateCommandName string
+
+const (
+	updateCommandApply  updateCommandName = "apply"
+	updateCommandCheck  updateCommandName = "check"
+	updateCommandStatus updateCommandName = "status"
 )
 
 // httpTimeout bounds GitHub API calls.
@@ -69,6 +82,14 @@ const shutdownTimeout = 30 * time.Second
 // 120 s covers one full boot cycle plus processing headroom so a stuck lease
 // cannot pin a connection open indefinitely.
 const webhookWriteTimeout = 120 * time.Second
+
+var (
+	checkUpdate            = selfupdate.Check
+	applyUpdate            = selfupdate.Apply
+	loadUpdateState        = selfupdate.LoadState
+	restartManagedService  = install.Restart
+	runSelfUpdateScheduler = selfupdate.RunScheduler
+)
 
 func main() {
 	setupLogging()
@@ -97,6 +118,8 @@ func main() {
 		err = runInstall(ctx, args)
 	case commandUninstall:
 		err = runUninstall(ctx, args)
+	case commandUpdate:
+		err = runUpdate(ctx, args)
 	default:
 		usage()
 		os.Exit(2)
@@ -108,7 +131,150 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|build-golden|install|uninstall> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|build-golden|install|uninstall|update> [flags]")
+}
+
+func writeUserLine(writer io.Writer, line string) {
+	_, _ = io.WriteString(writer, line+"\n")
+}
+
+func runUpdate(ctx context.Context, args []string) error {
+	return runUpdateWithWriters(ctx, args, os.Stdout, os.Stderr)
+}
+
+func runUpdateWithWriters(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: gha-mac-broker update check|apply|status")
+		return fmt.Errorf("update requires check, apply, or status")
+	}
+	switch updateCommandName(args[0]) {
+	case updateCommandCheck:
+		return runUpdateCheck(ctx, args[1:], stdout, stderr)
+	case updateCommandApply:
+		return runUpdateApply(ctx, args[1:], stdout, stderr)
+	case updateCommandStatus:
+		return runUpdateStatus(ctx, args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "gha-mac-broker update: unknown subcommand %q\n", args[0])
+		return fmt.Errorf("unknown update subcommand %q", args[0])
+	}
+}
+
+func runUpdateCheck(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+	fs := flag.NewFlagSet("update check", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "update check flag parse failed", "err", err)
+		return fmt.Errorf("update check flags: %w", err)
+	}
+	result, err := checkUpdate(ctx, updateopts.Options(updateopts.Overrides{
+		Client:      nil,
+		InstallPath: "",
+		DryRun:      false,
+		Log:         nil,
+	}))
+	if err != nil {
+		slog.ErrorContext(ctx, "update check failed", "err", err)
+		return fmt.Errorf("update check: %w", err)
+	}
+	printUpdateCheckResult(stdout, result)
+	return nil
+}
+
+func runUpdateApply(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+	fs := flag.NewFlagSet("update apply", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dryRun := fs.Bool("dry-run", false, "download and verify without installing")
+	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "update apply flag parse failed", "err", err)
+		return fmt.Errorf("update apply flags: %w", err)
+	}
+	result, err := applyUpdate(ctx, updateopts.Options(updateopts.Overrides{
+		Client:      nil,
+		InstallPath: "",
+		DryRun:      *dryRun,
+		Log:         nil,
+	}))
+	if err != nil {
+		slog.ErrorContext(ctx, "update apply failed", "err", err)
+		return fmt.Errorf("update apply: %w", err)
+	}
+	if !result.UpdateAvailable {
+		writeUserLine(stdout, "gha-mac-broker: already current")
+		return nil
+	}
+	if result.DryRun {
+		writeUserLine(stdout, "gha-mac-broker: update apply dry run ok")
+		return nil
+	}
+	if !result.Applied {
+		writeUserLine(stdout, "gha-mac-broker: update available but not applied")
+		return nil
+	}
+	restarted, err := restartManagedService(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "update apply service restart failed", "err", err)
+		return fmt.Errorf("update apply restart: %w", err)
+	}
+	if restarted {
+		writeUserLine(stdout, "gha-mac-broker: update applied and service restarted")
+		return nil
+	}
+	writeUserLine(stdout, "gha-mac-broker: update applied; service not installed")
+	return nil
+}
+
+func runUpdateStatus(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+	fs := flag.NewFlagSet("update status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "update status flag parse failed", "err", err)
+		return fmt.Errorf("update status flags: %w", err)
+	}
+	options := updateopts.Options(updateopts.Overrides{
+		Client:      nil,
+		InstallPath: "",
+		DryRun:      false,
+		Log:         nil,
+	})
+	state, err := loadUpdateState(options.StatePath)
+	if err != nil {
+		slog.ErrorContext(ctx, "update status load failed", "err", err, "path", options.StatePath)
+		return fmt.Errorf("update status: %w", err)
+	}
+	writeUserLine(stdout, "current version:   "+options.Config.CurrentVersion)
+	writeUserLine(stdout, "current commit:    "+options.Config.CurrentCommit)
+	writeUserLine(stdout, "current buildHash: "+options.Config.CurrentBuildHash)
+	if !state.LastCheckAt.IsZero() {
+		writeUserLine(stdout, "last check:        "+state.LastCheckAt.Format(time.RFC3339))
+	}
+	if !state.NextCheckAt.IsZero() {
+		writeUserLine(stdout, "next check:        "+state.NextCheckAt.Format(time.RFC3339))
+	}
+	if state.LatestTag != "" {
+		writeUserLine(stdout, "latest tag:        "+state.LatestTag)
+	}
+	if state.AppliedTag != "" {
+		writeUserLine(stdout, "applied tag:       "+state.AppliedTag)
+	}
+	if state.LastResult != "" {
+		writeUserLine(stdout, "last result:       "+state.LastResult)
+	}
+	if state.LastError != "" {
+		writeUserLine(stdout, "last error:        "+state.LastError)
+	}
+	return nil
+}
+
+func printUpdateCheckResult(stdout io.Writer, result selfupdate.CheckResult) {
+	writeUserLine(stdout, "current version: "+result.CurrentVersion)
+	writeUserLine(stdout, "latest tag:      "+result.LatestTag)
+	writeUserLine(stdout, "asset:           "+result.AssetName)
+	if result.UpdateAvailable {
+		writeUserLine(stdout, "update available: yes")
+		return
+	}
+	writeUserLine(stdout, "update available: no")
 }
 
 // runInstall performs the full host setup: it scaffolds the config and secrets,
@@ -474,10 +640,7 @@ func runServe(ctx context.Context, args []string) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	deleteStaleRunners(ctx, cfg, gh)
-	p.Start(ctx)
-	p.StartReconcile(ctx, 0)
-	srv.StartDeliverySweeper(ctx)
+	startServeLoops(ctx, stop, cfg, gh, p, srv)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -521,4 +684,47 @@ func runServe(ctx context.Context, args []string) error {
 	}
 	p.Shutdown(shutCtx)
 	return nil
+}
+
+func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, p *pool.Pool, srv *server.Server) {
+	startUpdateSchedulerInBackground(ctx, stop, slog.Default())
+	deleteStaleRunners(ctx, cfg, cleaner)
+	p.Start(ctx)
+	p.StartReconcile(ctx, 0)
+	srv.StartDeliverySweeper(ctx)
+}
+
+func startUpdateSchedulerInBackground(ctx context.Context, stop func(), log *slog.Logger) {
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.ErrorContext(ctx, "update scheduler goroutine panic recovered", "err", recovered)
+			}
+		}()
+		startUpdateScheduler(ctx, stop, log)
+	}()
+}
+
+func startUpdateScheduler(ctx context.Context, stop func(), log *slog.Logger) {
+	if stop == nil {
+		return
+	}
+	runSelfUpdateScheduler(ctx, selfupdate.SchedulerHooks{
+		Enabled: func() bool {
+			return true
+		},
+		Mode: func() string {
+			return selfupdate.ModeApply
+		},
+		Options: func() selfupdate.Options {
+			return updateopts.Options(updateopts.Overrides{
+				Client:      nil,
+				InstallPath: "",
+				DryRun:      false,
+				Log:         log,
+			})
+		},
+		StopForRelaunch: stop,
+		Log:             log,
+	})
 }
