@@ -962,3 +962,27 @@ func TestHealthz(t *testing.T) {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
 }
+
+func TestClaimNextPendingIsAtomicAcrossConcurrentDrains(t *testing.T) {
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{freeSlots: 2}, &testRunner{ran: make(chan struct{}, 1)})
+	srv.recordPendingDelivery("owner/repo", 1, 100)
+	srv.recordPendingDelivery("owner/repo", 2, 100)
+
+	k1, _, ok1 := srv.claimNextPending()
+	k2, _, ok2 := srv.claimNextPending()
+	if !ok1 || !ok2 {
+		t.Fatalf("expected two claims, got ok1=%v ok2=%v", ok1, ok2)
+	}
+	if k1.jobID == k2.jobID {
+		t.Fatalf("two claims picked the same pending entry %d; selection is not atomic", k1.jobID)
+	}
+	if _, _, ok3 := srv.claimNextPending(); ok3 {
+		t.Fatal("expected no undispatched entry left after both were claimed")
+	}
+
+	srv.releasePending(k1)
+	kr, _, okr := srv.claimNextPending()
+	if !okr || kr.jobID != k1.jobID {
+		t.Fatalf("expected released entry %d to be claimable again, got ok=%v key=%d", k1.jobID, okr, kr.jobID)
+	}
+}
