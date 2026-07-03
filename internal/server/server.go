@@ -1,5 +1,5 @@
-// Package server wires the pool, reservation store, and broker binder into
-// HTTP handlers for the webhook, capacity, and health endpoints.
+// Package server wires the pool and broker binder into HTTP handlers for the
+// webhook, capacity, and health endpoints.
 package server
 
 import (
@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,12 +37,6 @@ type pooler interface {
 	Lease(ctx context.Context, image string) (*broker.WarmVM, error)
 	FreeSlots() int
 	Recycle(ctx context.Context, vm *broker.WarmVM)
-}
-
-// reserver is the subset of reservation.Store used by the server.
-type reserver interface {
-	Reserve(runID, image string, capacity int) bool
-	Consume(runID string) (image string, ok bool)
 }
 
 // jobRunner is the subset of broker.Binder used by the server.
@@ -117,7 +110,6 @@ type Server struct {
 	webhookCIDRs  []*net.IPNet
 	cfg           *config.Config
 	pool          pooler
-	store         reserver
 	binder        jobRunner
 	canceller     runCanceller
 	now           func() time.Time
@@ -129,7 +121,7 @@ type Server struct {
 // capacityToken is the bearer token required on GET /capacity; a nil or empty
 // token closes the endpoint (401 fail-safe). webhookCIDRs is the IP allowlist
 // for POST /webhook; a nil or empty slice disables the IP guard.
-func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler, store reserver, binder jobRunner, opts ...Option) *Server {
+func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler, binder jobRunner, opts ...Option) *Server {
 	s := &Server{
 		mux:           http.NewServeMux(),
 		secret:        secret,
@@ -137,7 +129,6 @@ func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs [
 		webhookCIDRs:  webhookCIDRs,
 		cfg:           cfg,
 		pool:          p,
-		store:         store,
 		binder:        binder,
 		canceller:     nil,
 		now:           time.Now,
@@ -260,24 +251,16 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 		return
 	}
 
-	runID := strconv.FormatInt(payload.WorkflowJob.RunID, 10)
 	s.recordPendingDelivery(repo, payload.WorkflowJob.ID, payload.WorkflowJob.RunID)
-	image, ok := s.store.Consume(runID)
-	if !ok {
-		// The job carries a broker label, so the planner already routed it to the
-		// pool. A missing reservation means the capacity promise expired between
-		// the planner's /capacity check and this webhook delivery, which strands
-		// the job: it has no other runner and the queued job waits forever. Serve
-		// it on the default image so slow delivery never strands a pool job; Lease
-		// still enforces the warm budget, so this cannot overbook.
-		fallbackImage, resolved := s.cfg.ResolveImage("", "")
-		if !resolved {
-			slog.WarnContext(ctx, "no reservation and no default image; ignoring job", "repo", repo, "run_id", runID)
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		slog.InfoContext(ctx, "no live reservation; serving pool-labeled job on default image", "repo", repo, "run_id", runID, "image", fallbackImage)
-		image = fallbackImage
+	// The capacity check is a read-only probe that holds no reservation, so the
+	// broker resolves the image from config here at serve time. With a single
+	// golden this is always the default image. Lease enforces the warm budget,
+	// so a job that finds the slot taken releases to hosted, never overbooking.
+	image, resolved := s.cfg.ResolveImage("", "")
+	if !resolved {
+		slog.WarnContext(ctx, "no default image configured; ignoring pool job", "repo", repo, "run_id", payload.WorkflowJob.RunID)
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 
 	// Lease on a detached context: an on-demand warm boots `tart run` as a
@@ -403,10 +386,12 @@ func (s *Server) clearPendingDelivery(key pendingKey) {
 	delete(s.pending, key)
 }
 
-// handleCapacity checks whether the pool has a free slot for a given repo and
-// run_id. If so it records a reservation and returns {"available":true}.
-// A missing or non-numeric run_id is rejected with 400 so a bad request
-// cannot create a phantom reservation that wastes a pool slot until TTL.
+// handleCapacity reports whether the pool has a free warm slot for a given repo
+// and requested image. It is a pure read: it holds nothing, so any number of
+// probes leaves pool state unchanged and can never strand a slot. The webhook
+// re-derives the image from config at serve time and Lease enforces the warm
+// budget, so a job that finds the slot taken between this check and its webhook
+// releases to hosted rather than overbooking.
 func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -416,29 +401,18 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repo := r.URL.Query().Get("repo")
-	runID := r.URL.Query().Get("run_id")
 	macos := r.URL.Query().Get("os")
 	xcode := r.URL.Query().Get("xcode")
-	slog.DebugContext(r.Context(), "capacity request", "repo", repo, "run_id", runID, "os", macos, "xcode", xcode)
+	slog.DebugContext(r.Context(), "capacity request", "repo", repo, "os", macos, "xcode", xcode)
 	if !s.cfg.RepoAllowed(repo) {
 		writeJSON(w, capacityResponse{Available: false})
 		return
 	}
-	if runID == "" {
-		http.Error(w, "run_id required", http.StatusBadRequest)
-		return
-	}
-	if _, err := strconv.ParseInt(runID, 10, 64); err != nil {
-		http.Error(w, "run_id must be numeric", http.StatusBadRequest)
-		return
-	}
-	image, ok := s.cfg.ResolveImage(macos, xcode)
-	if !ok {
+	if _, ok := s.cfg.ResolveImage(macos, xcode); !ok {
 		writeJSON(w, capacityResponse{Available: false})
 		return
 	}
-	available := s.store.Reserve(runID, image, s.pool.FreeSlots())
-	writeJSON(w, capacityResponse{Available: available})
+	writeJSON(w, capacityResponse{Available: s.pool.FreeSlots() > 0})
 }
 
 // handleHealthz returns 200 "ok" so load balancers can probe liveness.
