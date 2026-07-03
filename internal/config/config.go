@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -23,6 +24,9 @@ const DefaultBaseImage = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
 const (
 	defaultWarmBudget   = 2
 	defaultGoldenBudget = 3
+	defaultRunnerCount  = 3
+	defaultMaxIdle      = Duration(2 * time.Hour)
+	defaultMaxAge       = Duration(24 * time.Hour)
 	cirrusImagePrefix   = "ghcr.io/cirruslabs/"
 	// defaultFastPullParallel is the skopeo layer-copy concurrency used when
 	// fast_pull_parallel is unset. ghcr throttles each connection, so more
@@ -34,6 +38,15 @@ const (
 type Config struct {
 	// ListenAddr is the address the webhook and capacity server binds to.
 	ListenAddr string `toml:"listen_addr"`
+
+	// RunnerCount is the number of persistent worker VMs kept warm.
+	RunnerCount int `toml:"runner_count"`
+
+	// MaxIdle is the idle age after which a worker VM is recycled.
+	MaxIdle Duration `toml:"max_idle"`
+
+	// MaxAge is the total age after which a worker VM is recycled.
+	MaxAge Duration `toml:"max_age"`
 
 	// App identifies the GitHub App and where its private key lives.
 	App AppConfig `toml:"app"`
@@ -111,6 +124,19 @@ type ImageMapping struct {
 	Tag   string `toml:"tag"`
 }
 
+// Duration parses TOML duration strings such as "2h" or "45m".
+type Duration time.Duration
+
+// UnmarshalText parses TOML strings.
+func (d *Duration) UnmarshalText(text []byte) error {
+	parsed, err := time.ParseDuration(string(text))
+	if err != nil {
+		return fmt.Errorf("config: parse duration %q: %w", string(text), err)
+	}
+	*d = Duration(parsed)
+	return nil
+}
+
 // DefaultConfigPath returns the XDG-aware default config file path:
 // $XDG_CONFIG_HOME/gha-mac-broker/config.toml, falling back to
 // $HOME/.config/gha-mac-broker/config.toml when XDG_CONFIG_HOME is unset.
@@ -155,6 +181,15 @@ func Default() *Config {
 func (c *Config) applyDefaults() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = "[::1]:8080"
+	}
+	if c.RunnerCount == 0 {
+		c.RunnerCount = defaultRunnerCount
+	}
+	if c.MaxIdle == 0 {
+		c.MaxIdle = defaultMaxIdle
+	}
+	if c.MaxAge == 0 {
+		c.MaxAge = defaultMaxAge
 	}
 	if c.Tart.Binary == "" {
 		c.Tart.Binary = "tart"
@@ -214,6 +249,15 @@ func (c *Config) validate() error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("config: missing required fields: %s", strings.Join(missing, ", "))
+	}
+	if c.RunnerCount < 1 {
+		return fmt.Errorf("config: runner_count must be at least 1")
+	}
+	if c.MaxIdle < 0 {
+		return fmt.Errorf("config: max_idle must not be negative")
+	}
+	if c.MaxAge < 0 {
+		return fmt.Errorf("config: max_age must not be negative")
 	}
 	if !safeCirrusImageTag(c.Tart.BaseImage) {
 		return fmt.Errorf("config: tart.base_image must be a ghcr.io/cirruslabs/macos-*-xcode:* tag")

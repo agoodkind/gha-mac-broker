@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -34,6 +35,15 @@ private_key_path = "/tmp/key.pem"
 	}
 	if cfg.ListenAddr != "[::1]:8080" {
 		t.Errorf("default listen addr = %q", cfg.ListenAddr)
+	}
+	if cfg.RunnerCount != 3 {
+		t.Errorf("default runner count = %d", cfg.RunnerCount)
+	}
+	if time.Duration(cfg.MaxIdle) != 2*time.Hour {
+		t.Errorf("default max idle = %s", time.Duration(cfg.MaxIdle))
+	}
+	if time.Duration(cfg.MaxAge) != 24*time.Hour {
+		t.Errorf("default max age = %s", time.Duration(cfg.MaxAge))
 	}
 	if cfg.Tart.WarmBudget != 2 {
 		t.Errorf("default warm budget = %d", cfg.Tart.WarmBudget)
@@ -80,6 +90,39 @@ private_key_path = "/tmp/key.pem"
 	}
 	if cfg.RepoAllowed("agoodkind/secret") {
 		t.Error("non-listed repo must not be allowed")
+	}
+}
+
+func TestLoadRunnerPoolSettings(t *testing.T) {
+	path := writeConfig(t, `
+runner_count = 5
+max_idle = "45m"
+max_age = "6h"
+allowed_repos = ["agoodkind/lmd"]
+
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[tart]
+warm_budget = 7
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RunnerCount != 5 {
+		t.Fatalf("runner count = %d, want 5", cfg.RunnerCount)
+	}
+	if time.Duration(cfg.MaxIdle) != 45*time.Minute {
+		t.Fatalf("max idle = %s, want 45m0s", time.Duration(cfg.MaxIdle))
+	}
+	if time.Duration(cfg.MaxAge) != 6*time.Hour {
+		t.Fatalf("max age = %s, want 6h0m0s", time.Duration(cfg.MaxAge))
+	}
+	if cfg.Tart.WarmBudget != 7 {
+		t.Fatalf("warm budget = %d, want back-compat parse value 7", cfg.Tart.WarmBudget)
 	}
 }
 

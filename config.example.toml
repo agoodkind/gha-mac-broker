@@ -1,4 +1,7 @@
 listen_addr = "[::1]:8080"
+runner_count = 3
+max_idle = "2h"
+max_age = "24h"
 
 labels = ["self-hosted", "macOS", "ARM64", "agk-local-macos-26"]
 
@@ -23,6 +26,8 @@ webhook_cidrs_path  = "/Users/you/.config/gha-mac-broker/github-webhook-cidrs.tx
 [tart]
 binary         = "tart"
 base_image     = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
+# warm_budget is parsed for compatibility with older configs. runner_count now
+# controls worker capacity.
 warm_budget    = 2
 golden_budget  = 3
 vm_name_prefix = "gha-runner"
