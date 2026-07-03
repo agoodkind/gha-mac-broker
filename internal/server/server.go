@@ -25,9 +25,10 @@ import (
 // maxBodyBytes caps how much of a webhook body is read into memory.
 const maxBodyBytes = 1 << 20
 
-// servingDeadline bounds how long a pool-routed workflow run may remain
-// undelivered before the broker cancels the run for hosted retry.
-const servingDeadline = 4 * time.Minute
+// servingDeadline is a stuck-pool backstop for undelivered pool jobs. It stays
+// above normal drain time; swift-makefile's pool-watchdog is the faster
+// external backstop for jobs that stop making progress.
+const servingDeadline = 45 * time.Minute
 
 // deliverySweepInterval is the periodic cancellation sweep cadence.
 const deliverySweepInterval = 30 * time.Second
@@ -234,9 +235,10 @@ func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byt
 	return body, true
 }
 
-// dispatchJob checks the repo allowlist and label set for a queued job and,
-// if the broker can handle it, leases a warm VM and launches a RunJob
-// goroutine. It responds 202 on dispatch and 204 when the job is ignored.
+// dispatchJob checks the repo allowlist and label set for a queued job. It
+// records pool-routed jobs before serving so busy slots can drain them later.
+// It responds 202 when a job is accepted for immediate or deferred serving and
+// 204 when the job is ignored.
 func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload webhookPayload) {
 	ctx := r.Context()
 	repo := payload.Repository.FullName
@@ -251,27 +253,35 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 		return
 	}
 
-	s.recordPendingDelivery(repo, payload.WorkflowJob.ID, payload.WorkflowJob.RunID)
 	// The capacity check is a read-only probe that holds no reservation, so the
-	// broker resolves the image from config here at serve time. With a single
-	// golden this is always the default image. Lease enforces the warm budget,
-	// so a job that finds the slot taken releases to hosted, never overbooking.
-	image, resolved := s.cfg.ResolveImage("", "")
-	if !resolved {
+	// broker resolves the image from config at serve time. With a single golden
+	// this is always the default image.
+	if _, resolved := s.cfg.ResolveImage("", ""); !resolved {
 		slog.WarnContext(ctx, "no default image configured; ignoring pool job", "repo", repo, "run_id", payload.WorkflowJob.RunID)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	// Record the job, then drain: serveNextPending claims and serves this job (or
+	// an earlier waiting one) when a warm slot is free, else it stays queued for
+	// a later Recycle to drain. Either way the webhook is accepted.
+	s.recordPendingDelivery(repo, payload.WorkflowJob.ID, payload.WorkflowJob.RunID)
+	s.serveNextPending(ctx)
+	w.WriteHeader(http.StatusAccepted)
+}
 
+// serve leases a warm slot and runs the pool job for a claimed pending entry.
+// It returns false when the pool has no free slot, leaving the entry for a later
+// drain. On success the RunJob goroutine recycles the VM, releases the claim if
+// the gate never went in progress, and drains the next pending job.
+func (s *Server) serve(ctx context.Context, key pendingKey, repo, image string) bool {
 	// Lease on a detached context: an on-demand warm boots `tart run` as a
 	// CommandContext child, so tying it to the request context would kill the VM
 	// the instant this handler returns 202, before RunJob can exec into it.
 	jobCtx := context.WithoutCancel(ctx)
 	vm, err := s.pool.Lease(jobCtx, image)
 	if err != nil {
-		slog.ErrorContext(ctx, "lease failed", "err", err, "repo", repo)
-		http.Error(w, "no vm available", http.StatusServiceUnavailable)
-		return
+		slog.InfoContext(ctx, "pool busy, deferring", "err", err, "repo", repo)
+		return false
 	}
 
 	go func() {
@@ -280,13 +290,77 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 				slog.ErrorContext(jobCtx, "job goroutine panic recovered", "err", fmt.Errorf("panic: %v", r), "vm", vm.Name)
 			}
 		}()
+		// Defers run in reverse order: recycle frees the slot, then release this
+		// claim if the gate never went in progress (a delivered gate was already
+		// removed by markDelivered, so the release is a no-op) so it can be
+		// re-drained, then drain the next pending job into the freed slot.
+		defer s.serveNextPending(jobCtx)
+		defer s.releasePending(key)
 		defer s.pool.Recycle(jobCtx, vm)
 		if err := s.binder.RunJob(jobCtx, vm, repo, vm.Name); err != nil {
 			slog.WarnContext(jobCtx, "job failed", "err", err, "vm", vm.Name, "repo", repo)
 		}
 	}()
 
-	w.WriteHeader(http.StatusAccepted)
+	return true
+}
+
+// serveNextPending claims the next undispatched pending job and serves it. The
+// claim is atomic, so concurrent drains never pick the same entry. A serve that
+// finds no free slot releases the claim so the next Recycle retries it.
+func (s *Server) serveNextPending(ctx context.Context) {
+	key, delivery, ok := s.claimNextPending()
+	if !ok {
+		return
+	}
+	image, resolved := s.cfg.ResolveImage("", "")
+	if !resolved {
+		s.releasePending(key)
+		slog.WarnContext(ctx, "no default image configured; pending pool job remains deferred", "repo", delivery.repo, "run_id", delivery.runID, "job_id", key.jobID)
+		return
+	}
+	if !s.serve(ctx, key, delivery.repo, image) {
+		s.releasePending(key)
+		slog.DebugContext(ctx, "pending pool job remains deferred", "repo", delivery.repo, "run_id", delivery.runID, "job_id", key.jobID)
+	}
+}
+
+// claimNextPending atomically selects the lowest-jobID undispatched pending
+// entry and marks it dispatched under the lock, so two concurrent drains cannot
+// pick the same entry and double-mint a runner for one queued job.
+func (s *Server) claimNextPending() (pendingKey, pendingDelivery, bool) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	var selectedKey pendingKey
+	var selectedDelivery pendingDelivery
+	found := false
+	for key, delivery := range s.pending {
+		if delivery.dispatched {
+			continue
+		}
+		if !found || key.jobID < selectedKey.jobID {
+			selectedKey = key
+			selectedDelivery = delivery
+			found = true
+		}
+	}
+	if !found {
+		return selectedKey, selectedDelivery, false
+	}
+	selectedDelivery.dispatched = true
+	s.pending[selectedKey] = selectedDelivery
+	return selectedKey, selectedDelivery, true
+}
+
+// releasePending clears the dispatched mark on a pending entry so a later drain
+// can retry it. It is a no-op when the entry was already delivered and removed.
+func (s *Server) releasePending(key pendingKey) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if delivery, ok := s.pending[key]; ok {
+		delivery.dispatched = false
+		s.pending[key] = delivery
+	}
 }
 
 func (s *Server) handleJobInProgress(ctx context.Context, payload webhookPayload) {
@@ -306,6 +380,10 @@ type pendingDelivery struct {
 	repo     string
 	runID    int64
 	deadline time.Time
+	// dispatched is true once a drain has minted a runner for this entry, so a
+	// concurrent drain skips it. It is cleared if the serve fails or the gate
+	// never goes in progress, so the entry can be retried.
+	dispatched bool
 }
 
 type expiredDelivery struct {
@@ -319,9 +397,10 @@ func (s *Server) recordPendingDelivery(repo string, jobID int64, runID int64) {
 	}
 	key := pendingKey{jobID: jobID}
 	delivery := pendingDelivery{
-		repo:     repo,
-		runID:    runID,
-		deadline: s.now().Add(servingDeadline),
+		repo:       repo,
+		runID:      runID,
+		deadline:   s.now().Add(servingDeadline),
+		dispatched: false,
 	}
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
