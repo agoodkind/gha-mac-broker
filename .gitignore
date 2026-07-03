@@ -6,3 +6,8 @@ go.work.sum
 config.mk
 .superpowers/
 third_party/aria2/.build/
+!.golangci-lint-baseline.txt
+!.gocyclo-baseline.txt
+!.deadcode-baseline.txt
+!.staticcheck-extra-baseline.txt
+!.go-mk-applied-notices

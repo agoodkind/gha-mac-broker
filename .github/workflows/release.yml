@@ -13,3 +13,4 @@ jobs:
     secrets: inherit
     with:
       require_darwin_codesign: true
+      binary: gha-mac-broker
