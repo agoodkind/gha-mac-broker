@@ -39,7 +39,6 @@ import (
 	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/install"
 	"goodkind.io/gha-mac-broker/internal/pool"
-	"goodkind.io/gha-mac-broker/internal/reservation"
 	"goodkind.io/gha-mac-broker/internal/server"
 	"goodkind.io/gha-mac-broker/internal/skopeo"
 	"goodkind.io/gha-mac-broker/internal/tart"
@@ -418,7 +417,7 @@ func deleteStaleRunners(ctx context.Context, cfg *config.Config, cleaner staleRu
 	}
 }
 
-// runServe loads config, builds the pool, reservation store, and HTTP server,
+// runServe loads config, builds the pool and HTTP server,
 // starts the fill loop, and listens until SIGINT or SIGTERM triggers a
 // graceful shutdown.
 func runServe(ctx context.Context, args []string) error {
@@ -470,8 +469,7 @@ func runServe(ctx context.Context, args []string) error {
 	}
 	runToken := time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:])
 	p := pool.New(cfg.Tart.WarmBudget, cfg.Tart.GoldenBudget, binder, runToken)
-	store := reservation.New()
-	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, store, binder, server.WithRunCanceller(gh), server.WithClock(time.Now))
+	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, binder, server.WithRunCanceller(gh), server.WithClock(time.Now))
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
