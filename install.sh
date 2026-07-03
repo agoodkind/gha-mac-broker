@@ -475,7 +475,10 @@ post_install() {
 
 main() {
     parse_gha_mac_broker_args "$@"
-    run_install "${CORE_ARGS[@]}"
+    # The guarded expansion keeps a flagless curl|bash install working on the
+    # stock macOS bash 3.2, where "${CORE_ARGS[@]}" with an empty array trips
+    # set -u (fixed upstream only in bash 4.4).
+    run_install ${CORE_ARGS[@]+"${CORE_ARGS[@]}"}
 }
 
 main "$@"

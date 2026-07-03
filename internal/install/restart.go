@@ -28,14 +28,15 @@ func Restart(ctx context.Context) (bool, error) {
 		slog.ErrorContext(ctx, "resolve home dir failed", "err", err)
 		return false, fmt.Errorf("restart: resolve home dir: %w", err)
 	}
-	switch restartRuntimeOS() {
+	restartOS := restartRuntimeOS()
+	switch restartOS {
 	case osDarwin:
 		return restartLaunchd(ctx, home)
 	case osLinux:
 		return restartSystemd(ctx, home)
 	default:
-		slog.ErrorContext(ctx, "unsupported OS", "err", errors.ErrUnsupported, "os", runtime.GOOS)
-		return false, fmt.Errorf("restart: unsupported OS %q: %w", runtime.GOOS, errors.ErrUnsupported)
+		slog.ErrorContext(ctx, "unsupported OS", "err", errors.ErrUnsupported, "os", restartOS)
+		return false, fmt.Errorf("restart: unsupported OS %q: %w", restartOS, errors.ErrUnsupported)
 	}
 }
 
