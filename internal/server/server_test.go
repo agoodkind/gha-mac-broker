@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -21,27 +23,68 @@ import (
 // --- test stubs ---
 
 type testPool struct {
+	capacity     int
 	freeSlots    int
 	leaseVM      *broker.WarmVM
 	leaseErr     error
 	mu           sync.Mutex
+	inUse        int
+	nextID       int
 	leasedImages []string
 	recycled     []*broker.WarmVM
 }
 
 func (p *testPool) Lease(_ context.Context, image string) (*broker.WarmVM, error) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.leasedImages = append(p.leasedImages, image)
-	p.mu.Unlock()
-	return p.leaseVM, p.leaseErr
+	if p.leaseErr != nil {
+		return nil, p.leaseErr
+	}
+	if capacity, ok := p.configuredCapacityLocked(); ok {
+		if p.inUse >= capacity {
+			return nil, errors.New("pool: no free lease slots")
+		}
+		p.inUse++
+	}
+	if p.leaseVM != nil {
+		return p.leaseVM, nil
+	}
+	p.nextID++
+	return &broker.WarmVM{Name: fmt.Sprintf("gha-vm-%d", p.nextID), Image: image}, nil
 }
 
-func (p *testPool) FreeSlots() int { return p.freeSlots }
+func (p *testPool) configuredCapacityLocked() (int, bool) {
+	if p.capacity > 0 {
+		return p.capacity, true
+	}
+	if p.freeSlots > 0 {
+		return p.freeSlots, true
+	}
+	return 0, false
+}
+
+func (p *testPool) FreeSlots() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	capacity := p.freeSlots
+	if p.capacity > 0 {
+		capacity = p.capacity
+	}
+	freeSlots := capacity - p.inUse
+	if freeSlots < 0 {
+		return 0
+	}
+	return freeSlots
+}
 
 func (p *testPool) Recycle(_ context.Context, vm *broker.WarmVM) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.recycled = append(p.recycled, vm)
+	if _, ok := p.configuredCapacityLocked(); ok && p.inUse > 0 {
+		p.inUse--
+	}
 }
 
 type testRunner struct {
@@ -52,6 +95,82 @@ type testRunner struct {
 func (r *testRunner) RunJob(_ context.Context, _ *broker.WarmVM, _, _ string) error {
 	r.ran <- struct{}{}
 	return r.err
+}
+
+type runStart struct {
+	Active     int
+	MaxActive  int
+	Repo       string
+	RunnerName string
+}
+
+type blockingRunner struct {
+	started chan runStart
+	release chan struct{}
+	mu      sync.Mutex
+	active  int
+	max     int
+}
+
+func newBlockingRunner(expectedRuns int) *blockingRunner {
+	return &blockingRunner{
+		started: make(chan runStart, expectedRuns),
+		release: make(chan struct{}, expectedRuns),
+		mu:      sync.Mutex{},
+	}
+}
+
+func (r *blockingRunner) RunJob(_ context.Context, _ *broker.WarmVM, repo string, runnerName string) error {
+	r.mu.Lock()
+	r.active++
+	if r.active > r.max {
+		r.max = r.active
+	}
+	start := runStart{
+		Active:     r.active,
+		MaxActive:  r.max,
+		Repo:       repo,
+		RunnerName: runnerName,
+	}
+	r.mu.Unlock()
+
+	r.started <- start
+	<-r.release
+
+	r.mu.Lock()
+	r.active--
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *blockingRunner) Release() {
+	r.release <- struct{}{}
+}
+
+func (r *blockingRunner) MaxActive() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.max
+}
+
+func waitRunStart(t *testing.T, runner *blockingRunner) runStart {
+	t.Helper()
+	select {
+	case start := <-runner.started:
+		return start
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunJob was not called within timeout")
+	}
+	return runStart{}
+}
+
+func assertNoRunStart(t *testing.T, runner *blockingRunner) {
+	t.Helper()
+	select {
+	case start := <-runner.started:
+		t.Fatalf("unexpected RunJob start while pool slots were full: %+v", start)
+	case <-time.After(200 * time.Millisecond):
+	}
 }
 
 type cancelCall struct {
@@ -210,6 +329,16 @@ func pendingDeliveryCount(s *Server) int {
 	return len(s.pending)
 }
 
+func serveQueuedWebhook(t *testing.T, srv *Server, repo string, runID int64, jobID int64) int {
+	t.Helper()
+	body := webhookBodyWithJobID("queued", repo, []string{"self-hosted"}, runID, jobID)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", signBody(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	return w.Code
+}
+
 func TestWebhookBadSignatureReturns401(t *testing.T) {
 	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{}, &testRunner{ran: make(chan struct{}, 1)})
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 42)
@@ -261,7 +390,8 @@ func TestWebhookNoMatchingLabelReturns204(t *testing.T) {
 func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
 	vm := &broker.WarmVM{Name: "vm-1", Image: config.DefaultBaseImage}
 	pool := &testPool{freeSlots: 2, leaseVM: vm}
-	runner := &testRunner{ran: make(chan struct{}, 1)}
+	runner := newBlockingRunner(1)
+	defer runner.Release()
 	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool, runner)
 
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 7)
@@ -274,12 +404,9 @@ func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
 		t.Fatalf("expected 202, got %d", w.Code)
 	}
 
-	// Wait for the job goroutine to call RunJob.
-	select {
-	case <-runner.ran:
-	case <-time.After(2 * time.Second):
-		t.Fatal("RunJob was not called within timeout")
-	}
+	start := waitRunStart(t, runner)
+	srv.markDelivered("owner/repo", 7007, start.RunnerName, 4242)
+	runner.Release()
 
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
@@ -291,7 +418,8 @@ func TestWebhookQueuedDispatchesJobAndReturns202(t *testing.T) {
 func TestWebhookQueuedRecordsPendingDelivery(t *testing.T) {
 	vm := &broker.WarmVM{Name: "gha-vm-1", Image: config.DefaultBaseImage}
 	pool := &testPool{freeSlots: 2, leaseVM: vm}
-	runner := &testRunner{ran: make(chan struct{}, 1)}
+	runner := newBlockingRunner(1)
+	defer runner.Release()
 	clock := newMutableClock(time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
 	srv := New(
 		testSecret,
@@ -314,6 +442,83 @@ func TestWebhookQueuedRecordsPendingDelivery(t *testing.T) {
 	}
 	if got := pendingDeliveryCount(srv); got != 1 {
 		t.Fatalf("pending delivery count = %d, want 1", got)
+	}
+	start := waitRunStart(t, runner)
+	srv.markDelivered("owner/repo", 7007, start.RunnerName, 4242)
+	runner.Release()
+}
+
+func TestWebhookQueuedJobsDrainAfterRecycle(t *testing.T) {
+	pool := &testPool{capacity: 1}
+	runner := newBlockingRunner(2)
+	defer runner.Release()
+	defer runner.Release()
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool, runner)
+
+	if got := serveQueuedWebhook(t, srv, "owner/repo", 42, 1001); got != http.StatusAccepted {
+		t.Fatalf("first queued webhook status = %d, want 202", got)
+	}
+	firstStart := waitRunStart(t, runner)
+	srv.markDelivered("owner/repo", 1001, firstStart.RunnerName, 4241)
+
+	if got := serveQueuedWebhook(t, srv, "owner/repo", 42, 1002); got != http.StatusAccepted {
+		t.Fatalf("second queued webhook status = %d, want 202", got)
+	}
+	assertNoRunStart(t, runner)
+
+	runner.Release()
+	secondStart := waitRunStart(t, runner)
+	if secondStart.Repo != "owner/repo" {
+		t.Fatalf("second RunJob repo = %q, want owner/repo", secondStart.Repo)
+	}
+	srv.markDelivered("owner/repo", 1002, secondStart.RunnerName, 4242)
+
+	if maxActive := runner.MaxActive(); maxActive > 1 {
+		t.Fatalf("max active RunJob goroutines = %d, want <= 1", maxActive)
+	}
+	if got := pendingDeliveryCount(srv); got != 0 {
+		t.Fatalf("pending delivery count after drained deliveries = %d, want 0", got)
+	}
+}
+
+func TestWebhookQueuedJobsDoNotOverbookDuringDrain(t *testing.T) {
+	const jobCount = 5
+	pool := &testPool{capacity: 2}
+	runner := newBlockingRunner(jobCount)
+	for i := 0; i < jobCount; i++ {
+		defer runner.Release()
+	}
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool, runner)
+
+	for i := 0; i < jobCount; i++ {
+		jobID := int64(1001 + i)
+		if got := serveQueuedWebhook(t, srv, "owner/repo", 42, jobID); got != http.StatusAccepted {
+			t.Fatalf("queued webhook %d status = %d, want 202", i+1, got)
+		}
+	}
+
+	firstStart := waitRunStart(t, runner)
+	secondStart := waitRunStart(t, runner)
+	srv.markDelivered("owner/repo", 1001, firstStart.RunnerName, 4241)
+	srv.markDelivered("owner/repo", 1002, secondStart.RunnerName, 4242)
+	assertNoRunStart(t, runner)
+
+	for i := 2; i < jobCount; i++ {
+		runner.Release()
+		start := waitRunStart(t, runner)
+		jobID := int64(1001 + i)
+		runnerID := int64(4241 + i)
+		srv.markDelivered("owner/repo", jobID, start.RunnerName, runnerID)
+		if start.Active > 2 {
+			t.Fatalf("RunJob start %d active count = %d, want <= 2", i+1, start.Active)
+		}
+	}
+
+	if maxActive := runner.MaxActive(); maxActive > 2 {
+		t.Fatalf("max active RunJob goroutines = %d, want <= 2", maxActive)
+	}
+	if got := pendingDeliveryCount(srv); got != 0 {
+		t.Fatalf("pending delivery count after drained deliveries = %d, want 0", got)
 	}
 }
 
@@ -428,6 +633,12 @@ func TestWebhookQueuedRetryKeepsOriginalPendingDeadline(t *testing.T) {
 	}
 }
 
+func TestServingDeadlineIsStuckPoolBackstop(t *testing.T) {
+	if servingDeadline != 45*time.Minute {
+		t.Fatalf("servingDeadline = %s, want 45m0s", servingDeadline)
+	}
+}
+
 func TestDeliverySweeperCancelsExpiredPendingRun(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
 	canceller := &testCanceller{}
@@ -522,7 +733,8 @@ func TestWebhookQueuedWithoutReservationServesDefaultImage(t *testing.T) {
 	// the image at serve time.
 	vm := &broker.WarmVM{Name: "vm-1", Image: config.DefaultBaseImage}
 	pool := &testPool{freeSlots: 2, leaseVM: vm}
-	runner := &testRunner{ran: make(chan struct{}, 1)}
+	runner := newBlockingRunner(1)
+	defer runner.Release()
 	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool, runner)
 
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 7)
@@ -534,11 +746,9 @@ func TestWebhookQueuedWithoutReservationServesDefaultImage(t *testing.T) {
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("expected 202 serving the default image without a reservation, got %d", w.Code)
 	}
-	select {
-	case <-runner.ran:
-	case <-time.After(2 * time.Second):
-		t.Fatal("RunJob was not called within timeout")
-	}
+	start := waitRunStart(t, runner)
+	srv.markDelivered("owner/repo", 7007, start.RunnerName, 4242)
+	runner.Release()
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 	if len(pool.leasedImages) != 1 || pool.leasedImages[0] != config.DefaultBaseImage {

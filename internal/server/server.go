@@ -25,9 +25,10 @@ import (
 // maxBodyBytes caps how much of a webhook body is read into memory.
 const maxBodyBytes = 1 << 20
 
-// servingDeadline bounds how long a pool-routed workflow run may remain
-// undelivered before the broker cancels the run for hosted retry.
-const servingDeadline = 4 * time.Minute
+// servingDeadline is a stuck-pool backstop for undelivered pool jobs. It stays
+// above normal drain time; swift-makefile's pool-watchdog is the faster
+// external backstop for jobs that stop making progress.
+const servingDeadline = 45 * time.Minute
 
 // deliverySweepInterval is the periodic cancellation sweep cadence.
 const deliverySweepInterval = 30 * time.Second
@@ -234,9 +235,10 @@ func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byt
 	return body, true
 }
 
-// dispatchJob checks the repo allowlist and label set for a queued job and,
-// if the broker can handle it, leases a warm VM and launches a RunJob
-// goroutine. It responds 202 on dispatch and 204 when the job is ignored.
+// dispatchJob checks the repo allowlist and label set for a queued job. It
+// records pool-routed jobs before serving so busy slots can drain them later.
+// It responds 202 when a job is accepted for immediate or deferred serving and
+// 204 when the job is ignored.
 func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload webhookPayload) {
 	ctx := r.Context()
 	repo := payload.Repository.FullName
@@ -255,7 +257,7 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 	// The capacity check is a read-only probe that holds no reservation, so the
 	// broker resolves the image from config here at serve time. With a single
 	// golden this is always the default image. Lease enforces the warm budget,
-	// so a job that finds the slot taken releases to hosted, never overbooking.
+	// so a job that finds the slot taken remains queued for later drain.
 	image, resolved := s.cfg.ResolveImage("", "")
 	if !resolved {
 		slog.WarnContext(ctx, "no default image configured; ignoring pool job", "repo", repo, "run_id", payload.WorkflowJob.RunID)
@@ -263,15 +265,19 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 		return
 	}
 
+	s.serve(ctx, repo, image)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func (s *Server) serve(ctx context.Context, repo, image string) bool {
 	// Lease on a detached context: an on-demand warm boots `tart run` as a
 	// CommandContext child, so tying it to the request context would kill the VM
 	// the instant this handler returns 202, before RunJob can exec into it.
 	jobCtx := context.WithoutCancel(ctx)
 	vm, err := s.pool.Lease(jobCtx, image)
 	if err != nil {
-		slog.ErrorContext(ctx, "lease failed", "err", err, "repo", repo)
-		http.Error(w, "no vm available", http.StatusServiceUnavailable)
-		return
+		slog.InfoContext(ctx, "pool busy, deferring", "err", err, "repo", repo)
+		return false
 	}
 
 	go func() {
@@ -280,13 +286,47 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 				slog.ErrorContext(jobCtx, "job goroutine panic recovered", "err", fmt.Errorf("panic: %v", r), "vm", vm.Name)
 			}
 		}()
+		// Defers run in reverse order: recycle before asking the pool to drain
+		// the next pending job so Lease sees the newly freed slot.
+		defer s.serveNextPending(jobCtx)
 		defer s.pool.Recycle(jobCtx, vm)
 		if err := s.binder.RunJob(jobCtx, vm, repo, vm.Name); err != nil {
 			slog.WarnContext(jobCtx, "job failed", "err", err, "vm", vm.Name, "repo", repo)
 		}
 	}()
 
-	w.WriteHeader(http.StatusAccepted)
+	return true
+}
+
+func (s *Server) serveNextPending(ctx context.Context) {
+	key, delivery, ok := s.nextPendingDelivery()
+	if !ok {
+		return
+	}
+	image, resolved := s.cfg.ResolveImage("", "")
+	if !resolved {
+		slog.WarnContext(ctx, "no default image configured; pending pool job remains deferred", "repo", delivery.repo, "run_id", delivery.runID, "job_id", key.jobID)
+		return
+	}
+	if !s.serve(ctx, delivery.repo, image) {
+		slog.DebugContext(ctx, "pending pool job remains deferred", "repo", delivery.repo, "run_id", delivery.runID, "job_id", key.jobID)
+	}
+}
+
+func (s *Server) nextPendingDelivery() (pendingKey, pendingDelivery, bool) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	var selectedKey pendingKey
+	var selectedDelivery pendingDelivery
+	found := false
+	for key, delivery := range s.pending {
+		if !found || key.jobID < selectedKey.jobID {
+			selectedKey = key
+			selectedDelivery = delivery
+			found = true
+		}
+	}
+	return selectedKey, selectedDelivery, found
 }
 
 func (s *Server) handleJobInProgress(ctx context.Context, payload webhookPayload) {
