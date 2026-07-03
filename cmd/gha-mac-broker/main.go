@@ -154,7 +154,7 @@ func runUpdateWithWriters(ctx context.Context, args []string, stdout io.Writer, 
 	case updateCommandApply:
 		return runUpdateApply(ctx, args[1:], stdout, stderr)
 	case updateCommandStatus:
-		return runUpdateStatus(args[1:], stdout, stderr)
+		return runUpdateStatus(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "gha-mac-broker update: unknown subcommand %q\n", args[0])
 		return fmt.Errorf("unknown update subcommand %q", args[0])
@@ -165,10 +165,17 @@ func runUpdateCheck(ctx context.Context, args []string, stdout io.Writer, stderr
 	fs := flag.NewFlagSet("update check", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "update check flag parse failed", "err", err)
 		return fmt.Errorf("update check flags: %w", err)
 	}
-	result, err := checkUpdate(ctx, updateopts.Options(updateopts.Overrides{}))
+	result, err := checkUpdate(ctx, updateopts.Options(updateopts.Overrides{
+		Client:      nil,
+		InstallPath: "",
+		DryRun:      false,
+		Log:         nil,
+	}))
 	if err != nil {
+		slog.ErrorContext(ctx, "update check failed", "err", err)
 		return fmt.Errorf("update check: %w", err)
 	}
 	printUpdateCheckResult(stdout, result)
@@ -180,10 +187,17 @@ func runUpdateApply(ctx context.Context, args []string, stdout io.Writer, stderr
 	fs.SetOutput(stderr)
 	dryRun := fs.Bool("dry-run", false, "download and verify without installing")
 	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "update apply flag parse failed", "err", err)
 		return fmt.Errorf("update apply flags: %w", err)
 	}
-	result, err := applyUpdate(ctx, updateopts.Options(updateopts.Overrides{DryRun: *dryRun}))
+	result, err := applyUpdate(ctx, updateopts.Options(updateopts.Overrides{
+		Client:      nil,
+		InstallPath: "",
+		DryRun:      *dryRun,
+		Log:         nil,
+	}))
 	if err != nil {
+		slog.ErrorContext(ctx, "update apply failed", "err", err)
 		return fmt.Errorf("update apply: %w", err)
 	}
 	if !result.UpdateAvailable {
@@ -200,6 +214,7 @@ func runUpdateApply(ctx context.Context, args []string, stdout io.Writer, stderr
 	}
 	restarted, err := restartManagedService(ctx)
 	if err != nil {
+		slog.ErrorContext(ctx, "update apply service restart failed", "err", err)
 		return fmt.Errorf("update apply restart: %w", err)
 	}
 	if restarted {
@@ -210,15 +225,22 @@ func runUpdateApply(ctx context.Context, args []string, stdout io.Writer, stderr
 	return nil
 }
 
-func runUpdateStatus(args []string, stdout io.Writer, stderr io.Writer) error {
+func runUpdateStatus(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
 	fs := flag.NewFlagSet("update status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "update status flag parse failed", "err", err)
 		return fmt.Errorf("update status flags: %w", err)
 	}
-	options := updateopts.Options(updateopts.Overrides{})
+	options := updateopts.Options(updateopts.Overrides{
+		Client:      nil,
+		InstallPath: "",
+		DryRun:      false,
+		Log:         nil,
+	})
 	state, err := loadUpdateState(options.StatePath)
 	if err != nil {
+		slog.ErrorContext(ctx, "update status load failed", "err", err, "path", options.StatePath)
 		return fmt.Errorf("update status: %w", err)
 	}
 	writeUserLine(stdout, "current version:   "+options.Config.CurrentVersion)
@@ -620,11 +642,7 @@ func runServe(ctx context.Context, args []string) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	go startUpdateScheduler(ctx, stop, slog.Default())
-	deleteStaleRunners(ctx, cfg, gh)
-	p.Start(ctx)
-	p.StartReconcile(ctx, 0)
-	srv.StartDeliverySweeper(ctx)
+	startServeLoops(ctx, stop, cfg, gh, p, srv)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -670,6 +688,25 @@ func runServe(ctx context.Context, args []string) error {
 	return nil
 }
 
+func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, p *pool.Pool, srv *server.Server) {
+	startUpdateSchedulerInBackground(ctx, stop, slog.Default())
+	deleteStaleRunners(ctx, cfg, cleaner)
+	p.Start(ctx)
+	p.StartReconcile(ctx, 0)
+	srv.StartDeliverySweeper(ctx)
+}
+
+func startUpdateSchedulerInBackground(ctx context.Context, stop func(), log *slog.Logger) {
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.ErrorContext(ctx, "update scheduler goroutine panic recovered", "err", recovered)
+			}
+		}()
+		startUpdateScheduler(ctx, stop, log)
+	}()
+}
+
 func startUpdateScheduler(ctx context.Context, stop func(), log *slog.Logger) {
 	if stop == nil {
 		return
@@ -682,7 +719,12 @@ func startUpdateScheduler(ctx context.Context, stop func(), log *slog.Logger) {
 			return selfupdate.ModeApply
 		},
 		Options: func() selfupdate.Options {
-			return updateopts.Options(updateopts.Overrides{Log: log})
+			return updateopts.Options(updateopts.Overrides{
+				Client:      nil,
+				InstallPath: "",
+				DryRun:      false,
+				Log:         log,
+			})
 		},
 		StopForRelaunch: stop,
 		Log:             log,
