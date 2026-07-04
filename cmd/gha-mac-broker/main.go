@@ -199,26 +199,15 @@ func runStatusWithWriters(ctx context.Context, args []string, stdout io.Writer, 
 }
 
 func statusEndpoint(ctx context.Context, listenAddr string) (string, error) {
-	host, port, err := net.SplitHostPort(listenAddr)
+	_, port, err := net.SplitHostPort(listenAddr)
 	if err != nil {
 		slog.ErrorContext(ctx, "status listen address parse failed", "err", err, "listen_addr", listenAddr)
 		return "", fmt.Errorf("status: parse listen_addr %q: %w", listenAddr, err)
 	}
-	return "http://" + net.JoinHostPort(statusLoopbackHost(host), port) + "/status", nil
-}
-
-func statusLoopbackHost(host string) string {
-	if host == "" {
-		return "::1"
-	}
-	if strings.EqualFold(host, "localhost") {
-		return host
-	}
-	ip := net.ParseIP(host)
-	if ip != nil && ip.IsLoopback() {
-		return host
-	}
-	return "::1"
+	// Dial localhost so the CLI reaches the daemon whether it bound IPv6 or IPv4
+	// loopback. On macOS localhost resolves to IPv6 first, matching the daemon's
+	// default ::1 bind.
+	return "http://" + net.JoinHostPort("localhost", port) + "/status", nil
 }
 
 func runUpdate(ctx context.Context, args []string) error {

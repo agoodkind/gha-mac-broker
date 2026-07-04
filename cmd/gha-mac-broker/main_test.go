@@ -120,8 +120,8 @@ base_image = %q
 	if capturedRequest == nil {
 		t.Fatal("status request was not sent")
 	}
-	if capturedRequest.URL.String() != "http://[::1]:23456/status" {
-		t.Fatalf("status url = %q, want http://[::1]:23456/status", capturedRequest.URL.String())
+	if capturedRequest.URL.String() != "http://localhost:23456/status" {
+		t.Fatalf("status url = %q, want http://localhost:23456/status", capturedRequest.URL.String())
 	}
 	if capturedRequest.Header.Get("Authorization") != "Bearer status-token" {
 		t.Fatalf("authorization = %q, want bearer token", capturedRequest.Header.Get("Authorization"))
@@ -131,13 +131,15 @@ base_image = %q
 	}
 }
 
-func TestStatusEndpointPreservesIPv4LoopbackHost(t *testing.T) {
-	statusURL, err := statusEndpoint(context.Background(), "127.0.0.1:23456")
-	if err != nil {
-		t.Fatalf("statusEndpoint: %v", err)
-	}
-	if statusURL != "http://127.0.0.1:23456/status" {
-		t.Fatalf("status url = %q, want http://127.0.0.1:23456/status", statusURL)
+func TestStatusEndpointUsesLocalhost(t *testing.T) {
+	for _, listenAddr := range []string{"[::1]:23456", "127.0.0.1:23456", "0.0.0.0:23456"} {
+		statusURL, err := statusEndpoint(context.Background(), listenAddr)
+		if err != nil {
+			t.Fatalf("statusEndpoint(%q): %v", listenAddr, err)
+		}
+		if statusURL != "http://localhost:23456/status" {
+			t.Fatalf("status url for %q = %q, want http://localhost:23456/status", listenAddr, statusURL)
+		}
 	}
 }
 
