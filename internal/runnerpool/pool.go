@@ -236,18 +236,25 @@ func (p *Pool) snapshotLocked() Snapshot {
 	if !p.started || p.shuttingDown {
 		return snapshot
 	}
+	active := 0
 	for _, state := range p.states {
-		if state.vm == nil || state.warming || state.recycle || state.lastErr != nil {
-			snapshot.Healthy = false
+		alive := state.vm != nil && !state.recycle && state.lastErr == nil
+		if alive {
+			active++
 		}
-		if state.vm != nil && !state.warming && !state.busy && !state.recycle {
+		if alive && !state.busy {
 			snapshot.Idle++
 		}
 		if state.busy {
 			snapshot.Busy++
 		}
 	}
-	snapshot.Ready = snapshot.Healthy && (snapshot.Idle > 0 || snapshot.Queued < p.options.RunnerCount)
+	// The pool is healthy when at least one worker VM can serve a job. A single
+	// worker warming, recycling, or errored does not take the whole pool down,
+	// so routine recycling never sheds every consumer to hosted while other VMs
+	// remain live.
+	snapshot.Healthy = active > 0
+	snapshot.Ready = active > 0 && (snapshot.Idle > 0 || snapshot.Queued < active)
 	return snapshot
 }
 
