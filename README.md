@@ -1,9 +1,10 @@
 # gha-mac-broker
 
-A generic GitHub Actions macOS warm-pool runner broker. One Mac keeps a pool of
-pre-booted [Tart](https://tart.run) VMs and binds a free VM to whichever
-repository just queued a job, using repo-scoped just-in-time runner config. One
-shared pool serves many personal-account repositories without an organization.
+A generic GitHub Actions macOS warm-pool runner broker. One Mac keeps a fixed set
+of pre-booted [Tart](https://tart.run) VMs and runs each queued job on a free VM
+using repo-scoped just-in-time runner config. A VM is reused across many jobs, so
+one VM serves gates from any allowed repository over its life. One shared pool
+serves many personal-account repositories without an organization.
 
 ## Why
 
@@ -61,11 +62,13 @@ tilde expansion), never inlined.
 | `app.app_id` | GitHub App ID |
 | `app.private_key_path` | PEM private key on disk |
 | `app.webhook_secret_path` | file holding the webhook HMAC secret |
-| `tart.golden_image` | source VM the pool clones (runner installed, unconfigured) |
-| `tart.cache_dir` | host dir shared into each VM, survives VM deletion |
-| `tart.ssh_key_path` | private key the broker uses to control the VM |
+| `app.capacity_token_path` | file holding the bearer token required on `GET /capacity` |
+| `runner_count` | number of persistent warm VMs the pool keeps booted (default 3) |
+| `max_idle` | recycle an idle VM after this long (hygiene; the cache is a host mount, so this is free) |
+| `max_age` | recycle a VM once it has run this long |
+| `tart.base_image` | Cirrus image the golden is built from (runner baked in, unconfigured) |
+| `tart.cache_dir` | host dir mounted into each VM, survives VM deletion |
 | `allowed_repos` | `owner/repo` allowlist the broker will serve |
-| `pool_size` | number of warm VMs kept booted |
 
 ## Subcommands
 
@@ -85,7 +88,22 @@ gha-mac-broker serve -config /path/to/config.toml
 - `bind` clones a warm VM, registers it as an ephemeral runner, runs one job,
   and tears the VM down. It needs the golden image to be present.
 
-## Status
+## Architecture
 
-The webhook server, warm pool, and `/capacity` reservation endpoint are not yet
-implemented; `bind` is the single-shot primitive they will drive.
+`serve` runs a fixed persistent worker pool. Each worker owns one warm VM cloned
+from the golden and reuses it across many jobs. The webhook is the demand signal:
+a `workflow_job.queued` delivery for an allowed repo carrying a pool label is
+enqueued (`internal/server/server.go`), and an idle worker pulls the next job,
+mints a repo-scoped JIT config for that job's repo, and runs it on its VM over the
+tart-exec vsock channel (`internal/runnerpool/pool.go`, `internal/broker/bind.go`).
+The VM is not torn down between jobs, so `runner_count` VMs run `runner_count` jobs
+at once and a fan-out drains across them in waves. Each job is a fresh JIT
+registration to its own repository, so one generic VM serves any allowed repo.
+
+`GET /capacity` reports `runnerpool.Ready()`: true only when the pool is healthy
+and a worker is free or near-free, so a consumer's `plan-runners` step routes to
+the pool when it can serve and falls back to GitHub-hosted `macos-26` when the pool
+is saturated or down. That failover, plus a stranded-run backstop, lives in the
+consumer's reusable workflow, not in the broker. Idle VMs recycle on `max_idle`,
+`max_age`, a vsock liveness failure, or a stale GitHub runner registration; the
+build cache is a host mount, so recycling never cold-starts the cache.
