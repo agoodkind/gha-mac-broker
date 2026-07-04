@@ -19,6 +19,8 @@ const (
 	defaultRunnerCount       = 3
 	defaultWarmRetryDelay    = 5 * time.Second
 	defaultReconcileInterval = time.Minute
+	defaultMaxBind           = 65 * time.Minute
+	defaultPickupTimeout     = 5 * time.Minute
 )
 
 // Job is one queued workflow job accepted from the webhook server.
@@ -34,6 +36,8 @@ type Options struct {
 	Image          string
 	MaxIdle        time.Duration
 	MaxAge         time.Duration
+	MaxBind        time.Duration
+	PickupTimeout  time.Duration
 	RunToken       string
 	AllowedRepos   []string
 	WarmRetryDelay time.Duration
@@ -95,6 +99,7 @@ type workerState struct {
 	busy      bool
 	recycle   bool
 	runID     int64
+	jobCancel context.CancelFunc
 	lastErr   error
 }
 
@@ -153,6 +158,12 @@ func normalizeOptions(options Options) Options {
 	}
 	if options.WarmRetryDelay <= 0 {
 		options.WarmRetryDelay = defaultWarmRetryDelay
+	}
+	if options.MaxBind <= 0 {
+		options.MaxBind = defaultMaxBind
+	}
+	if options.PickupTimeout <= 0 {
+		options.PickupTimeout = defaultPickupTimeout
 	}
 	if options.Now == nil {
 		options.Now = time.Now
@@ -362,6 +373,7 @@ func (p *Pool) snapshotLocked() Snapshot {
 
 // Reconcile recycles idle VMs that exceed hygiene limits or fail health checks.
 func (p *Pool) Reconcile(ctx context.Context) error {
+	p.reapBusyWorkers(ctx)
 	candidates := p.idleCandidates()
 	var recycleErrs []error
 	for _, candidate := range candidates {
@@ -378,6 +390,57 @@ func (p *Pool) Reconcile(ctx context.Context) error {
 		slog.WarnContext(ctx, "runnerpool reconcile found unhealthy idle vm", "err", err)
 	}
 	return err
+}
+
+type busyCandidate struct {
+	index   int
+	vm      *broker.WarmVM
+	boundAt time.Time
+	now     time.Time
+}
+
+func (p *Pool) reapBusyWorkers(ctx context.Context) {
+	candidates := p.busyCandidates()
+	for _, candidate := range candidates {
+		bindAge := candidate.now.Sub(candidate.boundAt)
+		if p.options.MaxBind > 0 && bindAge >= p.options.MaxBind {
+			p.requestBusyRecycle(candidate.index, candidate.vm)
+			continue
+		}
+		if p.options.PickupTimeout <= 0 || bindAge < p.options.PickupTimeout {
+			continue
+		}
+		if p.prober == nil {
+			continue
+		}
+		active, err := p.prober.HasActiveJob(ctx, candidate.vm)
+		if err != nil {
+			slog.WarnContext(ctx, "runnerpool active job probe failed", "err", err, "vm", candidate.vm.Name)
+			continue
+		}
+		if !active {
+			p.requestBusyRecycle(candidate.index, candidate.vm)
+		}
+	}
+}
+
+func (p *Pool) busyCandidates() []busyCandidate {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.options.Now()
+	candidates := make([]busyCandidate, 0, len(p.states))
+	for index, state := range p.states {
+		if state.vm == nil || !state.busy || state.recycle || state.boundAt.IsZero() {
+			continue
+		}
+		candidates = append(candidates, busyCandidate{
+			index:   index,
+			vm:      state.vm,
+			boundAt: state.boundAt,
+			now:     now,
+		})
+	}
+	return candidates
 }
 
 type idleCandidate struct {
@@ -453,8 +516,45 @@ func (p *Pool) requestRecycle(index int, vm *broker.WarmVM, err error) {
 		return
 	}
 	state.recycle = true
+	state.jobCancel = nil
 	state.lastErr = err
 	p.cond.Broadcast()
+}
+
+func (p *Pool) requestBusyRecycle(index int, vm *broker.WarmVM) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	state := &p.states[index]
+	if state.vm == nil || state.vm.Name != vm.Name || !state.busy {
+		return
+	}
+	state.recycle = true
+	cancel := state.jobCancel
+	state.jobCancel = nil
+	if cancel != nil {
+		cancel()
+	}
+	p.cond.Broadcast()
+}
+
+// CancelRun reaps the busy worker bound to runID, if one is still running.
+func (p *Pool) CancelRun(runID int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for index := range p.states {
+		state := &p.states[index]
+		if !state.busy || state.runID != runID {
+			continue
+		}
+		state.recycle = true
+		cancel := state.jobCancel
+		state.jobCancel = nil
+		if cancel != nil {
+			cancel()
+		}
+		p.cond.Broadcast()
+		return
+	}
 }
 
 // Shutdown stops workers and tears down every VM they own.
@@ -513,10 +613,27 @@ func (p *Pool) workerLoop(ctx context.Context, index int) {
 			continue
 		}
 
-		if err := p.runner.RunJob(ctx, vm, job.Repo, vm.Name); err != nil {
+		jobCtx, cancel := context.WithCancel(ctx)
+		p.setJobCancel(index, cancel)
+		var err error
+		var recycleAfterJob bool
+		func() {
+			defer cancel()
+			err = p.runner.RunJob(jobCtx, vm, job.Repo, vm.Name)
+			recycleAfterJob = p.finishJobOrRecycle(index, jobCtx)
+		}()
+		if err != nil {
 			slog.WarnContext(ctx, "runnerpool job failed", "err", err, "repo", job.Repo, "job_id", job.JobID, "run_id", job.RunID, "vm", vm.Name)
 		}
-		p.finishJob(index)
+		if recycleAfterJob {
+			p.teardownVM(context.WithoutCancel(ctx), vm)
+			vm = nil
+			bornAt = time.Time{}
+			if ctx.Err() != nil {
+				p.clearWorker(index)
+				return
+			}
+		}
 	}
 }
 
@@ -554,6 +671,7 @@ func (p *Pool) markWarming(index int) {
 	state.busy = false
 	state.recycle = false
 	state.runID = 0
+	state.jobCancel = nil
 	p.cond.Broadcast()
 }
 
@@ -565,6 +683,7 @@ func (p *Pool) markWarmError(index int, err error) {
 	state.warming = false
 	state.boundAt = time.Time{}
 	state.runID = 0
+	state.jobCancel = nil
 	p.cond.Broadcast()
 }
 
@@ -579,6 +698,7 @@ func (p *Pool) waitForJobOrRecycle(ctx context.Context, index int, vm *broker.Wa
 	state.warming = false
 	state.busy = false
 	state.runID = 0
+	state.jobCancel = nil
 	state.lastErr = nil
 	p.cond.Broadcast()
 	for {
@@ -592,6 +712,7 @@ func (p *Pool) waitForJobOrRecycle(ctx context.Context, index int, vm *broker.Wa
 			state.idleSince = time.Time{}
 			state.boundAt = time.Time{}
 			state.runID = 0
+			state.jobCancel = nil
 			p.cond.Broadcast()
 			return Job{Repo: "", JobID: 0, RunID: 0}, true, true
 		}
@@ -606,6 +727,7 @@ func (p *Pool) waitForJobOrRecycle(ctx context.Context, index int, vm *broker.Wa
 			state.idleSince = time.Time{}
 			state.boundAt = p.options.Now()
 			state.runID = job.RunID
+			state.jobCancel = nil
 			p.cond.Broadcast()
 			return job, false, true
 		}
@@ -613,14 +735,38 @@ func (p *Pool) waitForJobOrRecycle(ctx context.Context, index int, vm *broker.Wa
 	}
 }
 
-func (p *Pool) finishJob(index int) {
+func (p *Pool) setJobCancel(index int, cancel context.CancelFunc) {
+	cancelNow := false
+	p.mu.Lock()
+	state := &p.states[index]
+	if state.busy && !state.recycle {
+		state.jobCancel = cancel
+	} else {
+		cancelNow = true
+	}
+	p.mu.Unlock()
+	if cancelNow {
+		cancel()
+	}
+}
+
+func (p *Pool) finishJobOrRecycle(index int, jobCtx context.Context) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	state := &p.states[index]
+	recycleAfterJob := state.recycle || jobCtx.Err() != nil
 	state.busy = false
 	state.boundAt = time.Time{}
 	state.runID = 0
+	state.jobCancel = nil
+	if recycleAfterJob {
+		state.vm = nil
+		state.recycle = false
+		state.warming = true
+		state.idleSince = time.Time{}
+	}
 	p.cond.Broadcast()
+	return recycleAfterJob
 }
 
 func (p *Pool) clearWorker(index int) {
@@ -635,6 +781,7 @@ func (p *Pool) clearWorker(index int) {
 		busy:      false,
 		recycle:   false,
 		runID:     0,
+		jobCancel: nil,
 		lastErr:   nil,
 	}
 	p.cond.Broadcast()

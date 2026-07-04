@@ -26,6 +26,7 @@ type pooler interface {
 	Enqueue(ctx context.Context, job runnerpool.Job) error
 	Ready() bool
 	Status(ctx context.Context) (runnerpool.Snapshot, []runnerpool.WorkerView)
+	CancelRun(runID int64)
 }
 
 type webhookAction string
@@ -129,6 +130,9 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	case webhookActionCompleted:
 		slog.DebugContext(r.Context(), "workflow job completed", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "status", payload.WorkflowJob.Status, "conclusion", payload.WorkflowJob.Conclusion)
+		if payload.WorkflowJob.Conclusion == "cancelled" || payload.WorkflowJob.Conclusion == "skipped" {
+			s.pool.CancelRun(payload.WorkflowJob.RunID)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.WriteHeader(http.StatusNoContent)

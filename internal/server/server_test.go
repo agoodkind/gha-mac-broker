@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +24,7 @@ type testPool struct {
 	ready      bool
 	enqueueErr error
 	enqueued   []runnerpool.Job
+	cancelled  []int64
 	snapshot   runnerpool.Snapshot
 	workers    []runnerpool.WorkerView
 }
@@ -49,10 +51,22 @@ func (p *testPool) Status(_ context.Context) (runnerpool.Snapshot, []runnerpool.
 	return p.snapshot, append([]runnerpool.WorkerView(nil), p.workers...)
 }
 
+func (p *testPool) CancelRun(runID int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cancelled = append(p.cancelled, runID)
+}
+
 func (p *testPool) Jobs() []runnerpool.Job {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]runnerpool.Job(nil), p.enqueued...)
+}
+
+func (p *testPool) CancelledRuns() []int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]int64(nil), p.cancelled...)
 }
 
 var testSecret = []byte("test-secret")
@@ -103,6 +117,10 @@ func webhookBody(action string, repo string, labels []string, runID int64) []byt
 }
 
 func webhookBodyWithJobID(action string, repo string, labels []string, runID int64, jobID int64) []byte {
+	return webhookBodyWithConclusion(action, repo, labels, runID, jobID, "")
+}
+
+func webhookBodyWithConclusion(action string, repo string, labels []string, runID int64, jobID int64, conclusion string) []byte {
 	payload := webhookPayload{
 		Action:     webhookAction(action),
 		Repository: webhookRepo{FullName: repo},
@@ -111,7 +129,7 @@ func webhookBodyWithJobID(action string, repo string, labels []string, runID int
 			Labels:     labels,
 			RunID:      runID,
 			Status:     action,
-			Conclusion: "",
+			Conclusion: conclusion,
 			RunnerName: "",
 			RunnerID:   0,
 		},
@@ -201,6 +219,36 @@ func TestWebhookNonQueuedReturns204(t *testing.T) {
 	}
 	if got := len(pool.Jobs()); got != 0 {
 		t.Fatalf("enqueued jobs = %d, want 0", got)
+	}
+}
+
+func TestWebhookCompletedCancelsCancelledAndSkippedRuns(t *testing.T) {
+	pool := &testPool{}
+	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool)
+	testCases := []struct {
+		name       string
+		runID      int64
+		conclusion string
+		wantRuns   []int64
+	}{
+		{name: "cancelled", runID: 42, conclusion: "cancelled", wantRuns: []int64{42}},
+		{name: "skipped", runID: 43, conclusion: "skipped", wantRuns: []int64{42, 43}},
+		{name: "success", runID: 44, conclusion: "success", wantRuns: []int64{42, 43}},
+		{name: "empty", runID: 45, conclusion: "", wantRuns: []int64{42, 43}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := webhookBodyWithConclusion("completed", "owner/repo", []string{"self-hosted"}, testCase.runID, 7000+testCase.runID, testCase.conclusion)
+			w := postWebhook(t, srv, body)
+			if w.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want 204", w.Code)
+			}
+			gotRuns := pool.CancelledRuns()
+			if fmt.Sprint(gotRuns) != fmt.Sprint(testCase.wantRuns) {
+				t.Fatalf("cancelled runs = %v, want %v", gotRuns, testCase.wantRuns)
+			}
+		})
 	}
 }
 
