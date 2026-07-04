@@ -48,6 +48,14 @@ type Config struct {
 	// disables age recycling; the value is honored verbatim, not defaulted.
 	MaxAge Duration `toml:"max_age"`
 
+	// MaxBind is the maximum time a busy worker may stay bound before a dead
+	// job probe can recycle it. Zero or unset uses the runner pool default.
+	MaxBind Duration `toml:"max_bind"`
+
+	// PickupTimeout is the time a busy worker may stay bound before a no-active
+	// job probe can recycle it. Zero or unset uses the runner pool default.
+	PickupTimeout Duration `toml:"pickup_timeout"`
+
 	// App identifies the GitHub App and where its private key lives.
 	App AppConfig `toml:"app"`
 
@@ -252,6 +260,12 @@ func (c *Config) validate() error {
 	}
 	if c.MaxAge < 0 {
 		return fmt.Errorf("config: max_age must not be negative")
+	}
+	if c.MaxBind < 0 {
+		return fmt.Errorf("config: max_bind must not be negative")
+	}
+	if c.PickupTimeout < 0 {
+		return fmt.Errorf("config: pickup_timeout must not be negative")
 	}
 	if !safeCirrusImageTag(c.Tart.BaseImage) {
 		return fmt.Errorf("config: tart.base_image must be a ghcr.io/cirruslabs/macos-*-xcode:* tag")

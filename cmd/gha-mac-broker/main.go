@@ -199,12 +199,26 @@ func runStatusWithWriters(ctx context.Context, args []string, stdout io.Writer, 
 }
 
 func statusEndpoint(ctx context.Context, listenAddr string) (string, error) {
-	_, port, err := net.SplitHostPort(listenAddr)
+	host, port, err := net.SplitHostPort(listenAddr)
 	if err != nil {
 		slog.ErrorContext(ctx, "status listen address parse failed", "err", err, "listen_addr", listenAddr)
 		return "", fmt.Errorf("status: parse listen_addr %q: %w", listenAddr, err)
 	}
-	return "http://" + net.JoinHostPort("::1", port) + "/status", nil
+	return "http://" + net.JoinHostPort(statusLoopbackHost(host), port) + "/status", nil
+}
+
+func statusLoopbackHost(host string) string {
+	if host == "" {
+		return "::1"
+	}
+	if strings.EqualFold(host, "localhost") {
+		return host
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return host
+	}
+	return "::1"
 }
 
 func runUpdate(ctx context.Context, args []string) error {
@@ -767,8 +781,8 @@ func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBin
 		Image:          cfg.Tart.BaseImage,
 		MaxIdle:        time.Duration(cfg.MaxIdle),
 		MaxAge:         time.Duration(cfg.MaxAge),
-		MaxBind:        0,
-		PickupTimeout:  0,
+		MaxBind:        time.Duration(cfg.MaxBind),
+		PickupTimeout:  time.Duration(cfg.PickupTimeout),
 		RunToken:       runToken,
 		AllowedRepos:   cfg.AllowedRepos,
 		WarmRetryDelay: 0,

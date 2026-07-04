@@ -131,6 +131,16 @@ base_image = %q
 	}
 }
 
+func TestStatusEndpointPreservesIPv4LoopbackHost(t *testing.T) {
+	statusURL, err := statusEndpoint(context.Background(), "127.0.0.1:23456")
+	if err != nil {
+		t.Fatalf("statusEndpoint: %v", err)
+	}
+	if statusURL != "http://127.0.0.1:23456/status" {
+		t.Fatalf("status url = %q, want http://127.0.0.1:23456/status", statusURL)
+	}
+}
+
 func TestDeleteStaleRunnersDeletesOfflineRunners(t *testing.T) {
 	client := &staleRunnerClient{
 		runners: []ghapp.Runner{

@@ -66,6 +66,8 @@ tilde expansion), never inlined.
 | `runner_count` | number of persistent warm VMs the pool keeps booted (default 3) |
 | `max_idle` | recycle an idle VM after this long (hygiene; the cache is a host mount, so this is free) |
 | `max_age` | recycle a VM once it has run this long |
+| `max_bind` | probe a busy worker after this long and recycle it only when active work is not confirmed |
+| `pickup_timeout` | probe a newly bound busy worker after this long and recycle it when no active job exists |
 | `tart.base_image` | Cirrus image the golden is built from (runner baked in, unconfigured) |
 | `tart.cache_dir` | host dir mounted into each VM, survives VM deletion |
 | `allowed_repos` | `owner/repo` allowlist the broker will serve |
@@ -108,4 +110,6 @@ the pool when it can serve and falls back to GitHub-hosted `macos-26` when the p
 is saturated or down. That failover, plus a stranded-run backstop, lives in the
 consumer's reusable workflow, not in the broker. Idle VMs recycle on `max_idle`,
 `max_age`, a vsock liveness failure, or a stale GitHub runner registration; the
-build cache is a host mount, so recycling never cold-starts the cache.
+build cache is a host mount, so recycling never cold-starts the cache. Busy VMs
+recycle on `pickup_timeout` or `max_bind` only after the active-job probe reports
+no active job, except that a `max_bind` probe error is treated as stale work.

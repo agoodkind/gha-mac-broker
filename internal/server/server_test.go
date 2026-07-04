@@ -51,10 +51,10 @@ func (p *testPool) Status(_ context.Context) (runnerpool.Snapshot, []runnerpool.
 	return p.snapshot, append([]runnerpool.WorkerView(nil), p.workers...)
 }
 
-func (p *testPool) CancelRun(runID int64) {
+func (p *testPool) CancelRun(jobID int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.cancelled = append(p.cancelled, runID)
+	p.cancelled = append(p.cancelled, jobID)
 }
 
 func (p *testPool) Jobs() []runnerpool.Job {
@@ -63,7 +63,7 @@ func (p *testPool) Jobs() []runnerpool.Job {
 	return append([]runnerpool.Job(nil), p.enqueued...)
 }
 
-func (p *testPool) CancelledRuns() []int64 {
+func (p *testPool) CancelledJobs() []int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]int64(nil), p.cancelled...)
@@ -222,31 +222,32 @@ func TestWebhookNonQueuedReturns204(t *testing.T) {
 	}
 }
 
-func TestWebhookCompletedCancelsCancelledAndSkippedRuns(t *testing.T) {
+func TestWebhookCompletedCancelsCancelledAndSkippedJobs(t *testing.T) {
 	pool := &testPool{}
 	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, pool)
 	testCases := []struct {
 		name       string
 		runID      int64
+		jobID      int64
 		conclusion string
-		wantRuns   []int64
+		wantJobs   []int64
 	}{
-		{name: "cancelled", runID: 42, conclusion: "cancelled", wantRuns: []int64{42}},
-		{name: "skipped", runID: 43, conclusion: "skipped", wantRuns: []int64{42, 43}},
-		{name: "success", runID: 44, conclusion: "success", wantRuns: []int64{42, 43}},
-		{name: "empty", runID: 45, conclusion: "", wantRuns: []int64{42, 43}},
+		{name: "cancelled", runID: 42, jobID: 1001, conclusion: "cancelled", wantJobs: []int64{1001}},
+		{name: "skipped", runID: 42, jobID: 1002, conclusion: "skipped", wantJobs: []int64{1001, 1002}},
+		{name: "success", runID: 42, jobID: 1003, conclusion: "success", wantJobs: []int64{1001, 1002}},
+		{name: "empty", runID: 42, jobID: 1004, conclusion: "", wantJobs: []int64{1001, 1002}},
 	}
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			body := webhookBodyWithConclusion("completed", "owner/repo", []string{"self-hosted"}, testCase.runID, 7000+testCase.runID, testCase.conclusion)
+			body := webhookBodyWithConclusion("completed", "owner/repo", []string{"self-hosted"}, testCase.runID, testCase.jobID, testCase.conclusion)
 			w := postWebhook(t, srv, body)
 			if w.Code != http.StatusNoContent {
 				t.Fatalf("status = %d, want 204", w.Code)
 			}
-			gotRuns := pool.CancelledRuns()
-			if fmt.Sprint(gotRuns) != fmt.Sprint(testCase.wantRuns) {
-				t.Fatalf("cancelled runs = %v, want %v", gotRuns, testCase.wantRuns)
+			gotJobs := pool.CancelledJobs()
+			if fmt.Sprint(gotJobs) != fmt.Sprint(testCase.wantJobs) {
+				t.Fatalf("cancelled jobs = %v, want %v", gotJobs, testCase.wantJobs)
 			}
 		})
 	}

@@ -445,6 +445,7 @@ func TestCancelRunReapsMatchingBusyWorker(t *testing.T) {
 		busy:      true,
 		recycle:   false,
 		boundAt:   now.Add(-time.Minute),
+		jobID:     1001,
 		runID:     42,
 		jobCancel: func() {
 			cancelCount++
@@ -459,6 +460,7 @@ func TestCancelRunReapsMatchingBusyWorker(t *testing.T) {
 		busy:      true,
 		recycle:   false,
 		boundAt:   now.Add(-time.Minute),
+		jobID:     1002,
 		runID:     43,
 		lastErr:   nil,
 	}
@@ -474,7 +476,7 @@ func TestCancelRunReapsMatchingBusyWorker(t *testing.T) {
 	}
 	pool.mu.Unlock()
 
-	pool.CancelRun(42)
+	pool.CancelRun(1001)
 	pool.mu.Lock()
 	if !pool.states[0].recycle {
 		t.Fatal("matching worker recycle = false, want true")
@@ -490,9 +492,40 @@ func TestCancelRunReapsMatchingBusyWorker(t *testing.T) {
 	}
 	pool.mu.Unlock()
 
-	pool.CancelRun(42)
+	pool.CancelRun(1001)
 	if cancelCount != 1 {
 		t.Fatalf("cancel count after duplicate CancelRun = %d, want 1", cancelCount)
+	}
+}
+
+func TestCancelRunIgnoresSiblingJobWithSameRunID(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newBlockingRunner(1)
+	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
+	ctx := startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+	firstVM := warmer.WarmNames()[0]
+
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo", JobID: 1001, RunID: 42}); err != nil {
+		t.Fatalf("Enqueue job: %v", err)
+	}
+	waitStarted(t, runner)
+
+	pool.CancelRun(1002)
+
+	if torn := warmer.TornNames(); len(torn) != 0 {
+		t.Fatalf("teardowns after sibling cancel = %v, want none", torn)
+	}
+
+	pool.CancelRun(1001)
+
+	waitFor(t, func() bool {
+		return len(warmer.WarmNames()) == 2
+	})
+	torn := warmer.TornNames()
+	if len(torn) != 1 || torn[0] != firstVM {
+		t.Fatalf("teardowns after matching cancel = %v, want [%s]", torn, firstVM)
 	}
 }
 
@@ -710,13 +743,62 @@ func TestReconcileKeepsBusyWorkerAfterPickupTimeoutWhenProbeErrors(t *testing.T)
 	}
 }
 
-func TestReconcileReapsBusyWorkerPastMaxBindRegardlessOfActiveJob(t *testing.T) {
+func TestReconcileKeepsBusyWorkerPastMaxBindWithActiveJob(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	clock := newMutableClock(now)
 	options := testOptions(clock, 1)
 	options.PickupTimeout = time.Minute
 	options.MaxBind = 2 * time.Minute
 	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+
+	pool.mu.Lock()
+	pool.states[0] = workerState{
+		vm:        &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+		bornAt:    now.Add(-time.Hour),
+		idleSince: time.Time{},
+		warming:   false,
+		busy:      true,
+		recycle:   false,
+		boundAt:   now.Add(-options.MaxBind - time.Second),
+		runID:     42,
+		jobCancel: func() {
+			cancelCount++
+		},
+		lastErr: nil,
+	}
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].recycle {
+		t.Fatal("busy worker recycle = true, want false")
+	}
+	if pool.states[0].jobCancel == nil {
+		t.Fatal("busy worker jobCancel = nil, want still set")
+	}
+	if cancelCount != 0 {
+		t.Fatalf("cancel count = %d, want 0", cancelCount)
+	}
+	calls := prober.Calls()
+	if len(calls) != 1 || calls[0] != "vm-busy" {
+		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
+	}
+}
+
+func TestReconcileReapsBusyWorkerPastMaxBindWhenProbeErrors(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = 2 * time.Minute
+	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
+	prober.probeErr = errors.New("guest probe failed")
 	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
 	cancelCount := 0
 
@@ -752,8 +834,9 @@ func TestReconcileReapsBusyWorkerPastMaxBindRegardlessOfActiveJob(t *testing.T) 
 	if cancelCount != 1 {
 		t.Fatalf("cancel count = %d, want 1", cancelCount)
 	}
-	if calls := prober.Calls(); len(calls) != 0 {
-		t.Fatalf("prober calls = %v, want none for hard cap", calls)
+	calls := prober.Calls()
+	if len(calls) != 1 || calls[0] != "vm-busy" {
+		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
 	}
 }
 
@@ -771,7 +854,7 @@ func TestCancelRunTearsDownAndRewarmsWorker(t *testing.T) {
 	}
 	waitStarted(t, runner)
 
-	pool.CancelRun(42)
+	pool.CancelRun(1)
 
 	waitFor(t, func() bool {
 		return len(warmer.WarmNames()) == 2

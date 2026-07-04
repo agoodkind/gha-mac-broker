@@ -100,6 +100,8 @@ func TestLoadRunnerPoolSettings(t *testing.T) {
 runner_count = 5
 max_idle = "45m"
 max_age = "6h"
+max_bind = "90m"
+pickup_timeout = "7m"
 allowed_repos = ["agoodkind/lmd"]
 
 [app]
@@ -122,6 +124,12 @@ warm_budget = 7
 	}
 	if time.Duration(cfg.MaxAge) != 6*time.Hour {
 		t.Fatalf("max age = %s, want 6h0m0s", time.Duration(cfg.MaxAge))
+	}
+	if time.Duration(cfg.MaxBind) != 90*time.Minute {
+		t.Fatalf("max bind = %s, want 1h30m0s", time.Duration(cfg.MaxBind))
+	}
+	if time.Duration(cfg.PickupTimeout) != 7*time.Minute {
+		t.Fatalf("pickup timeout = %s, want 7m0s", time.Duration(cfg.PickupTimeout))
 	}
 	if cfg.Tart.WarmBudget != 7 {
 		t.Fatalf("warm budget = %d, want back-compat parse value 7", cfg.Tart.WarmBudget)
