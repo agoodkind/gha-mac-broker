@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -37,6 +38,16 @@ const heartbeatFile = "/tmp/gha-broker.alive"
 
 // runnerHome is where the golden image keeps the GitHub Actions runner.
 const runnerHome = "~/actions-runner"
+
+// activeJobProbeTimeout bounds /status guest process checks.
+const activeJobProbeTimeout = 5 * time.Second
+
+type activeJobProbeResult string
+
+const (
+	activeJobProbeResultYes activeJobProbeResult = "yes"
+	activeJobProbeResultNo  activeJobProbeResult = "no"
+)
 
 // WarmVM is a booted, vsock-ready VM that has not yet been bound to a job. Name
 // is safe to read from any goroutine once Warm returns.
@@ -140,12 +151,52 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo, runnerName string
 
 	remote := fmt.Sprintf("cd %s && ./run.sh --jitconfig %s", runnerHome, jit.EncodedJITConfig)
 	slog.InfoContext(ctx, "running ephemeral job", "repo", repo, "vm", vm.Name, "runner", jit.Runner.Name)
-	if _, err := b.vm.Exec(ctx, vm.Name, "bash", "-lc", remote); err != nil {
+	runLog, runLogPath, err := openRunLog(ctx, vm.Name)
+	if err != nil {
+		slog.WarnContext(ctx, "run log open failed; using buffered exec", "err", err, "vm", vm.Name, "path", runLogPath)
+		if _, err := b.vm.Exec(ctx, vm.Name, "bash", "-lc", remote); err != nil {
+			slog.ErrorContext(ctx, "job run failed", "err", err, "vm", vm.Name)
+			return fmt.Errorf("broker: run job on %s: %w", vm.Name, err)
+		}
+		slog.InfoContext(ctx, "job complete", "repo", repo, "vm", vm.Name)
+		return nil
+	}
+	defer func() {
+		if err := runLog.Close(); err != nil {
+			slog.WarnContext(ctx, "run log close failed", "err", err, "vm", vm.Name, "path", runLogPath)
+		}
+	}()
+	if _, err := b.vm.ExecTee(ctx, vm.Name, runLog, "bash", "-lc", remote); err != nil {
 		slog.ErrorContext(ctx, "job run failed", "err", err, "vm", vm.Name)
 		return fmt.Errorf("broker: run job on %s: %w", vm.Name, err)
 	}
 	slog.InfoContext(ctx, "job complete", "repo", repo, "vm", vm.Name)
 	return nil
+}
+
+func openRunLog(ctx context.Context, vmName string) (*os.File, string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		slog.WarnContext(ctx, "resolve home dir for run log failed", "err", err, "vm", vmName)
+		return nil, "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	logDir := filepath.Join(home, "Library", "Logs", "gha-mac-broker")
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		slog.WarnContext(ctx, "create run log dir failed", "err", err, "vm", vmName, "path", logDir)
+		return nil, logDir, fmt.Errorf("create run log dir: %w", err)
+	}
+	logPath := filepath.Join(logDir, "run-"+safeLogName(vmName)+".log")
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		slog.WarnContext(ctx, "open run log failed", "err", err, "vm", vmName, "path", logPath)
+		return nil, logPath, fmt.Errorf("open run log: %w", err)
+	}
+	return file, logPath, nil
+}
+
+func safeLogName(name string) string {
+	replacer := strings.NewReplacer("/", "_", "\\", "_")
+	return replacer.Replace(name)
 }
 
 // Teardown stops the liveness touch loop, kills the boot process if running,
@@ -167,6 +218,27 @@ func (b *Binder) CheckAlive(ctx context.Context, vm *WarmVM) error {
 		return fmt.Errorf("broker: check alive %s: %w", vm.Name, err)
 	}
 	return nil
+}
+
+// HasActiveJob reports whether the guest is running an actions job worker.
+func (b *Binder) HasActiveJob(ctx context.Context, vm *WarmVM) (bool, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, activeJobProbeTimeout)
+	defer cancel()
+	out, err := b.vm.Exec(probeCtx, vm.Name, "bash", "-lc", "pgrep -f Runner.Worker >/dev/null 2>&1 && echo yes || echo no")
+	if err != nil {
+		slog.WarnContext(probeCtx, "active job probe failed", "err", err, "vm", vm.Name)
+		return false, fmt.Errorf("broker: probe active job on %s: %w", vm.Name, err)
+	}
+	result := activeJobProbeResult(strings.TrimSpace(string(out)))
+	switch result {
+	case activeJobProbeResultYes:
+		return true, nil
+	case activeJobProbeResultNo:
+		return false, nil
+	default:
+		slog.WarnContext(probeCtx, "active job probe returned unexpected output", "vm", vm.Name, "output", result)
+		return false, fmt.Errorf("broker: active job probe on %s returned %q", vm.Name, string(result))
+	}
 }
 
 // List returns the Tart VM names visible to the broker host.

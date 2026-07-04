@@ -25,6 +25,7 @@ const maxBodyBytes = 1 << 20
 type pooler interface {
 	Enqueue(ctx context.Context, job runnerpool.Job) error
 	Ready() bool
+	Status(ctx context.Context) (runnerpool.Snapshot, []runnerpool.WorkerView)
 }
 
 type webhookAction string
@@ -59,6 +60,11 @@ type capacityResponse struct {
 	Available bool `json:"available"`
 }
 
+type statusResponse struct {
+	Snapshot runnerpool.Snapshot     `json:"snapshot"`
+	Workers  []runnerpool.WorkerView `json:"workers"`
+}
+
 // Server handles the /webhook, /capacity, and /healthz endpoints.
 type Server struct {
 	mux           *http.ServeMux
@@ -81,6 +87,7 @@ func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs [
 	}
 	s.mux.HandleFunc("/webhook", s.handleWebhook)
 	s.mux.HandleFunc("/capacity", s.handleCapacity)
+	s.mux.HandleFunc("/status", s.handleStatus)
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	if len(webhookCIDRs) == 0 {
 		slog.Warn("webhook IP guard disabled: no CIDRs configured")
@@ -202,6 +209,21 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, capacityResponse{Available: s.pool.Ready()})
 }
 
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.checkBearerToken(w, r) {
+		return
+	}
+	snapshot, workers := s.pool.Status(r.Context())
+	writeJSON(w, statusResponse{
+		Snapshot: snapshot,
+		Workers:  workers,
+	})
+}
+
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	slog.DebugContext(r.Context(), "healthz")
 	w.WriteHeader(http.StatusOK)
@@ -273,7 +295,11 @@ func webhookClientIP(r *http.Request) string {
 	return host
 }
 
-func writeJSON(w http.ResponseWriter, payload capacityResponse) {
+type jsonResponse interface {
+	capacityResponse | statusResponse
+}
+
+func writeJSON[T jsonResponse](w http.ResponseWriter, payload T) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		slog.Error("marshal failed", "err", err)

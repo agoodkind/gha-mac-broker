@@ -197,6 +197,38 @@ func (g *fakeGitHub) SetRunners(repo string, runners []ghapp.Runner) {
 	g.runners[repo] = append([]ghapp.Runner(nil), runners...)
 }
 
+type fakeActiveJobProber struct {
+	mu       sync.Mutex
+	active   map[string]bool
+	calls    []string
+	probeErr error
+}
+
+func newFakeActiveJobProber(active map[string]bool) *fakeActiveJobProber {
+	return &fakeActiveJobProber{
+		mu:       sync.Mutex{},
+		active:   active,
+		calls:    nil,
+		probeErr: nil,
+	}
+}
+
+func (p *fakeActiveJobProber) HasActiveJob(_ context.Context, vm *broker.WarmVM) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, vm.Name)
+	if p.probeErr != nil {
+		return false, p.probeErr
+	}
+	return p.active[vm.Name], nil
+}
+
+func (p *fakeActiveJobProber) Calls() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.calls...)
+}
+
 type mutableClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -273,11 +305,95 @@ func startTestPool(t *testing.T, pool *Pool) context.Context {
 	return ctx
 }
 
+func TestStatusReportsWorkerViewsAndActiveJob(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	warmer := newFakeWarmer()
+	runner := newBlockingRunner(1)
+	github := newFakeGitHub()
+	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
+	pool := New(testOptions(clock, 2), warmer, runner, github, prober)
+
+	pool.mu.Lock()
+	pool.started = true
+	pool.states[0] = workerState{
+		vm:        &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+		bornAt:    now.Add(-time.Hour),
+		idleSince: time.Time{},
+		warming:   false,
+		busy:      true,
+		recycle:   false,
+		boundAt:   now.Add(-2 * time.Minute),
+		runID:     42,
+		lastErr:   nil,
+	}
+	pool.states[1] = workerState{
+		vm:        &broker.WarmVM{Name: "vm-idle", Image: "image-a"},
+		bornAt:    now.Add(-time.Hour),
+		idleSince: now.Add(-time.Minute),
+		warming:   false,
+		busy:      false,
+		recycle:   false,
+		boundAt:   time.Time{},
+		runID:     0,
+		lastErr:   nil,
+	}
+	pool.mu.Unlock()
+
+	snapshot, workers := pool.Status(context.Background())
+
+	if snapshot.Busy != 1 {
+		t.Fatalf("snapshot busy = %d, want 1", snapshot.Busy)
+	}
+	if snapshot.Idle != 1 {
+		t.Fatalf("snapshot idle = %d, want 1", snapshot.Idle)
+	}
+	if len(workers) != 2 {
+		t.Fatalf("workers = %+v, want 2 workers", workers)
+	}
+	busy := workers[0]
+	if busy.Index != 0 {
+		t.Fatalf("busy index = %d, want 0", busy.Index)
+	}
+	if busy.VM != "vm-busy" {
+		t.Fatalf("busy vm = %q, want vm-busy", busy.VM)
+	}
+	if busy.Phase != "busy" {
+		t.Fatalf("busy phase = %q, want busy", busy.Phase)
+	}
+	if busy.RunID != 42 {
+		t.Fatalf("busy run id = %d, want 42", busy.RunID)
+	}
+	if busy.BindAgeSeconds != 120 {
+		t.Fatalf("busy bind age seconds = %d, want 120", busy.BindAgeSeconds)
+	}
+	if busy.ActiveJob == nil {
+		t.Fatal("busy active job = nil, want false")
+	}
+	if *busy.ActiveJob {
+		t.Fatal("busy active job = true, want false")
+	}
+	idle := workers[1]
+	if idle.Phase != "idle" {
+		t.Fatalf("idle phase = %q, want idle", idle.Phase)
+	}
+	if idle.ActiveJob != nil {
+		t.Fatalf("idle active job = %v, want nil", *idle.ActiveJob)
+	}
+	if idle.BindAgeSeconds != 0 {
+		t.Fatalf("idle bind age seconds = %d, want 0", idle.BindAgeSeconds)
+	}
+	calls := prober.Calls()
+	if len(calls) != 1 || calls[0] != "vm-busy" {
+		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
+	}
+}
+
 func TestWorkerReusesWarmVMAcrossJobs(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	warmer := newFakeWarmer()
 	runner := newFakeRunner(2)
-	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub())
+	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
 	ctx := startTestPool(t, pool)
 	waitFor(t, pool.Ready)
 
@@ -307,7 +423,7 @@ func TestQueueIsFIFOForSingleWorker(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	warmer := newFakeWarmer()
 	runner := newFakeRunner(3)
-	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub())
+	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
 	ctx := startTestPool(t, pool)
 	waitFor(t, pool.Ready)
 
@@ -334,7 +450,7 @@ func TestConcurrentWorkersDoNotDoubleServeJobs(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	warmer := newFakeWarmer()
 	runner := newBlockingRunner(8)
-	pool := New(testOptions(clock, 3), warmer, runner, newFakeGitHub())
+	pool := New(testOptions(clock, 3), warmer, runner, newFakeGitHub(), nil)
 	ctx := startTestPool(t, pool)
 	waitFor(t, pool.Ready)
 
@@ -382,7 +498,7 @@ func TestReconcileRecyclesIdleVMByMaxIdle(t *testing.T) {
 	runner := newFakeRunner(1)
 	options := testOptions(clock, 1)
 	options.MaxIdle = time.Minute
-	pool := New(options, warmer, runner, newFakeGitHub())
+	pool := New(options, warmer, runner, newFakeGitHub(), nil)
 	ctx := startTestPool(t, pool)
 	waitFor(t, pool.Ready)
 	firstVM := warmer.WarmNames()[0]
@@ -404,7 +520,7 @@ func TestReconcileReplacesIdleVMOnHealthFailure(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	warmer := newFakeWarmer()
 	runner := newFakeRunner(1)
-	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub())
+	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
 	ctx := startTestPool(t, pool)
 	waitFor(t, pool.Ready)
 	firstVM := warmer.WarmNames()[0]
@@ -427,7 +543,7 @@ func TestReconcileReplacesIdleVMWithStaleGitHubRunner(t *testing.T) {
 	warmer := newFakeWarmer()
 	runner := newFakeRunner(1)
 	github := newFakeGitHub()
-	pool := New(testOptions(clock, 1), warmer, runner, github)
+	pool := New(testOptions(clock, 1), warmer, runner, github, nil)
 	ctx := startTestPool(t, pool)
 	waitFor(t, pool.Ready)
 	firstVM := warmer.WarmNames()[0]
@@ -449,7 +565,7 @@ func TestShutdownTearsDownAllWorkerVMs(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	warmer := newFakeWarmer()
 	runner := newFakeRunner(1)
-	pool := New(testOptions(clock, 3), warmer, runner, newFakeGitHub())
+	pool := New(testOptions(clock, 3), warmer, runner, newFakeGitHub(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool.Start(ctx)

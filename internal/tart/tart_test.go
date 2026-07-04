@@ -1,8 +1,11 @@
 package tart
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -65,6 +68,30 @@ func TestExecArgsAndExitCode(t *testing.T) {
 
 	if _, err := tt.Exec(context.Background(), "warm-1", "false"); err == nil {
 		t.Error("Exec should surface a non-zero guest exit code as an error")
+	}
+}
+
+func TestExecTeeWritesOutputToSink(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	script := "#!/usr/bin/env bash\nprintf 'stdout-line\\n'\nprintf 'stderr-line\\n' >&2\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+	tt := New(bin)
+	var sink bytes.Buffer
+
+	out, err := tt.ExecTee(context.Background(), "warm-1", &sink, "bash", "-lc", "echo ignored")
+	if err != nil {
+		t.Fatalf("ExecTee: %v", err)
+	}
+	for _, want := range []string{"stdout-line", "stderr-line"} {
+		if !strings.Contains(sink.String(), want) {
+			t.Fatalf("sink = %q, want %q", sink.String(), want)
+		}
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("out = %q, want %q", out, want)
+		}
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os/exec"
 	"strings"
@@ -45,6 +46,22 @@ func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", strings.Join(args, " "))
+		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out.String()))
+	}
+	return out.Bytes(), nil
+}
+
+func execRunnerTee(ctx context.Context, bin string, sink io.Writer, args ...string) ([]byte, error) {
+	cmd := command(ctx, bin, args...)
+	var out bytes.Buffer
+	writer := io.Writer(&out)
+	if sink != nil {
+		writer = io.MultiWriter(&out, sink)
+	}
+	cmd.Stdout = writer
+	cmd.Stderr = writer
 	if err := cmd.Run(); err != nil {
 		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", strings.Join(args, " "))
 		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out.String()))
@@ -94,6 +111,13 @@ func (t *Tart) Clone(ctx context.Context, source, name string, insecure bool) er
 func (t *Tart) Exec(ctx context.Context, name string, argv ...string) ([]byte, error) {
 	args := append([]string{"exec", name}, argv...)
 	return t.run(ctx, t.bin, args...)
+}
+
+// ExecTee runs a guest command and mirrors combined output to sink while it is
+// produced. It still returns the buffered combined output when the command exits.
+func (t *Tart) ExecTee(ctx context.Context, name string, sink io.Writer, argv ...string) ([]byte, error) {
+	args := append([]string{"exec", name}, argv...)
+	return execRunnerTee(ctx, t.bin, sink, args...)
 }
 
 // Stop gracefully stops a running VM.

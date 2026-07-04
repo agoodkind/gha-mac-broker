@@ -4,7 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -29,6 +34,12 @@ func (c *staleRunnerClient) ListRunners(_ context.Context, _ string) ([]ghapp.Ru
 func (c *staleRunnerClient) DeleteRunner(_ context.Context, _ string, runnerID int64) error {
 	c.deleted = append(c.deleted, runnerID)
 	return nil
+}
+
+type roundTripFunc func(req *http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func testServeConfig() *config.Config {
@@ -56,6 +67,67 @@ func testServeConfig() *config.Config {
 		},
 		Labels:       []string{"self-hosted", "macOS"},
 		AllowedRepos: []string{"owner/repo"},
+	}
+}
+
+func TestRunStatusUsesCapacityTokenAndListenPort(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "capacity-token")
+	if err := os.WriteFile(tokenPath, []byte("status-token\n"), 0o600); err != nil {
+		t.Fatalf("write capacity token: %v", err)
+	}
+	configPath := filepath.Join(dir, "config.toml")
+	configBody := fmt.Sprintf(`
+listen_addr = "[::1]:23456"
+runner_count = 1
+labels = ["self-hosted"]
+allowed_repos = ["owner/repo"]
+
+[app]
+app_id = "1"
+private_key_path = "/tmp/private-key.pem"
+webhook_secret_path = "/tmp/webhook-secret"
+capacity_token_path = %q
+
+[tart]
+base_image = %q
+`, tokenPath, config.DefaultBaseImage)
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var capturedRequest *http.Request
+	oldClient := statusHTTPClient
+	statusHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			capturedRequest = req
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"snapshot":{"ready":true},"workers":[]}`)),
+			}, nil
+		}),
+	}
+	t.Cleanup(func() {
+		statusHTTPClient = oldClient
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runStatusWithWriters(context.Background(), []string{"-config", configPath}, &stdout, &stderr); err != nil {
+		t.Fatalf("runStatusWithWriters: %v\nstderr=%s", err, stderr.String())
+	}
+	if capturedRequest == nil {
+		t.Fatal("status request was not sent")
+	}
+	if capturedRequest.URL.String() != "http://[::1]:23456/status" {
+		t.Fatalf("status url = %q, want http://[::1]:23456/status", capturedRequest.URL.String())
+	}
+	if capturedRequest.Header.Get("Authorization") != "Bearer status-token" {
+		t.Fatalf("authorization = %q, want bearer token", capturedRequest.Header.Get("Authorization"))
+	}
+	if !strings.Contains(stdout.String(), `"workers":[]`) {
+		t.Fatalf("stdout = %q, want status JSON", stdout.String())
 	}
 }
 

@@ -42,12 +42,23 @@ type Options struct {
 
 // Snapshot is a concurrency-safe view of pool readiness and backlog.
 type Snapshot struct {
-	RunnerCount int
-	Idle        int
-	Busy        int
-	Queued      int
-	Healthy     bool
-	Ready       bool
+	RunnerCount int  `json:"runner_count"`
+	Idle        int  `json:"idle"`
+	Busy        int  `json:"busy"`
+	Queued      int  `json:"queued"`
+	Healthy     bool `json:"healthy"`
+	Ready       bool `json:"ready"`
+}
+
+// WorkerView is a concurrency-safe per-worker status row.
+type WorkerView struct {
+	Index          int    `json:"index"`
+	VM             string `json:"vm"`
+	Phase          string `json:"phase"`
+	RunID          int64  `json:"run_id"`
+	BindAgeSeconds int64  `json:"bind_age_seconds"`
+	ActiveJob      *bool  `json:"active_job"`
+	LastError      string `json:"last_error"`
 }
 
 // Warmer creates, probes, and tears down warm VMs. *broker.Binder satisfies
@@ -65,6 +76,11 @@ type Runner interface {
 	RunJob(ctx context.Context, vm *broker.WarmVM, repo string, runnerName string) error
 }
 
+// ActiveJobProber checks whether a busy worker VM is running a job process.
+type ActiveJobProber interface {
+	HasActiveJob(ctx context.Context, vm *broker.WarmVM) (bool, error)
+}
+
 // RunnerLister lists GitHub runners for idle VM health checks.
 type RunnerLister interface {
 	ListRunners(ctx context.Context, repo string) ([]ghapp.Runner, error)
@@ -74,9 +90,11 @@ type workerState struct {
 	vm        *broker.WarmVM
 	bornAt    time.Time
 	idleSince time.Time
+	boundAt   time.Time
 	warming   bool
 	busy      bool
 	recycle   bool
+	runID     int64
 	lastErr   error
 }
 
@@ -86,6 +104,7 @@ type Pool struct {
 	warmer  Warmer
 	runner  Runner
 	github  RunnerLister
+	prober  ActiveJobProber
 
 	mu           sync.Mutex
 	cond         *sync.Cond
@@ -103,13 +122,14 @@ type Pool struct {
 }
 
 // New builds a persistent worker pool.
-func New(options Options, warmer Warmer, runner Runner, github RunnerLister) *Pool {
+func New(options Options, warmer Warmer, runner Runner, github RunnerLister, prober ActiveJobProber) *Pool {
 	options = normalizeOptions(options)
 	pool := &Pool{
 		options:      options,
 		warmer:       warmer,
 		runner:       runner,
 		github:       github,
+		prober:       prober,
 		mu:           sync.Mutex{},
 		cond:         nil,
 		queue:        nil,
@@ -222,6 +242,88 @@ func (p *Pool) Snapshot() Snapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.snapshotLocked()
+}
+
+type statusProbeTarget struct {
+	viewIndex int
+	vm        *broker.WarmVM
+}
+
+// Status returns a pool snapshot plus per-worker views. Active-job probes run
+// after the pool lock is released so a slow guest probe cannot block workers.
+func (p *Pool) Status(ctx context.Context) (Snapshot, []WorkerView) {
+	p.mu.Lock()
+	snapshot := p.snapshotLocked()
+	now := p.options.Now()
+	views := make([]WorkerView, 0, len(p.states))
+	probeTargets := make([]statusProbeTarget, 0, len(p.states))
+	for index, state := range p.states {
+		view := workerView(index, state, now)
+		views = append(views, view)
+		if p.prober != nil && state.busy && state.vm != nil {
+			probeTargets = append(probeTargets, statusProbeTarget{
+				viewIndex: index,
+				vm:        state.vm,
+			})
+		}
+	}
+	prober := p.prober
+	p.mu.Unlock()
+
+	if prober == nil {
+		return snapshot, views
+	}
+	for _, target := range probeTargets {
+		active, err := prober.HasActiveJob(ctx, target.vm)
+		if err != nil {
+			slog.WarnContext(ctx, "runnerpool active job probe failed", "err", err, "vm", target.vm.Name)
+			continue
+		}
+		activeJob := active
+		views[target.viewIndex].ActiveJob = &activeJob
+	}
+	return snapshot, views
+}
+
+func workerView(index int, state workerState, now time.Time) WorkerView {
+	view := WorkerView{
+		Index:          index,
+		VM:             "",
+		Phase:          workerPhase(state),
+		RunID:          state.runID,
+		BindAgeSeconds: 0,
+		ActiveJob:      nil,
+		LastError:      "",
+	}
+	if state.vm != nil {
+		view.VM = state.vm.Name
+	}
+	if state.busy && !state.boundAt.IsZero() {
+		bindAge := now.Sub(state.boundAt)
+		if bindAge > 0 {
+			view.BindAgeSeconds = int64(bindAge.Seconds())
+		}
+	}
+	if state.lastErr != nil {
+		view.LastError = state.lastErr.Error()
+	}
+	return view
+}
+
+func workerPhase(state workerState) string {
+	if state.recycle {
+		return "recycle"
+	}
+	if state.warming {
+		return "warming"
+	}
+	if state.vm == nil {
+		return "empty"
+	}
+	if state.busy {
+		return "busy"
+	}
+	return "idle"
 }
 
 func (p *Pool) snapshotLocked() Snapshot {
@@ -446,9 +548,12 @@ func (p *Pool) markWarming(index int) {
 	defer p.mu.Unlock()
 	state := &p.states[index]
 	state.vm = nil
+	state.idleSince = time.Time{}
+	state.boundAt = time.Time{}
 	state.warming = true
 	state.busy = false
 	state.recycle = false
+	state.runID = 0
 	p.cond.Broadcast()
 }
 
@@ -458,6 +563,8 @@ func (p *Pool) markWarmError(index int, err error) {
 	state := &p.states[index]
 	state.lastErr = err
 	state.warming = false
+	state.boundAt = time.Time{}
+	state.runID = 0
 	p.cond.Broadcast()
 }
 
@@ -468,8 +575,10 @@ func (p *Pool) waitForJobOrRecycle(ctx context.Context, index int, vm *broker.Wa
 	state.vm = vm
 	state.bornAt = bornAt
 	state.idleSince = p.options.Now()
+	state.boundAt = time.Time{}
 	state.warming = false
 	state.busy = false
+	state.runID = 0
 	state.lastErr = nil
 	p.cond.Broadcast()
 	for {
@@ -480,6 +589,9 @@ func (p *Pool) waitForJobOrRecycle(ctx context.Context, index int, vm *broker.Wa
 			state.vm = nil
 			state.recycle = false
 			state.warming = true
+			state.idleSince = time.Time{}
+			state.boundAt = time.Time{}
+			state.runID = 0
 			p.cond.Broadcast()
 			return Job{Repo: "", JobID: 0, RunID: 0}, true, true
 		}
@@ -492,6 +604,8 @@ func (p *Pool) waitForJobOrRecycle(ctx context.Context, index int, vm *broker.Wa
 			p.queue = p.queue[1:]
 			state.busy = true
 			state.idleSince = time.Time{}
+			state.boundAt = p.options.Now()
+			state.runID = job.RunID
 			p.cond.Broadcast()
 			return job, false, true
 		}
@@ -504,6 +618,8 @@ func (p *Pool) finishJob(index int) {
 	defer p.mu.Unlock()
 	state := &p.states[index]
 	state.busy = false
+	state.boundAt = time.Time{}
+	state.runID = 0
 	p.cond.Broadcast()
 }
 
@@ -514,9 +630,11 @@ func (p *Pool) clearWorker(index int) {
 		vm:        nil,
 		bornAt:    time.Time{},
 		idleSince: time.Time{},
+		boundAt:   time.Time{},
 		warming:   false,
 		busy:      false,
 		recycle:   false,
+		runID:     0,
 		lastErr:   nil,
 	}
 	p.cond.Broadcast()

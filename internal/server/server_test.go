@@ -23,6 +23,8 @@ type testPool struct {
 	ready      bool
 	enqueueErr error
 	enqueued   []runnerpool.Job
+	snapshot   runnerpool.Snapshot
+	workers    []runnerpool.WorkerView
 }
 
 func (p *testPool) Enqueue(_ context.Context, job runnerpool.Job) error {
@@ -39,6 +41,12 @@ func (p *testPool) Ready() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.ready
+}
+
+func (p *testPool) Status(_ context.Context) (runnerpool.Snapshot, []runnerpool.WorkerView) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.snapshot, append([]runnerpool.WorkerView(nil), p.workers...)
 }
 
 func (p *testPool) Jobs() []runnerpool.Job {
@@ -349,6 +357,77 @@ func TestCapacityEmptyTokenAlwaysReturns401(t *testing.T) {
 	srv.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 when server has no token configured, got %d", w.Code)
+	}
+}
+
+func TestStatusRequiresBearerTokenAndReturnsPoolViews(t *testing.T) {
+	activeJob := false
+	pool := &testPool{
+		ready: true,
+		snapshot: runnerpool.Snapshot{
+			RunnerCount: 2,
+			Idle:        1,
+			Busy:        1,
+			Queued:      0,
+			Healthy:     true,
+			Ready:       true,
+		},
+		workers: []runnerpool.WorkerView{
+			{
+				Index:          0,
+				VM:             "vm-busy",
+				Phase:          "busy",
+				RunID:          42,
+				BindAgeSeconds: 120,
+				ActiveJob:      &activeJob,
+				LastError:      "",
+			},
+			{
+				Index:          1,
+				VM:             "vm-idle",
+				Phase:          "idle",
+				RunID:          0,
+				BindAgeSeconds: 0,
+				ActiveJob:      nil,
+				LastError:      "",
+			},
+		},
+	}
+	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, pool)
+
+	unauthorizedReq := httptest.NewRequest(http.MethodGet, "/status", nil)
+	unauthorizedRecorder := httptest.NewRecorder()
+	srv.ServeHTTP(unauthorizedRecorder, unauthorizedReq)
+	if unauthorizedRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status without token = %d, want 401", unauthorizedRecorder.Code)
+	}
+
+	authorizedReq := httptest.NewRequest(http.MethodGet, "/status", nil)
+	authorizedReq.Header.Set("Authorization", "Bearer test-capacity-token")
+	authorizedRecorder := httptest.NewRecorder()
+	srv.ServeHTTP(authorizedRecorder, authorizedReq)
+	if authorizedRecorder.Code != http.StatusOK {
+		t.Fatalf("status with token = %d, want 200", authorizedRecorder.Code)
+	}
+
+	var resp statusResponse
+	if err := json.Unmarshal(authorizedRecorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal status response: %v", err)
+	}
+	if resp.Snapshot.Busy != 1 {
+		t.Fatalf("status busy = %d, want 1", resp.Snapshot.Busy)
+	}
+	if len(resp.Workers) != 2 {
+		t.Fatalf("status workers = %+v, want 2 workers", resp.Workers)
+	}
+	if resp.Workers[0].Phase != "busy" {
+		t.Fatalf("status worker phase = %q, want busy", resp.Workers[0].Phase)
+	}
+	if resp.Workers[0].ActiveJob == nil {
+		t.Fatal("status worker active job = nil, want false")
+	}
+	if *resp.Workers[0].ActiveJob {
+		t.Fatal("status worker active job = true, want false")
 	}
 }
 
