@@ -40,7 +40,7 @@ import (
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/install"
-	"goodkind.io/gha-mac-broker/internal/pool"
+	"goodkind.io/gha-mac-broker/internal/runnerpool"
 	"goodkind.io/gha-mac-broker/internal/server"
 	"goodkind.io/gha-mac-broker/internal/skopeo"
 	"goodkind.io/gha-mac-broker/internal/tart"
@@ -623,24 +623,16 @@ func runServe(ctx context.Context, args []string) error {
 	v := tart.New(cfg.Tart.Binary)
 	binder := broker.New(cfg, gh, v)
 
-	// runToken is embedded in every VM name so names stay readable yet never
-	// repeat across restarts or collide between overlapping processes. It pairs
-	// a compact timestamp (readable, sortable) with random entropy so two
-	// processes that start within the same second still get distinct names.
-	// Generated here at the main boundary where time.Now is permitted.
-	var entropy [3]byte
-	if _, err := rand.Read(entropy[:]); err != nil {
-		slog.ErrorContext(ctx, "generate run token entropy failed", "err", err)
-		return fmt.Errorf("serve: generate run token entropy: %w", err)
+	p, err := newRunnerPool(ctx, cfg, binder, gh)
+	if err != nil {
+		return err
 	}
-	runToken := time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:])
-	p := pool.New(cfg.Tart.WarmBudget, cfg.Tart.GoldenBudget, binder, runToken)
-	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, binder, server.WithRunCanceller(gh), server.WithClock(time.Now))
+	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	startServeLoops(ctx, stop, cfg, gh, p, srv)
+	startServeLoops(ctx, stop, cfg, gh, binder, p)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -686,12 +678,47 @@ func runServe(ctx context.Context, args []string) error {
 	return nil
 }
 
-func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, p *pool.Pool, srv *server.Server) {
+type runnerPoolBinder interface {
+	runnerpool.Warmer
+	runnerpool.Runner
+}
+
+type orphanSweeper interface {
+	SweepOrphans(ctx context.Context)
+}
+
+func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBinder, github runnerpool.RunnerLister) (*runnerpool.Pool, error) {
+	runToken, err := newRunToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return runnerpool.New(runnerpool.Options{
+		RunnerCount:    cfg.RunnerCount,
+		Image:          cfg.Tart.BaseImage,
+		MaxIdle:        time.Duration(cfg.MaxIdle),
+		MaxAge:         time.Duration(cfg.MaxAge),
+		RunToken:       runToken,
+		AllowedRepos:   cfg.AllowedRepos,
+		WarmRetryDelay: 0,
+		Now:            time.Now,
+	}, binder, binder, github), nil
+}
+
+func newRunToken(ctx context.Context) (string, error) {
+	var entropy [3]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		slog.ErrorContext(ctx, "generate run token entropy failed", "err", err)
+		return "", fmt.Errorf("serve: generate run token entropy: %w", err)
+	}
+	return time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:]), nil
+}
+
+func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, sweeper orphanSweeper, p *runnerpool.Pool) {
 	startUpdateSchedulerInBackground(ctx, stop, slog.Default())
 	deleteStaleRunners(ctx, cfg, cleaner)
+	sweeper.SweepOrphans(ctx)
 	p.Start(ctx)
 	p.StartReconcile(ctx, 0)
-	srv.StartDeliverySweeper(ctx)
 }
 
 func startUpdateSchedulerInBackground(ctx context.Context, stop func(), log *slog.Logger) {

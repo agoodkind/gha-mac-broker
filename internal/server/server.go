@@ -1,5 +1,5 @@
-// Package server wires the pool and broker binder into HTTP handlers for the
-// webhook, capacity, and health endpoints.
+// Package server wires the runner pool into HTTP handlers for the webhook,
+// capacity, and health endpoints.
 package server
 
 import (
@@ -9,45 +9,22 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
-	"time"
 
-	"goodkind.io/gha-mac-broker/internal/broker"
 	"goodkind.io/gha-mac-broker/internal/config"
+	"goodkind.io/gha-mac-broker/internal/runnerpool"
 )
 
-// maxBodyBytes caps how much of a webhook body is read into memory.
 const maxBodyBytes = 1 << 20
 
-// servingDeadline is a stuck-pool backstop for undelivered pool jobs. It stays
-// above normal drain time; swift-makefile's pool-watchdog is the faster
-// external backstop for jobs that stop making progress.
-const servingDeadline = 45 * time.Minute
-
-// deliverySweepInterval is the periodic cancellation sweep cadence.
-const deliverySweepInterval = 30 * time.Second
-
-// pooler is the subset of pool.Pool used by the server.
+// pooler is the subset of runnerpool.Pool used by the server.
 type pooler interface {
-	Lease(ctx context.Context, image string) (*broker.WarmVM, error)
-	FreeSlots() int
-	Recycle(ctx context.Context, vm *broker.WarmVM)
-}
-
-// jobRunner is the subset of broker.Binder used by the server.
-type jobRunner interface {
-	RunJob(ctx context.Context, vm *broker.WarmVM, repo, runnerName string) error
-}
-
-// runCanceller is the subset of ghapp.Client used by the delivery sweeper.
-type runCanceller interface {
-	CancelRun(ctx context.Context, repo string, runID int64) error
+	Enqueue(ctx context.Context, job runnerpool.Job) error
+	Ready() bool
 }
 
 type webhookAction string
@@ -58,36 +35,16 @@ const (
 	webhookActionCompleted  webhookAction = "completed"
 )
 
-// Option configures optional server collaborators.
-type Option func(*Server)
-
-// WithClock overrides the server clock used for delivery deadlines.
-func WithClock(now func() time.Time) Option {
-	return func(s *Server) {
-		s.now = now
-	}
-}
-
-// WithRunCanceller enables delivery-deadline workflow-run cancellation.
-func WithRunCanceller(canceller runCanceller) Option {
-	return func(s *Server) {
-		s.canceller = canceller
-	}
-}
-
-// webhookPayload is the relevant subset of a GitHub workflow_job webhook body.
 type webhookPayload struct {
 	Action      webhookAction   `json:"action"`
 	Repository  webhookRepo     `json:"repository"`
 	WorkflowJob webhookJobField `json:"workflow_job"`
 }
 
-// webhookRepo holds the repository name from the webhook payload.
 type webhookRepo struct {
 	FullName string `json:"full_name"`
 }
 
-// webhookJobField holds the labels and run id from the workflow_job field.
 type webhookJobField struct {
 	ID         int64    `json:"id"`
 	Labels     []string `json:"labels"`
@@ -98,7 +55,6 @@ type webhookJobField struct {
 	RunnerID   int64    `json:"runner_id"`
 }
 
-// capacityResponse is the JSON body returned by GET /capacity.
 type capacityResponse struct {
 	Available bool `json:"available"`
 }
@@ -111,18 +67,10 @@ type Server struct {
 	webhookCIDRs  []*net.IPNet
 	cfg           *config.Config
 	pool          pooler
-	binder        jobRunner
-	canceller     runCanceller
-	now           func() time.Time
-	pendingMu     sync.Mutex
-	pending       map[pendingKey]pendingDelivery
 }
 
 // New builds a Server and registers its routes on an internal mux.
-// capacityToken is the bearer token required on GET /capacity; a nil or empty
-// token closes the endpoint (401 fail-safe). webhookCIDRs is the IP allowlist
-// for POST /webhook; a nil or empty slice disables the IP guard.
-func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler, binder jobRunner, opts ...Option) *Server {
+func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler) *Server {
 	s := &Server{
 		mux:           http.NewServeMux(),
 		secret:        secret,
@@ -130,14 +78,6 @@ func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs [
 		webhookCIDRs:  webhookCIDRs,
 		cfg:           cfg,
 		pool:          p,
-		binder:        binder,
-		canceller:     nil,
-		now:           time.Now,
-		pendingMu:     sync.Mutex{},
-		pending:       make(map[pendingKey]pendingDelivery),
-	}
-	for _, opt := range opts {
-		opt(s)
 	}
 	s.mux.HandleFunc("/webhook", s.handleWebhook)
 	s.mux.HandleFunc("/capacity", s.handleCapacity)
@@ -154,35 +94,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// StartDeliverySweeper launches the cancellation loop for overdue pool-routed
-// workflow runs. It is a no-op when no run canceller is configured.
-func (s *Server) StartDeliverySweeper(ctx context.Context) {
-	if s.canceller == nil {
-		slog.WarnContext(ctx, "delivery sweeper disabled: no run canceller configured")
-		return
-	}
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "delivery sweeper panic recovered", "err", fmt.Errorf("panic: %v", r))
-			}
-		}()
-		ticker := time.NewTicker(deliverySweepInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				s.sweepPendingDeliveries(ctx)
-			}
-		}
-	}()
-}
-
-// handleWebhook processes GitHub workflow_job webhook deliveries. It verifies
-// the HMAC-SHA256 signature, branches on the workflow_job action, dispatches
-// queued pool jobs, and records in_progress delivery confirmations.
+// handleWebhook processes GitHub workflow_job webhook deliveries.
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -206,7 +118,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	case webhookActionQueued:
 		s.dispatchJob(w, r, payload)
 	case webhookActionInProgress:
-		s.handleJobInProgress(r.Context(), payload)
+		slog.DebugContext(r.Context(), "workflow job in progress", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "runner", payload.WorkflowJob.RunnerName, "runner_id", payload.WorkflowJob.RunnerID)
 		w.WriteHeader(http.StatusNoContent)
 	case webhookActionCompleted:
 		slog.DebugContext(r.Context(), "workflow job completed", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "status", payload.WorkflowJob.Status, "conclusion", payload.WorkflowJob.Conclusion)
@@ -216,9 +128,6 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// readVerifiedBody reads the request body up to maxBodyBytes and verifies the
-// X-Hub-Signature-256 HMAC. It writes an error response and returns false on
-// any failure.
 func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
 	if err != nil {
@@ -235,10 +144,6 @@ func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byt
 	return body, true
 }
 
-// dispatchJob checks the repo allowlist and label set for a queued job. It
-// records pool-routed jobs before serving so busy slots can drain them later.
-// It responds 202 when a job is accepted for immediate or deferred serving and
-// 204 when the job is ignored.
 func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload webhookPayload) {
 	ctx := r.Context()
 	repo := payload.Repository.FullName
@@ -252,225 +157,24 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload web
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-
-	// The capacity check is a read-only probe that holds no reservation, so the
-	// broker resolves the image from config at serve time. With a single golden
-	// this is always the default image.
 	if _, resolved := s.cfg.ResolveImage("", ""); !resolved {
 		slog.WarnContext(ctx, "no default image configured; ignoring pool job", "repo", repo, "run_id", payload.WorkflowJob.RunID)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	// Record the job, then drain: serveNextPending claims and serves this job (or
-	// an earlier waiting one) when a warm slot is free, else it stays queued for
-	// a later Recycle to drain. Either way the webhook is accepted.
-	s.recordPendingDelivery(repo, payload.WorkflowJob.ID, payload.WorkflowJob.RunID)
-	s.serveNextPending(ctx)
+	job := runnerpool.Job{
+		Repo:  repo,
+		JobID: payload.WorkflowJob.ID,
+		RunID: payload.WorkflowJob.RunID,
+	}
+	if err := s.pool.Enqueue(ctx, job); err != nil {
+		slog.WarnContext(ctx, "runner pool enqueue failed", "err", err, "repo", repo, "run_id", payload.WorkflowJob.RunID, "job_id", payload.WorkflowJob.ID)
+		http.Error(w, "pool unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// serve leases a warm slot and runs the pool job for a claimed pending entry.
-// It returns false when the pool has no free slot, leaving the entry for a later
-// drain. On success the RunJob goroutine recycles the VM, releases the claim if
-// the gate never went in progress, and drains the next pending job.
-func (s *Server) serve(ctx context.Context, key pendingKey, repo, image string) bool {
-	// Lease on a detached context: an on-demand warm boots `tart run` as a
-	// CommandContext child, so tying it to the request context would kill the VM
-	// the instant this handler returns 202, before RunJob can exec into it.
-	jobCtx := context.WithoutCancel(ctx)
-	vm, err := s.pool.Lease(jobCtx, image)
-	if err != nil {
-		slog.InfoContext(ctx, "pool busy, deferring", "err", err, "repo", repo)
-		return false
-	}
-
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.ErrorContext(jobCtx, "job goroutine panic recovered", "err", fmt.Errorf("panic: %v", r), "vm", vm.Name)
-			}
-		}()
-		// Defers run in reverse order: recycle frees the slot, then release this
-		// claim if the gate never went in progress (a delivered gate was already
-		// removed by markDelivered, so the release is a no-op) so it can be
-		// re-drained, then drain the next pending job into the freed slot.
-		defer s.serveNextPending(jobCtx)
-		defer s.releasePending(key)
-		defer s.pool.Recycle(jobCtx, vm)
-		if err := s.binder.RunJob(jobCtx, vm, repo, vm.Name); err != nil {
-			slog.WarnContext(jobCtx, "job failed", "err", err, "vm", vm.Name, "repo", repo)
-		}
-	}()
-
-	return true
-}
-
-// serveNextPending claims the next undispatched pending job and serves it. The
-// claim is atomic, so concurrent drains never pick the same entry. A serve that
-// finds no free slot releases the claim so the next Recycle retries it.
-func (s *Server) serveNextPending(ctx context.Context) {
-	key, delivery, ok := s.claimNextPending()
-	if !ok {
-		return
-	}
-	image, resolved := s.cfg.ResolveImage("", "")
-	if !resolved {
-		s.releasePending(key)
-		slog.WarnContext(ctx, "no default image configured; pending pool job remains deferred", "repo", delivery.repo, "run_id", delivery.runID, "job_id", key.jobID)
-		return
-	}
-	if !s.serve(ctx, key, delivery.repo, image) {
-		s.releasePending(key)
-		slog.DebugContext(ctx, "pending pool job remains deferred", "repo", delivery.repo, "run_id", delivery.runID, "job_id", key.jobID)
-	}
-}
-
-// claimNextPending atomically selects the lowest-jobID undispatched pending
-// entry and marks it dispatched under the lock, so two concurrent drains cannot
-// pick the same entry and double-mint a runner for one queued job.
-func (s *Server) claimNextPending() (pendingKey, pendingDelivery, bool) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	var selectedKey pendingKey
-	var selectedDelivery pendingDelivery
-	found := false
-	for key, delivery := range s.pending {
-		if delivery.dispatched {
-			continue
-		}
-		if !found || key.jobID < selectedKey.jobID {
-			selectedKey = key
-			selectedDelivery = delivery
-			found = true
-		}
-	}
-	if !found {
-		return selectedKey, selectedDelivery, false
-	}
-	selectedDelivery.dispatched = true
-	s.pending[selectedKey] = selectedDelivery
-	return selectedKey, selectedDelivery, true
-}
-
-// releasePending clears the dispatched mark on a pending entry so a later drain
-// can retry it. It is a no-op when the entry was already delivered and removed.
-func (s *Server) releasePending(key pendingKey) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	if delivery, ok := s.pending[key]; ok {
-		delivery.dispatched = false
-		s.pending[key] = delivery
-	}
-}
-
-func (s *Server) handleJobInProgress(ctx context.Context, payload webhookPayload) {
-	repo := payload.Repository.FullName
-	if !s.cfg.RepoAllowed(repo) {
-		slog.DebugContext(ctx, "in_progress webhook ignored", "reason", "repo not allowed", "repo", repo)
-		return
-	}
-	s.markDelivered(repo, payload.WorkflowJob.ID, payload.WorkflowJob.RunnerName, payload.WorkflowJob.RunnerID)
-}
-
-type pendingKey struct {
-	jobID int64
-}
-
-type pendingDelivery struct {
-	repo     string
-	runID    int64
-	deadline time.Time
-	// dispatched is true once a drain has minted a runner for this entry, so a
-	// concurrent drain skips it. It is cleared if the serve fails or the gate
-	// never goes in progress, so the entry can be retried.
-	dispatched bool
-}
-
-type expiredDelivery struct {
-	key      pendingKey
-	delivery pendingDelivery
-}
-
-func (s *Server) recordPendingDelivery(repo string, jobID int64, runID int64) {
-	if jobID == 0 || runID == 0 {
-		return
-	}
-	key := pendingKey{jobID: jobID}
-	delivery := pendingDelivery{
-		repo:       repo,
-		runID:      runID,
-		deadline:   s.now().Add(servingDeadline),
-		dispatched: false,
-	}
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	if _, ok := s.pending[key]; ok {
-		return
-	}
-	s.pending[key] = delivery
-}
-
-func (s *Server) markDelivered(repo string, jobID int64, runnerName string, runnerID int64) {
-	if jobID == 0 || !s.isPoolRunner(runnerName) {
-		return
-	}
-	key := pendingKey{jobID: jobID}
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	delivery, ok := s.pending[key]
-	if !ok || delivery.repo != repo {
-		return
-	}
-	delete(s.pending, key)
-	slog.Info("workflow job delivered to pool runner", "repo", repo, "run_id", delivery.runID, "job_id", jobID, "runner", runnerName, "runner_id", runnerID)
-}
-
-func (s *Server) isPoolRunner(runnerName string) bool {
-	prefix := s.cfg.Tart.VMNamePrefix + "-"
-	return strings.HasPrefix(runnerName, prefix)
-}
-
-func (s *Server) sweepPendingDeliveries(ctx context.Context) {
-	if s.canceller == nil {
-		return
-	}
-	expired := s.expiredDeliveries()
-	for _, item := range expired {
-		if err := s.canceller.CancelRun(ctx, item.delivery.repo, item.delivery.runID); err != nil {
-			slog.ErrorContext(ctx, "cancel overdue workflow run failed", "err", err, "repo", item.delivery.repo, "run_id", item.delivery.runID, "reason", "serving deadline exceeded")
-			continue
-		}
-		slog.WarnContext(ctx, "cancelled overdue workflow run", "repo", item.delivery.repo, "run_id", item.delivery.runID, "reason", "serving deadline exceeded")
-		s.clearPendingDelivery(item.key)
-	}
-}
-
-func (s *Server) expiredDeliveries() []expiredDelivery {
-	now := s.now()
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	var expired []expiredDelivery
-	for key, delivery := range s.pending {
-		if now.Before(delivery.deadline) {
-			continue
-		}
-		expired = append(expired, expiredDelivery{key: key, delivery: delivery})
-	}
-	return expired
-}
-
-func (s *Server) clearPendingDelivery(key pendingKey) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	delete(s.pending, key)
-}
-
-// handleCapacity reports whether the pool has a free warm slot for a given repo
-// and requested image. It is a pure read: it holds nothing, so any number of
-// probes leaves pool state unchanged and can never strand a slot. The webhook
-// re-derives the image from config at serve time and Lease enforces the warm
-// budget, so a job that finds the slot taken between this check and its webhook
-// releases to hosted rather than overbooking.
 func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -491,21 +195,19 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, capacityResponse{Available: false})
 		return
 	}
-	writeJSON(w, capacityResponse{Available: s.pool.FreeSlots() > 0})
+	writeJSON(w, capacityResponse{Available: s.pool.Ready()})
 }
 
-// handleHealthz returns 200 "ok" so load balancers can probe liveness.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	slog.DebugContext(r.Context(), "healthz")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
 
-// hasLabel reports whether any of the job labels matches a broker label.
 func (s *Server) hasLabel(jobLabels []string) bool {
-	for _, jl := range jobLabels {
-		for _, sl := range s.cfg.Labels {
-			if strings.EqualFold(jl, sl) {
+	for _, jobLabel := range jobLabels {
+		for _, serverLabel := range s.cfg.Labels {
+			if strings.EqualFold(jobLabel, serverLabel) {
 				return true
 			}
 		}
@@ -513,10 +215,6 @@ func (s *Server) hasLabel(jobLabels []string) bool {
 	return false
 }
 
-// checkBearerToken verifies the Authorization: Bearer <token> header against
-// the server's configured capacity token using a constant-time compare. An
-// empty configured token always returns false (401 fail-safe): a server with
-// no token configured never opens /capacity by accident.
 func (s *Server) checkBearerToken(w http.ResponseWriter, r *http.Request) bool {
 	if len(s.capacityToken) == 0 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -536,10 +234,6 @@ func (s *Server) checkBearerToken(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// checkWebhookIP extracts the real client IP from the request and confirms it
-// falls within one of the configured webhook CIDRs. When the CIDR list is
-// empty the check is skipped (dev/local mode); New logs that once at startup.
-// Returns false and writes a 403 response when the IP is not allowed.
 func (s *Server) checkWebhookIP(w http.ResponseWriter, r *http.Request) bool {
 	if len(s.webhookCIDRs) == 0 {
 		return true
@@ -561,9 +255,6 @@ func (s *Server) checkWebhookIP(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-// webhookClientIP returns the best-effort real client IP for a webhook
-// request. It prefers the CF-Connecting-IP header set by cloudflared, then
-// True-Client-IP, and falls back to the TCP RemoteAddr host.
 func webhookClientIP(r *http.Request) string {
 	if ip := r.Header.Get("Cf-Connecting-Ip"); ip != "" {
 		return ip
@@ -578,7 +269,6 @@ func webhookClientIP(r *http.Request) string {
 	return host
 }
 
-// writeJSON marshals payload and writes it as an application/json 200 response.
 func writeJSON(w http.ResponseWriter, payload capacityResponse) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -591,9 +281,7 @@ func writeJSON(w http.ResponseWriter, payload capacityResponse) {
 	_, _ = w.Write(body)
 }
 
-// verifySignature reports whether the X-Hub-Signature-256 header value is a
-// valid HMAC-SHA256 of body under secret.
-func verifySignature(secret, body []byte, sigHeader string) bool {
+func verifySignature(secret []byte, body []byte, sigHeader string) bool {
 	const prefix = "sha256="
 	if !strings.HasPrefix(sigHeader, prefix) {
 		return false
