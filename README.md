@@ -90,6 +90,8 @@ gha-mac-broker serve -config /path/to/config.toml
 
 ## Architecture
 
+Runner pool details live in [docs/runnerpool/overview.md](docs/runnerpool/overview.md).
+
 `serve` runs a fixed persistent worker pool. Each worker owns one warm VM cloned
 from the golden and reuses it across many jobs. The webhook is the demand signal:
 a `workflow_job.queued` delivery for an allowed repo carrying a pool label is
