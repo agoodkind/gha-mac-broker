@@ -191,7 +191,11 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, capacityResponse{Available: false})
 		return
 	}
-	if _, ok := s.cfg.ResolveImage(macos, xcode); !ok {
+	// Available only when the requested image resolves to the exact image the
+	// pool is running. The pool warms every VM on cfg.Tart.BaseImage, so a
+	// mappable-but-different tag cannot be served and must route to hosted.
+	tag, ok := s.cfg.ResolveImage(macos, xcode)
+	if !ok || tag != s.cfg.Tart.BaseImage {
 		writeJSON(w, capacityResponse{Available: false})
 		return
 	}

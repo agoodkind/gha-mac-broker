@@ -478,8 +478,11 @@ func (p *Pool) waitForJobOrRecycle(ctx context.Context, index int, vm *broker.Wa
 		}
 		if len(p.queue) > 0 {
 			job := p.queue[0]
-			copy(p.queue, p.queue[1:])
-			p.queue = p.queue[:len(p.queue)-1]
+			// Advance the head and zero the removed slot so the dequeue is O(1)
+			// and the popped Job's references are not retained by the backing
+			// array.
+			p.queue[0] = Job{Repo: "", JobID: 0, RunID: 0}
+			p.queue = p.queue[1:]
 			state.busy = true
 			state.idleSince = time.Time{}
 			p.cond.Broadcast()
