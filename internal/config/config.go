@@ -25,8 +25,6 @@ const (
 	defaultWarmBudget   = 2
 	defaultGoldenBudget = 3
 	defaultRunnerCount  = 3
-	defaultMaxIdle      = Duration(2 * time.Hour)
-	defaultMaxAge       = Duration(24 * time.Hour)
 	cirrusImagePrefix   = "ghcr.io/cirruslabs/"
 	// defaultFastPullParallel is the skopeo layer-copy concurrency used when
 	// fast_pull_parallel is unset. ghcr throttles each connection, so more
@@ -42,10 +40,12 @@ type Config struct {
 	// RunnerCount is the number of persistent worker VMs kept warm.
 	RunnerCount int `toml:"runner_count"`
 
-	// MaxIdle is the idle age after which a worker VM is recycled.
+	// MaxIdle is the idle age after which a worker VM is recycled. Zero or unset
+	// disables idle recycling; the value is honored verbatim, not defaulted.
 	MaxIdle Duration `toml:"max_idle"`
 
-	// MaxAge is the total age after which a worker VM is recycled.
+	// MaxAge is the total age after which a worker VM is recycled. Zero or unset
+	// disables age recycling; the value is honored verbatim, not defaulted.
 	MaxAge Duration `toml:"max_age"`
 
 	// App identifies the GitHub App and where its private key lives.
@@ -184,12 +184,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RunnerCount == 0 {
 		c.RunnerCount = defaultRunnerCount
-	}
-	if c.MaxIdle == 0 {
-		c.MaxIdle = defaultMaxIdle
-	}
-	if c.MaxAge == 0 {
-		c.MaxAge = defaultMaxAge
 	}
 	if c.Tart.Binary == "" {
 		c.Tart.Binary = "tart"

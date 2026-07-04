@@ -39,11 +39,13 @@ private_key_path = "/tmp/key.pem"
 	if cfg.RunnerCount != 3 {
 		t.Errorf("default runner count = %d", cfg.RunnerCount)
 	}
-	if time.Duration(cfg.MaxIdle) != 2*time.Hour {
-		t.Errorf("default max idle = %s", time.Duration(cfg.MaxIdle))
+	// MaxIdle and MaxAge are honored verbatim, so an unset value stays zero and
+	// disables that recycle trigger rather than defaulting.
+	if time.Duration(cfg.MaxIdle) != 0 {
+		t.Errorf("unset max idle = %s, want 0 (disabled)", time.Duration(cfg.MaxIdle))
 	}
-	if time.Duration(cfg.MaxAge) != 24*time.Hour {
-		t.Errorf("default max age = %s", time.Duration(cfg.MaxAge))
+	if time.Duration(cfg.MaxAge) != 0 {
+		t.Errorf("unset max age = %s, want 0 (disabled)", time.Duration(cfg.MaxAge))
 	}
 	if cfg.Tart.WarmBudget != 2 {
 		t.Errorf("default warm budget = %d", cfg.Tart.WarmBudget)
