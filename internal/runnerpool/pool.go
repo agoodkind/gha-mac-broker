@@ -396,6 +396,7 @@ type busyCandidate struct {
 	index   int
 	vm      *broker.WarmVM
 	boundAt time.Time
+	runID   int64
 	now     time.Time
 }
 
@@ -404,7 +405,7 @@ func (p *Pool) reapBusyWorkers(ctx context.Context) {
 	for _, candidate := range candidates {
 		bindAge := candidate.now.Sub(candidate.boundAt)
 		if p.options.MaxBind > 0 && bindAge >= p.options.MaxBind {
-			p.requestBusyRecycle(candidate.index, candidate.vm)
+			p.requestBusyRecycle(candidate)
 			continue
 		}
 		if p.options.PickupTimeout <= 0 || bindAge < p.options.PickupTimeout {
@@ -419,7 +420,7 @@ func (p *Pool) reapBusyWorkers(ctx context.Context) {
 			continue
 		}
 		if !active {
-			p.requestBusyRecycle(candidate.index, candidate.vm)
+			p.requestBusyRecycle(candidate)
 		}
 	}
 }
@@ -437,6 +438,7 @@ func (p *Pool) busyCandidates() []busyCandidate {
 			index:   index,
 			vm:      state.vm,
 			boundAt: state.boundAt,
+			runID:   state.runID,
 			now:     now,
 		})
 	}
@@ -521,20 +523,27 @@ func (p *Pool) requestRecycle(index int, vm *broker.WarmVM, err error) {
 	p.cond.Broadcast()
 }
 
-func (p *Pool) requestBusyRecycle(index int, vm *broker.WarmVM) {
+func (p *Pool) requestBusyRecycle(candidate busyCandidate) {
+	var cancel context.CancelFunc
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	state := &p.states[index]
-	if state.vm == nil || state.vm.Name != vm.Name || !state.busy {
+	state := &p.states[candidate.index]
+	if state.vm == nil ||
+		state.vm.Name != candidate.vm.Name ||
+		!state.busy ||
+		state.recycle ||
+		state.runID != candidate.runID ||
+		!state.boundAt.Equal(candidate.boundAt) {
+		p.mu.Unlock()
 		return
 	}
 	state.recycle = true
-	cancel := state.jobCancel
+	cancel = state.jobCancel
 	state.jobCancel = nil
+	p.cond.Broadcast()
+	p.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	p.cond.Broadcast()
 }
 
 // CancelRun reaps the busy worker bound to runID, if one is still running.

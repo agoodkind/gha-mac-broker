@@ -202,6 +202,7 @@ type fakeActiveJobProber struct {
 	active   map[string]bool
 	calls    []string
 	probeErr error
+	onProbe  func()
 }
 
 func newFakeActiveJobProber(active map[string]bool) *fakeActiveJobProber {
@@ -210,6 +211,7 @@ func newFakeActiveJobProber(active map[string]bool) *fakeActiveJobProber {
 		active:   active,
 		calls:    nil,
 		probeErr: nil,
+		onProbe:  nil,
 	}
 }
 
@@ -219,6 +221,9 @@ func (p *fakeActiveJobProber) HasActiveJob(_ context.Context, vm *broker.WarmVM)
 	p.calls = append(p.calls, vm.Name)
 	if p.probeErr != nil {
 		return false, p.probeErr
+	}
+	if p.onProbe != nil {
+		p.onProbe()
 	}
 	return p.active[vm.Name], nil
 }
@@ -574,6 +579,124 @@ func TestReconcileKeepsBusyWorkerWithActiveJobAfterPickupTimeout(t *testing.T) {
 	defer pool.mu.Unlock()
 	if pool.states[0].recycle {
 		t.Fatal("busy worker recycle = true, want false")
+	}
+	if pool.states[0].jobCancel == nil {
+		t.Fatal("busy worker jobCancel = nil, want still set")
+	}
+	if cancelCount != 0 {
+		t.Fatalf("cancel count = %d, want 0", cancelCount)
+	}
+	calls := prober.Calls()
+	if len(calls) != 1 || calls[0] != "vm-busy" {
+		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
+	}
+}
+
+func TestReconcileKeepsBusyWorkerWhenBindingChangesBeforeRecycleApply(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	oldCancelCount := 0
+	newCancelCount := 0
+	newBoundAt := now.Add(-30 * time.Second)
+
+	pool.mu.Lock()
+	pool.states[0] = workerState{
+		vm:        &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+		bornAt:    now.Add(-time.Hour),
+		idleSince: time.Time{},
+		warming:   false,
+		busy:      true,
+		recycle:   false,
+		boundAt:   now.Add(-options.PickupTimeout - time.Second),
+		runID:     42,
+		jobCancel: func() {
+			oldCancelCount++
+		},
+		lastErr: nil,
+	}
+	pool.mu.Unlock()
+
+	prober.onProbe = func() {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		pool.states[0].boundAt = newBoundAt
+		pool.states[0].runID = 43
+		pool.states[0].jobCancel = func() {
+			newCancelCount++
+		}
+	}
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].recycle {
+		t.Fatal("rebound worker recycle = true, want false")
+	}
+	if pool.states[0].runID != 43 {
+		t.Fatalf("rebound worker run id = %d, want 43", pool.states[0].runID)
+	}
+	if !pool.states[0].boundAt.Equal(newBoundAt) {
+		t.Fatalf("rebound worker boundAt = %v, want %v", pool.states[0].boundAt, newBoundAt)
+	}
+	if pool.states[0].jobCancel == nil {
+		t.Fatal("rebound worker jobCancel = nil, want still set")
+	}
+	if oldCancelCount != 0 {
+		t.Fatalf("old cancel count = %d, want 0", oldCancelCount)
+	}
+	if newCancelCount != 0 {
+		t.Fatalf("new cancel count = %d, want 0", newCancelCount)
+	}
+	calls := prober.Calls()
+	if len(calls) != 1 || calls[0] != "vm-busy" {
+		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
+	}
+}
+
+func TestReconcileKeepsBusyWorkerAfterPickupTimeoutWhenProbeErrors(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
+	prober.probeErr = errors.New("guest probe failed")
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+
+	pool.mu.Lock()
+	pool.states[0] = workerState{
+		vm:        &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+		bornAt:    now.Add(-time.Hour),
+		idleSince: time.Time{},
+		warming:   false,
+		busy:      true,
+		recycle:   false,
+		boundAt:   now.Add(-options.PickupTimeout - time.Second),
+		runID:     42,
+		jobCancel: func() {
+			cancelCount++
+		},
+		lastErr: nil,
+	}
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].recycle {
+		t.Fatal("busy worker recycle = true after probe error, want false")
 	}
 	if pool.states[0].jobCancel == nil {
 		t.Fatal("busy worker jobCancel = nil, want still set")
