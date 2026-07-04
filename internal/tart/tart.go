@@ -20,10 +20,15 @@ import (
 // so tests can stub the CLI.
 type CommandRunner func(ctx context.Context, bin string, args ...string) ([]byte, error)
 
-// Tart drives the tart binary. The run field is swappable in white-box tests.
+// TeeCommandRunner runs `tart <args...>` and mirrors combined output to sink.
+// It is a field so tests can stub streaming CLI paths.
+type TeeCommandRunner func(ctx context.Context, bin string, sink io.Writer, args ...string) ([]byte, error)
+
+// Tart drives the tart binary. Runner fields are swappable in white-box tests.
 type Tart struct {
-	bin string
-	run CommandRunner
+	bin    string
+	run    CommandRunner
+	runTee TeeCommandRunner
 }
 
 // New returns a Tart that invokes the given binary (default "tart").
@@ -31,7 +36,7 @@ func New(bin string) *Tart {
 	if bin == "" {
 		bin = "tart"
 	}
-	return &Tart{bin: bin, run: execRunner}
+	return &Tart{bin: bin, run: execRunner, runTee: execRunnerTee}
 }
 
 // command builds an [exec.Cmd] for the tart binary. Centralizing construction
@@ -117,7 +122,7 @@ func (t *Tart) Exec(ctx context.Context, name string, argv ...string) ([]byte, e
 // produced. It still returns the buffered combined output when the command exits.
 func (t *Tart) ExecTee(ctx context.Context, name string, sink io.Writer, argv ...string) ([]byte, error) {
 	args := append([]string{"exec", name}, argv...)
-	return execRunnerTee(ctx, t.bin, sink, args...)
+	return t.runTee(ctx, t.bin, sink, args...)
 }
 
 // Stop gracefully stops a running VM.

@@ -42,6 +42,8 @@ const runnerHome = "~/actions-runner"
 // activeJobProbeTimeout bounds /status guest process checks.
 const activeJobProbeTimeout = 5 * time.Second
 
+const activeJobProbeScript = "pgrep -f '[R]unner\\.Worker' >/dev/null 2>&1 && echo yes || echo no"
+
 type activeJobProbeResult string
 
 const (
@@ -224,7 +226,7 @@ func (b *Binder) CheckAlive(ctx context.Context, vm *WarmVM) error {
 func (b *Binder) HasActiveJob(ctx context.Context, vm *WarmVM) (bool, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, activeJobProbeTimeout)
 	defer cancel()
-	out, err := b.vm.Exec(probeCtx, vm.Name, "bash", "-lc", "pgrep -f Runner.Worker >/dev/null 2>&1 && echo yes || echo no")
+	out, err := b.vm.Exec(probeCtx, vm.Name, "bash", "-lc", activeJobProbeScript)
 	if err != nil {
 		slog.WarnContext(probeCtx, "active job probe failed", "err", err, "vm", vm.Name)
 		return false, fmt.Errorf("broker: probe active job on %s: %w", vm.Name, err)

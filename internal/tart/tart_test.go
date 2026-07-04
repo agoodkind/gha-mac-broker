@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -92,6 +93,40 @@ func TestExecTeeWritesOutputToSink(t *testing.T) {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("out = %q, want %q", out, want)
 		}
+	}
+}
+
+func TestExecTeeUsesInjectedRunner(t *testing.T) {
+	var gotBin string
+	var gotArgs []string
+	stub := func(_ context.Context, bin string, sink io.Writer, args ...string) ([]byte, error) {
+		gotBin = bin
+		gotArgs = args
+		if _, err := sink.Write([]byte("tee-line\n")); err != nil {
+			return nil, err
+		}
+		return []byte("buffered-line\n"), nil
+	}
+	tt := New("fake-tart")
+	tt.runTee = stub
+	var sink bytes.Buffer
+
+	out, err := tt.ExecTee(context.Background(), "warm-1", &sink, "bash", "-lc", "echo ignored")
+	if err != nil {
+		t.Fatalf("ExecTee: %v", err)
+	}
+	if gotBin != "fake-tart" {
+		t.Fatalf("tee bin = %q, want fake-tart", gotBin)
+	}
+	wantArgs := []string{"exec", "warm-1", "bash", "-lc", "echo ignored"}
+	if !slices.Equal(gotArgs, wantArgs) {
+		t.Fatalf("tee args = %v, want %v", gotArgs, wantArgs)
+	}
+	if sink.String() != "tee-line\n" {
+		t.Fatalf("sink = %q, want tee-line", sink.String())
+	}
+	if string(out) != "buffered-line\n" {
+		t.Fatalf("out = %q, want buffered-line", out)
 	}
 }
 
