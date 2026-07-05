@@ -42,7 +42,11 @@ const runnerHome = "~/actions-runner"
 // activeJobProbeTimeout bounds /status guest process checks.
 const activeJobProbeTimeout = 5 * time.Second
 
-const activeJobProbeScript = "pgrep -f '[R]unner\\.Worker' >/dev/null 2>&1 && echo yes || echo no"
+// activeJobProbeScript prints "yes" when a Runner.Worker is running, "no" only
+// when pgrep exits 1 (no match), and otherwise propagates pgrep's nonzero exit
+// so a real probe failure surfaces as an Exec error rather than a false "no".
+// A masked error would let the pickup-timeout reap path drop a healthy worker.
+const activeJobProbeScript = "pgrep -f '[R]unner\\.Worker' >/dev/null 2>&1; rc=$?; if [ \"$rc\" -eq 0 ]; then echo yes; elif [ \"$rc\" -eq 1 ]; then echo no; else exit \"$rc\"; fi"
 
 type activeJobProbeResult string
 
@@ -184,7 +188,11 @@ func openRunLog(ctx context.Context, vmName string) (*os.File, string, error) {
 		return nil, logDir, fmt.Errorf("create run log dir: %w", err)
 	}
 	logPath := filepath.Join(logDir, "run-"+safeLogName(vmName)+".log")
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	// Truncate rather than append: the pool reuses VM names across jobs, so
+	// appending would grow run-<vm>.log without bound and interleave unrelated
+	// jobs. Each job replaces the prior, leaving the latest job's output for a
+	// post-mortem of a wedge on that VM.
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		slog.WarnContext(ctx, "open run log failed", "err", err, "vm", vmName, "path", logPath)
 		return nil, logPath, fmt.Errorf("open run log: %w", err)
