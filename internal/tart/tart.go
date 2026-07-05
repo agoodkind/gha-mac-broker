@@ -16,6 +16,8 @@ import (
 	"strings"
 )
 
+const maxTeeTailBytes = 64 * 1024
+
 // CommandRunner runs `tart <args...>` and returns combined stdout. It is a field
 // so tests can stub the CLI.
 type CommandRunner func(ctx context.Context, bin string, args ...string) ([]byte, error)
@@ -58,18 +60,52 @@ func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error)
 	return out.Bytes(), nil
 }
 
+type tailBuffer struct {
+	limit int
+	buf   []byte
+}
+
+func newTailBuffer(limit int) *tailBuffer {
+	return &tailBuffer{
+		limit: limit,
+		buf:   make([]byte, 0, limit),
+	}
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	if b.limit <= 0 {
+		return len(p), nil
+	}
+	if len(p) >= b.limit {
+		b.buf = append(b.buf[:0], p[len(p)-b.limit:]...)
+		return len(p), nil
+	}
+	excess := len(b.buf) + len(p) - b.limit
+	if excess > 0 {
+		copy(b.buf, b.buf[excess:])
+		b.buf = b.buf[:len(b.buf)-excess]
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *tailBuffer) Bytes() []byte {
+	return b.buf
+}
+
 func execRunnerTee(ctx context.Context, bin string, sink io.Writer, args ...string) ([]byte, error) {
 	cmd := command(ctx, bin, args...)
-	var out bytes.Buffer
-	writer := io.Writer(&out)
+	out := newTailBuffer(maxTeeTailBytes)
+	writer := io.Writer(out)
 	if sink != nil {
-		writer = io.MultiWriter(&out, sink)
+		writer = io.MultiWriter(out, sink)
 	}
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 	if err := cmd.Run(); err != nil {
 		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", strings.Join(args, " "))
-		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out.String()))
+		tail := string(out.Bytes())
+		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(tail))
 	}
 	return out.Bytes(), nil
 }

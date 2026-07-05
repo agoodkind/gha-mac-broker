@@ -96,6 +96,32 @@ func TestExecTeeWritesOutputToSink(t *testing.T) {
 	}
 }
 
+func TestExecTeeReturnsBoundedTailAndStreamsFullOutput(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	script := "#!/usr/bin/env bash\nfor i in {1..70000}; do printf 'x'; done\nprintf 'tail-marker\\n'\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+	tt := New(bin)
+	var sink bytes.Buffer
+
+	out, err := tt.ExecTee(context.Background(), "warm-1", &sink, "bash", "-lc", "echo ignored")
+	if err != nil {
+		t.Fatalf("ExecTee: %v", err)
+	}
+	if sink.Len() != 70012 {
+		t.Fatalf("sink len = %d, want 70012", sink.Len())
+	}
+	const expectedTailLimit = 64 * 1024
+	if len(out) > expectedTailLimit {
+		t.Fatalf("out len = %d, want at most %d", len(out), expectedTailLimit)
+	}
+	if !strings.Contains(string(out), "tail-marker") {
+		t.Fatalf("out = %q, want trailing marker", out)
+	}
+}
+
 func TestExecTeeUsesInjectedRunner(t *testing.T) {
 	var gotBin string
 	var gotArgs []string
