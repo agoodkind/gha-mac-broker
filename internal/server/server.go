@@ -191,9 +191,11 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.checkBearerToken(w, r) {
-		return
-	}
+	// /capacity is intentionally public. It returns only a coarse availability
+	// boolean and takes no action, so any consumer can probe it with no per-repo
+	// secret, which lets swift-makefile route every consumer to the pool from one
+	// place. The webhook that actually provisions runners stays HMAC-guarded, and
+	// /status stays bearer-guarded because it exposes worker internals.
 	repo := r.URL.Query().Get("repo")
 	macos := r.URL.Query().Get("os")
 	xcode := r.URL.Query().Get("xcode")

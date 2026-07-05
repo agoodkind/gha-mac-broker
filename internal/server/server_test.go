@@ -369,43 +369,32 @@ func TestCapacityNotAvailableWhenPoolNotReady(t *testing.T) {
 	}
 }
 
-func TestCapacityNoHeaderReturns401(t *testing.T) {
+func TestCapacityPublicNoHeaderReturns200(t *testing.T) {
 	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{ready: true})
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=10", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 with no auth header, got %d", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with no auth header (capacity is public), got %d", w.Code)
 	}
 }
 
-func TestCapacityWrongTokenReturns401(t *testing.T) {
+func TestCapacityPublicIgnoresWrongToken(t *testing.T) {
 	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{ready: true})
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=11", nil)
 	req.Header.Set("Authorization", "Bearer wrong-token")
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 with wrong token, got %d", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with a wrong token (capacity is public), got %d", w.Code)
 	}
 }
 
-func TestCapacityCorrectTokenReturns200AndAvailable(t *testing.T) {
+func TestCapacityReturns200AndAvailable(t *testing.T) {
 	srv := New(testSecret, newTestConfig("owner/repo"), testCapacityToken, nil, &testPool{ready: true})
 	resp := capacityRequest(t, srv, "/capacity?repo=owner/repo")
 	if !resp.Available {
 		t.Fatal("expected available=true when runner pool is ready")
-	}
-}
-
-func TestCapacityEmptyTokenAlwaysReturns401(t *testing.T) {
-	srv := New(testSecret, newTestConfig("owner/repo"), nil, nil, &testPool{ready: true})
-	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=13", nil)
-	req.Header.Set("Authorization", "Bearer any-token")
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 when server has no token configured, got %d", w.Code)
 	}
 }
 
