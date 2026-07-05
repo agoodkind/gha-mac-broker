@@ -66,7 +66,7 @@ type statusResponse struct {
 	Workers  []runnerpool.WorkerView `json:"workers"`
 }
 
-// Server handles the /webhook, /capacity, and /healthz endpoints.
+// Server handles the /webhook, /capacity, /status, and /healthz endpoints.
 type Server struct {
 	mux           *http.ServeMux
 	secret        []byte
