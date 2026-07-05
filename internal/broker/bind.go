@@ -134,16 +134,12 @@ func (b *Binder) Warm(ctx context.Context, image, id string) (*WarmVM, error) {
 	return &WarmVM{Name: vmName, Image: image, boot: bootCmd, stopTouch: stopTouch}, nil
 }
 
-// RunJob checks the allowlist, mints a JIT config, and runs one ephemeral GitHub
-// Actions job on the warm VM over vsock. runnerName is the runner registration
-// name.
+// RunJob mints a JIT config and runs one ephemeral GitHub Actions job on the
+// warm VM over vsock. runnerName is the runner registration name.
 func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo, runnerName string) error {
 	owner, repoName, ok := strings.Cut(repo, "/")
 	if !ok {
 		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
-	}
-	if !b.cfg.RepoAllowed(repo) {
-		return fmt.Errorf("broker: repo %s is not in allowed_repos", repo)
 	}
 
 	jit, err := b.generateJIT(ctx, owner, repoName, runnerName)
@@ -291,14 +287,10 @@ func (b *Binder) SweepOrphans(ctx context.Context) {
 }
 
 // BindOnce clones a warm VM, registers it as an ephemeral runner for repo, runs
-// one job, and tears the VM down. id makes the VM and runner names unique. repo
-// is owner/repo and must be in the allowlist.
+// one job, and tears the VM down. id makes the VM and runner names unique.
 func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
 	if _, _, ok := strings.Cut(repo, "/"); !ok {
 		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
-	}
-	if !b.cfg.RepoAllowed(repo) {
-		return fmt.Errorf("broker: repo %s is not in allowed_repos", repo)
 	}
 	vm, err := b.Warm(ctx, b.cfg.Tart.BaseImage, id)
 	if err != nil {

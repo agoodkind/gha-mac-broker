@@ -41,6 +41,10 @@ const maxResponseBytes = 1 << 20
 // runnerListPageSize is the largest page size accepted by GitHub's runners API.
 const runnerListPageSize = 100
 
+// installationListPageSize is the largest page size used for App installations
+// and installation repository lists.
+const installationListPageSize = 100
+
 // Client authenticates as one GitHub App.
 type Client struct {
 	appID      string
@@ -182,7 +186,7 @@ type tokenPermissions struct {
 
 // accessTokenRequest scopes an installation token to one repository.
 type accessTokenRequest struct {
-	Repositories []string         `json:"repositories"`
+	Repositories []string         `json:"repositories,omitempty"`
 	Permissions  tokenPermissions `json:"permissions"`
 }
 
@@ -193,13 +197,17 @@ type accessTokenResponse struct {
 
 // InstallationToken mints a repo-scoped installation access token.
 func (c *Client) InstallationToken(ctx context.Context, installationID int64, repo string) (string, error) {
+	return c.installationToken(ctx, installationID, []string{repo})
+}
+
+func (c *Client) installationToken(ctx context.Context, installationID int64, repositories []string) (string, error) {
 	jwt, err := c.appJWT(ctx)
 	if err != nil {
 		return "", err
 	}
 	path := fmt.Sprintf("/app/installations/%d/access_tokens", installationID)
 	reqBody := accessTokenRequest{
-		Repositories: []string{repo},
+		Repositories: repositories,
 		Permissions:  tokenPermissions{Administration: "write", Actions: "write"},
 	}
 	slog.DebugContext(ctx, "minting installation token",
@@ -225,6 +233,85 @@ func (c *Client) InstallationToken(ctx context.Context, installationID int64, re
 		return "", errors.New("ghapp: empty installation token")
 	}
 	return out.Token, nil
+}
+
+type appInstallation struct {
+	ID int64 `json:"id"`
+}
+
+type installedRepository struct {
+	FullName string `json:"full_name"`
+}
+
+type installedRepositoriesResponse struct {
+	TotalCount   int                   `json:"total_count"`
+	Repositories []installedRepository `json:"repositories"`
+}
+
+// ListInstalledRepos returns every repository visible to the GitHub App
+// installations.
+func (c *Client) ListInstalledRepos(ctx context.Context) ([]string, error) {
+	jwt, err := c.appJWT(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var repos []string
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/app/installations?per_page=%d&page=%d", installationListPageSize, page)
+		body, err := c.do(ctx, http.MethodGet, path, "Bearer "+jwt, nil)
+		if err != nil {
+			slog.ErrorContext(ctx, "ghapp installation list failed", "err", err, "page", page)
+			return nil, fmt.Errorf("ghapp: list installations page %d: %w", page, err)
+		}
+		var installations []appInstallation
+		if err := json.Unmarshal(body, &installations); err != nil {
+			slog.ErrorContext(ctx, "ghapp decode installations failed", "err", err, "page", page)
+			return nil, fmt.Errorf("ghapp: decode installations page %d: %w", page, err)
+		}
+		if len(installations) == 0 {
+			return repos, nil
+		}
+		for _, installation := range installations {
+			if installation.ID == 0 {
+				return nil, fmt.Errorf("ghapp: installation page %d contained an installation with no id", page)
+			}
+			token, err := c.installationToken(ctx, installation.ID, nil)
+			if err != nil {
+				return nil, fmt.Errorf("ghapp: installation token for installed repos %d: %w", installation.ID, err)
+			}
+			installationRepos, err := c.listInstallationRepos(ctx, installation.ID, token)
+			if err != nil {
+				return nil, err
+			}
+			repos = append(repos, installationRepos...)
+		}
+	}
+}
+
+func (c *Client) listInstallationRepos(ctx context.Context, installationID int64, token string) ([]string, error) {
+	var repos []string
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/installation/repositories?per_page=%d&page=%d", installationListPageSize, page)
+		body, err := c.do(ctx, http.MethodGet, path, "token "+token, nil)
+		if err != nil {
+			slog.ErrorContext(ctx, "ghapp installed repository list failed", "err", err, "installation_id", installationID, "page", page)
+			return nil, fmt.Errorf("ghapp: list installed repositories for installation %d page %d: %w", installationID, page, err)
+		}
+		var out installedRepositoriesResponse
+		if err := json.Unmarshal(body, &out); err != nil {
+			slog.ErrorContext(ctx, "ghapp decode installed repositories failed", "err", err, "installation_id", installationID, "page", page)
+			return nil, fmt.Errorf("ghapp: decode installed repositories for installation %d page %d: %w", installationID, page, err)
+		}
+		for _, repository := range out.Repositories {
+			if repository.FullName == "" {
+				return nil, fmt.Errorf("ghapp: installed repository for installation %d page %d has no full_name", installationID, page)
+			}
+			repos = append(repos, repository.FullName)
+		}
+		if len(out.Repositories) == 0 || len(repos) >= out.TotalCount {
+			return repos, nil
+		}
+	}
 }
 
 // jitConfigRequest is the body of generate-jitconfig.

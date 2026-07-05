@@ -158,11 +158,6 @@ func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byt
 func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload webhookPayload) {
 	ctx := r.Context()
 	repo := payload.Repository.FullName
-	if !s.cfg.RepoAllowed(repo) {
-		slog.InfoContext(ctx, "webhook ignored", "reason", "repo not allowed", "repo", repo)
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
 	if !s.hasLabel(payload.WorkflowJob.Labels) {
 		slog.InfoContext(ctx, "webhook ignored", "reason", "no matching label", "repo", repo, "labels", payload.WorkflowJob.Labels)
 		w.WriteHeader(http.StatusNoContent)
@@ -200,10 +195,6 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	macos := r.URL.Query().Get("os")
 	xcode := r.URL.Query().Get("xcode")
 	slog.DebugContext(r.Context(), "capacity request", "repo", repo, "os", macos, "xcode", xcode)
-	if !s.cfg.RepoAllowed(repo) {
-		writeJSON(w, capacityResponse{Available: false})
-		return
-	}
 	// Available only when the requested image resolves to the exact image the
 	// pool is running. The pool warms every VM on cfg.Tart.BaseImage, so a
 	// mappable-but-different tag cannot be served and must route to hosted.

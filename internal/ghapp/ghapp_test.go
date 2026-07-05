@@ -309,3 +309,88 @@ func TestListRunnersReadsAllPages(t *testing.T) {
 		t.Fatalf("third runner id = %d, want 13", runners[2].ID)
 	}
 }
+
+func TestListInstalledReposReadsAppInstallations(t *testing.T) {
+	pemKey, _ := testKeyPEM(t)
+	type installedRepo struct {
+		FullName string `json:"full_name"`
+	}
+	type installedRepoPage struct {
+		TotalCount   int             `json:"total_count"`
+		Repositories []installedRepo `json:"repositories"`
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/app/installations":
+			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				t.Errorf("installation list must use App JWT bearer, got %q", r.Header.Get("Authorization"))
+			}
+			page := r.URL.Query().Get("page")
+			if page == "" {
+				page = "1"
+			}
+			switch page {
+			case "1":
+				_ = json.NewEncoder(w).Encode([]map[string]int64{{"id": 100}, {"id": 200}})
+			default:
+				_ = json.NewEncoder(w).Encode([]map[string]int64{})
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/100/access_tokens":
+			var body map[string]json.RawMessage
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if _, ok := body["repositories"]; ok {
+				t.Error("installed repository listing token should not be scoped to named repositories")
+			}
+			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "token-100"})
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/200/access_tokens":
+			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "token-200"})
+		case r.Method == http.MethodGet && r.URL.Path == "/installation/repositories":
+			switch r.Header.Get("Authorization") {
+			case "token token-100":
+				_ = json.NewEncoder(w).Encode(installedRepoPage{
+					TotalCount: 2,
+					Repositories: []installedRepo{
+						{FullName: "owner/one"},
+						{FullName: "owner/two"},
+					},
+				})
+			case "token token-200":
+				_ = json.NewEncoder(w).Encode(installedRepoPage{
+					TotalCount: 1,
+					Repositories: []installedRepo{
+						{FullName: "other/repo"},
+					},
+				})
+			default:
+				t.Errorf("unexpected repository list auth %q", r.Header.Get("Authorization"))
+				http.Error(w, "unexpected auth", http.StatusUnauthorized)
+			}
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	})
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, r)
+			return recorder.Result(), nil
+		}),
+	}
+
+	client, err := New("12345", pemKey, WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client.apiBase = "https://api.github.test"
+
+	repos, err := client.ListInstalledRepos(context.Background())
+	if err != nil {
+		t.Fatalf("ListInstalledRepos: %v", err)
+	}
+	want := []string{"owner/one", "owner/two", "other/repo"}
+	if strings.Join(repos, ",") != strings.Join(want, ",") {
+		t.Fatalf("repos = %v, want %v", repos, want)
+	}
+}

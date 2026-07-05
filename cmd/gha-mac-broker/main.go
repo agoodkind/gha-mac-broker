@@ -562,9 +562,6 @@ func runJITConfig(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if !cfg.RepoAllowed(*repo) {
-		return fmt.Errorf("repo %s is not in allowed_repos", *repo)
-	}
 
 	installationID, err := gh.InstallationID(ctx, owner, repoName)
 	if err != nil {
@@ -623,6 +620,7 @@ func runBind(ctx context.Context, args []string) error {
 }
 
 type staleRunnerCleaner interface {
+	ListInstalledRepos(ctx context.Context) ([]string, error)
 	ListRunners(ctx context.Context, repo string) ([]ghapp.Runner, error)
 	DeleteRunner(ctx context.Context, repo string, runnerID int64) error
 }
@@ -630,7 +628,12 @@ type staleRunnerCleaner interface {
 func deleteStaleRunners(ctx context.Context, cfg *config.Config, cleaner staleRunnerCleaner) {
 	totalDeleted := 0
 	runnerNamePrefix := cfg.Tart.VMNamePrefix
-	for _, repo := range cfg.AllowedRepos {
+	repos, err := cleaner.ListInstalledRepos(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "installed repository list failed; continuing startup", "err", err)
+		return
+	}
+	for _, repo := range repos {
 		runners, err := cleaner.ListRunners(ctx, repo)
 		if err != nil {
 			slog.WarnContext(ctx, "stale runner list failed; continuing startup", "err", err, "repo", repo)
@@ -773,7 +776,6 @@ func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBin
 		MaxBind:        time.Duration(cfg.MaxBind),
 		PickupTimeout:  time.Duration(cfg.PickupTimeout),
 		RunToken:       runToken,
-		AllowedRepos:   cfg.AllowedRepos,
 		WarmRetryDelay: 0,
 		Now:            time.Now,
 	}, binder, binder, github, binder), nil

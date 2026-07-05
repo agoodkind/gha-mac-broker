@@ -7,15 +7,6 @@ pickup_timeout = "5m"
 
 labels = ["self-hosted", "macOS", "ARM64", "agk-local-macos-26"]
 
-allowed_repos = [
-  "agoodkind/lmd",
-  "agoodkind/iphone-cell-tunnel",
-  "agoodkind/macos-fan-curve",
-  "agoodkind/macos-smc-fan",
-  "agoodkind/stickies-improved",
-  "agoodkind/swift-makefile",
-]
-
 # Paths are read verbatim with no shell tilde expansion, so use absolute paths
 # (replace "you" with your username).
 [app]

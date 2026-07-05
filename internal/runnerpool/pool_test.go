@@ -166,19 +166,30 @@ func (r *fakeRunner) MaxActive() int {
 }
 
 type fakeGitHub struct {
-	mu      sync.Mutex
-	runners map[string][]ghapp.Runner
-	calls   []string
-	err     error
+	mu             sync.Mutex
+	installedRepos []string
+	runners        map[string][]ghapp.Runner
+	calls          []string
+	err            error
 }
 
 func newFakeGitHub() *fakeGitHub {
 	return &fakeGitHub{
-		mu:      sync.Mutex{},
-		runners: make(map[string][]ghapp.Runner),
-		calls:   nil,
-		err:     nil,
+		mu:             sync.Mutex{},
+		installedRepos: []string{"owner/repo"},
+		runners:        make(map[string][]ghapp.Runner),
+		calls:          nil,
+		err:            nil,
 	}
+}
+
+func (g *fakeGitHub) ListInstalledRepos(_ context.Context) ([]string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.err != nil {
+		return nil, g.err
+	}
+	return append([]string(nil), g.installedRepos...), nil
 }
 
 func (g *fakeGitHub) ListRunners(_ context.Context, repo string) ([]ghapp.Runner, error) {
@@ -268,7 +279,6 @@ func testOptions(clock *mutableClock, runnerCount int) Options {
 		MaxIdle:        2 * time.Hour,
 		MaxAge:         24 * time.Hour,
 		RunToken:       "test",
-		AllowedRepos:   []string{"owner/repo"},
 		WarmRetryDelay: time.Millisecond,
 		Now:            clock.Now,
 	}

@@ -39,7 +39,6 @@ type Options struct {
 	MaxBind        time.Duration
 	PickupTimeout  time.Duration
 	RunToken       string
-	AllowedRepos   []string
 	WarmRetryDelay time.Duration
 	Now            func() time.Time
 }
@@ -87,6 +86,7 @@ type ActiveJobProber interface {
 
 // RunnerLister lists GitHub runners for idle VM health checks.
 type RunnerLister interface {
+	ListInstalledRepos(ctx context.Context) ([]string, error)
 	ListRunners(ctx context.Context, repo string) ([]ghapp.Runner, error)
 }
 
@@ -498,7 +498,12 @@ func (p *Pool) checkHealth(ctx context.Context, vm *broker.WarmVM) error {
 	if p.github == nil {
 		return nil
 	}
-	for _, repo := range p.options.AllowedRepos {
+	repos, err := p.github.ListInstalledRepos(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "runnerpool list installed repos failed", "err", err, "vm", vm.Name)
+		return fmt.Errorf("runnerpool: list installed repos: %w", err)
+	}
+	for _, repo := range repos {
 		runners, err := p.github.ListRunners(ctx, repo)
 		if err != nil {
 			slog.WarnContext(ctx, "runnerpool list runners failed", "err", err, "repo", repo, "vm", vm.Name)

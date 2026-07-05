@@ -3,7 +3,7 @@
 A generic GitHub Actions macOS warm-pool runner broker. One Mac keeps a fixed set
 of pre-booted [Tart](https://tart.run) VMs and runs each queued job on a free VM
 using repo-scoped just-in-time runner config. A VM is reused across many jobs, so
-one VM serves gates from any allowed repository over its life. One shared pool
+one VM serves gates from any installed repository over its life. One shared pool
 serves many personal-account repositories without an organization.
 
 ## Why
@@ -70,7 +70,6 @@ tilde expansion), never inlined.
 | `pickup_timeout` | probe a newly bound busy worker after this long and recycle it when no active job exists |
 | `tart.base_image` | Cirrus image the golden is built from (runner baked in, unconfigured) |
 | `tart.cache_dir` | host dir mounted into each VM, survives VM deletion |
-| `allowed_repos` | `owner/repo` allowlist the broker will serve |
 
 ## Subcommands
 
@@ -96,13 +95,13 @@ Runner pool details live in [docs/runnerpool/overview.md](docs/runnerpool/overvi
 
 `serve` runs a fixed persistent worker pool. Each worker owns one warm VM cloned
 from the golden and reuses it across many jobs. The webhook is the demand signal:
-a `workflow_job.queued` delivery for an allowed repo carrying a pool label is
+a `workflow_job.queued` delivery carrying a pool label is
 enqueued (`internal/server/server.go`), and an idle worker pulls the next job,
 mints a repo-scoped JIT config for that job's repo, and runs it on its VM over the
 tart-exec vsock channel (`internal/runnerpool/pool.go`, `internal/broker/bind.go`).
 The VM is not torn down between jobs, so `runner_count` VMs run `runner_count` jobs
 at once and a fan-out drains across them in waves. Each job is a fresh JIT
-registration to its own repository, so one generic VM serves any allowed repo.
+registration to its own repository, so one generic VM serves any installed repo.
 
 `GET /capacity` reports `runnerpool.Ready()`: true only when the pool is healthy
 and a worker is free or near-free, so a consumer's `plan-runners` step routes to

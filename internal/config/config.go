@@ -65,10 +65,6 @@ type Config struct {
 	// Labels are the runner labels every JIT runner registers with. The
 	// self-hosted job in CI targets one of these.
 	Labels []string `toml:"labels"`
-
-	// AllowedRepos is the owner/repo allowlist the broker will serve. A queued
-	// job for any other repository is ignored.
-	AllowedRepos []string `toml:"allowed_repos"`
 }
 
 // AppConfig holds GitHub App identity and secret references.
@@ -246,9 +242,6 @@ func (c *Config) validate() error {
 	if c.App.PrivateKeyPath == "" {
 		missing = append(missing, "app.private_key_path")
 	}
-	if len(c.AllowedRepos) == 0 {
-		missing = append(missing, "allowed_repos")
-	}
 	if len(missing) > 0 {
 		return fmt.Errorf("config: missing required fields: %s", strings.Join(missing, ", "))
 	}
@@ -360,16 +353,6 @@ func safeCirrusImageTag(tag string) bool {
 		return false
 	}
 	return !strings.ContainsAny(macosPart, "/ \t\r\n")
-}
-
-// RepoAllowed reports whether owner/repo is in the allowlist.
-func (c *Config) RepoAllowed(fullName string) bool {
-	for _, r := range c.AllowedRepos {
-		if strings.EqualFold(r, fullName) {
-			return true
-		}
-	}
-	return false
 }
 
 // ReadPrivateKey reads the App private key bytes from disk.

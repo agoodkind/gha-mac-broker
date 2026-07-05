@@ -19,9 +19,18 @@ import (
 )
 
 type staleRunnerClient struct {
-	runners []ghapp.Runner
-	listErr error
-	deleted []int64
+	repos        []string
+	listReposErr error
+	runners      []ghapp.Runner
+	listErr      error
+	deleted      []int64
+}
+
+func (c *staleRunnerClient) ListInstalledRepos(_ context.Context) ([]string, error) {
+	if c.listReposErr != nil {
+		return nil, c.listReposErr
+	}
+	return append([]string(nil), c.repos...), nil
 }
 
 func (c *staleRunnerClient) ListRunners(_ context.Context, _ string) ([]ghapp.Runner, error) {
@@ -65,8 +74,7 @@ func testServeConfig() *config.Config {
 			FastPullDir:      "",
 			FastPullParallel: 16,
 		},
-		Labels:       []string{"self-hosted", "macOS"},
-		AllowedRepos: []string{"owner/repo"},
+		Labels: []string{"self-hosted", "macOS"},
 	}
 }
 
@@ -81,7 +89,6 @@ func TestRunStatusUsesCapacityTokenAndListenPort(t *testing.T) {
 listen_addr = "[::1]:23456"
 runner_count = 1
 labels = ["self-hosted"]
-allowed_repos = ["owner/repo"]
 
 [app]
 app_id = "1"
@@ -145,6 +152,7 @@ func TestStatusEndpointUsesLocalhost(t *testing.T) {
 
 func TestDeleteStaleRunnersDeletesOfflineRunners(t *testing.T) {
 	client := &staleRunnerClient{
+		repos: []string{"owner/repo"},
 		runners: []ghapp.Runner{
 			{ID: 11, Name: "gha-old", Status: "offline", Busy: false},
 			{ID: 12, Name: "gha-new", Status: "online", Busy: true},
@@ -167,6 +175,7 @@ func TestDeleteStaleRunnersOnlyDeletesOfflineRunnersWithConfiguredPrefix(t *test
 	cfg := testServeConfig()
 	cfg.Tart.VMNamePrefix = "broker-managed"
 	client := &staleRunnerClient{
+		repos: []string{"owner/repo"},
 		runners: []ghapp.Runner{
 			{ID: 11, Name: "broker-managed-old", Status: "offline", Busy: false},
 			{ID: 12, Name: "external-runner", Status: "offline", Busy: false},
@@ -188,6 +197,7 @@ func TestDeleteStaleRunnersOnlyDeletesOfflineRunnersWithConfiguredPrefix(t *test
 
 func TestDeleteStaleRunnersListErrorDoesNotBlockStartup(t *testing.T) {
 	client := &staleRunnerClient{
+		repos:   []string{"owner/repo"},
 		runners: nil,
 		listErr: errors.New("github unavailable"),
 		deleted: nil,
@@ -197,6 +207,22 @@ func TestDeleteStaleRunnersListErrorDoesNotBlockStartup(t *testing.T) {
 
 	if len(client.deleted) != 0 {
 		t.Fatalf("deleted runners after list error = %v, want none", client.deleted)
+	}
+}
+
+func TestDeleteStaleRunnersRepoListErrorDoesNotBlockStartup(t *testing.T) {
+	client := &staleRunnerClient{
+		repos:        nil,
+		listReposErr: errors.New("github unavailable"),
+		runners:      nil,
+		listErr:      nil,
+		deleted:      nil,
+	}
+
+	deleteStaleRunners(context.Background(), testServeConfig(), client)
+
+	if len(client.deleted) != 0 {
+		t.Fatalf("deleted runners after repo list error = %v, want none", client.deleted)
 	}
 }
 
