@@ -500,8 +500,13 @@ func (p *Pool) checkHealth(ctx context.Context, vm *broker.WarmVM) error {
 	}
 	repos, err := p.github.ListInstalledRepos(ctx)
 	if err != nil {
-		slog.WarnContext(ctx, "runnerpool list installed repos failed", "err", err, "vm", vm.Name)
-		return fmt.Errorf("runnerpool: list installed repos: %w", err)
+		// Cannot enumerate the App's repos this cycle (transient outage, rate
+		// limit, permission hiccup). Skip the registration-leak check rather than
+		// recycle the VM, so one listing failure does not churn the whole warm
+		// pool. A real leak is still caught on a later reconcile once the API
+		// recovers.
+		slog.WarnContext(ctx, "runnerpool list installed repos failed; skipping registration check", "err", err, "vm", vm.Name)
+		return nil
 	}
 	for _, repo := range repos {
 		runners, err := p.github.ListRunners(ctx, repo)
