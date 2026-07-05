@@ -170,6 +170,7 @@ type fakeGitHub struct {
 	installedRepos []string
 	runners        map[string][]ghapp.Runner
 	calls          []string
+	installedCalls int
 	err            error
 }
 
@@ -179,6 +180,7 @@ func newFakeGitHub() *fakeGitHub {
 		installedRepos: []string{"owner/repo"},
 		runners:        make(map[string][]ghapp.Runner),
 		calls:          nil,
+		installedCalls: 0,
 		err:            nil,
 	}
 }
@@ -186,6 +188,7 @@ func newFakeGitHub() *fakeGitHub {
 func (g *fakeGitHub) ListInstalledRepos(_ context.Context) ([]string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.installedCalls++
 	if g.err != nil {
 		return nil, g.err
 	}
@@ -206,6 +209,18 @@ func (g *fakeGitHub) SetRunners(repo string, runners []ghapp.Runner) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.runners[repo] = append([]ghapp.Runner(nil), runners...)
+}
+
+func (g *fakeGitHub) InstalledCalls() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.installedCalls
+}
+
+func (g *fakeGitHub) RunnerCalls() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.calls...)
 }
 
 type fakeActiveJobProber struct {
@@ -1017,6 +1032,92 @@ func TestReconcileReplacesIdleVMWithStaleGitHubRunner(t *testing.T) {
 	torn := warmer.TornNames()
 	if len(torn) != 1 || torn[0] != firstVM {
 		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
+	}
+}
+
+func TestReconcileListsInstalledReposOnceForMultipleIdleCandidates(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	warmer := newFakeWarmer()
+	runner := newFakeRunner(1)
+	github := newFakeGitHub()
+	github.installedRepos = []string{"owner/repo-a", "owner/repo-b"}
+	pool := New(testOptions(clock, 3), warmer, runner, github, nil)
+
+	pool.mu.Lock()
+	pool.started = true
+	for i := range pool.states {
+		vmName := fmt.Sprintf("vm-idle-%d", i)
+		pool.states[i] = workerState{
+			vm:        &broker.WarmVM{Name: vmName, Image: "image-a"},
+			bornAt:    now.Add(-time.Hour),
+			idleSince: now.Add(-time.Minute),
+			warming:   false,
+			busy:      false,
+			recycle:   false,
+			boundAt:   time.Time{},
+			lastErr:   nil,
+		}
+		warmer.alive[vmName] = true
+	}
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if calls := github.InstalledCalls(); calls != 1 {
+		t.Fatalf("installed repo calls = %d, want 1", calls)
+	}
+	runnerCalls := github.RunnerCalls()
+	if len(runnerCalls) != 6 {
+		t.Fatalf("runner calls = %v, want 6 calls", runnerCalls)
+	}
+}
+
+func TestReconcileSkipsRegistrationLeakCheckWhenInstalledRepoListingFails(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	warmer := newFakeWarmer()
+	runner := newFakeRunner(1)
+	github := newFakeGitHub()
+	github.err = errors.New("installations unavailable")
+	pool := New(testOptions(clock, 2), warmer, runner, github, nil)
+
+	pool.mu.Lock()
+	pool.started = true
+	for i := range pool.states {
+		vmName := fmt.Sprintf("vm-idle-%d", i)
+		pool.states[i] = workerState{
+			vm:        &broker.WarmVM{Name: vmName, Image: "image-a"},
+			bornAt:    now.Add(-time.Hour),
+			idleSince: now.Add(-time.Minute),
+			warming:   false,
+			busy:      false,
+			recycle:   false,
+			boundAt:   time.Time{},
+			lastErr:   nil,
+		}
+		warmer.alive[vmName] = true
+	}
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if calls := github.InstalledCalls(); calls != 1 {
+		t.Fatalf("installed repo calls = %d, want 1", calls)
+	}
+	if runnerCalls := github.RunnerCalls(); len(runnerCalls) != 0 {
+		t.Fatalf("runner calls = %v, want none", runnerCalls)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	for i, state := range pool.states {
+		if state.recycle {
+			t.Fatalf("state %d recycle = true, want false", i)
+		}
 	}
 }
 

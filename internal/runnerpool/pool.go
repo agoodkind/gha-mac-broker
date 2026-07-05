@@ -376,9 +376,10 @@ func (p *Pool) snapshotLocked() Snapshot {
 func (p *Pool) Reconcile(ctx context.Context) error {
 	p.reapBusyWorkers(ctx)
 	candidates := p.idleCandidates()
+	repos, skipRegistrationCheck := p.installedReposForHealth(ctx, candidates)
 	var recycleErrs []error
 	for _, candidate := range candidates {
-		recycle, err := p.shouldRecycle(ctx, candidate)
+		recycle, err := p.shouldRecycle(ctx, candidate, repos, skipRegistrationCheck)
 		if err != nil {
 			recycleErrs = append(recycleErrs, err)
 		}
@@ -391,6 +392,23 @@ func (p *Pool) Reconcile(ctx context.Context) error {
 		slog.WarnContext(ctx, "runnerpool reconcile found unhealthy idle vm", "err", err)
 	}
 	return err
+}
+
+func (p *Pool) installedReposForHealth(ctx context.Context, candidates []idleCandidate) ([]string, bool) {
+	if p.github == nil || len(candidates) == 0 {
+		return nil, false
+	}
+	repos, err := p.github.ListInstalledRepos(ctx)
+	if err != nil {
+		// Cannot enumerate the App's repos this cycle (transient outage, rate
+		// limit, permission hiccup). Skip the registration-leak check rather than
+		// recycle the VMs, so one listing failure does not churn the whole warm
+		// pool. A real leak is still caught on a later reconcile once the API
+		// recovers.
+		slog.WarnContext(ctx, "runnerpool list installed repos failed; skipping registration check", "err", err, "candidate_count", len(candidates))
+		return nil, true
+	}
+	return repos, false
 }
 
 type busyCandidate struct {
@@ -477,35 +495,25 @@ func (p *Pool) idleCandidates() []idleCandidate {
 	return candidates
 }
 
-func (p *Pool) shouldRecycle(ctx context.Context, candidate idleCandidate) (bool, error) {
+func (p *Pool) shouldRecycle(ctx context.Context, candidate idleCandidate, repos []string, skipRegistrationCheck bool) (bool, error) {
 	if p.options.MaxIdle > 0 && !candidate.idleSince.IsZero() && candidate.now.Sub(candidate.idleSince) >= p.options.MaxIdle {
 		return true, nil
 	}
 	if p.options.MaxAge > 0 && !candidate.bornAt.IsZero() && candidate.now.Sub(candidate.bornAt) >= p.options.MaxAge {
 		return true, nil
 	}
-	if err := p.checkHealth(ctx, candidate.vm); err != nil {
+	if err := p.checkHealth(ctx, candidate.vm, repos, skipRegistrationCheck); err != nil {
 		return true, err
 	}
 	return false, nil
 }
 
-func (p *Pool) checkHealth(ctx context.Context, vm *broker.WarmVM) error {
+func (p *Pool) checkHealth(ctx context.Context, vm *broker.WarmVM, repos []string, skipRegistrationCheck bool) error {
 	if err := p.warmer.CheckAlive(ctx, vm); err != nil {
 		slog.WarnContext(ctx, "runnerpool alive check failed", "err", err, "vm", vm.Name)
 		return fmt.Errorf("runnerpool: check alive %s: %w", vm.Name, err)
 	}
-	if p.github == nil {
-		return nil
-	}
-	repos, err := p.github.ListInstalledRepos(ctx)
-	if err != nil {
-		// Cannot enumerate the App's repos this cycle (transient outage, rate
-		// limit, permission hiccup). Skip the registration-leak check rather than
-		// recycle the VM, so one listing failure does not churn the whole warm
-		// pool. A real leak is still caught on a later reconcile once the API
-		// recovers.
-		slog.WarnContext(ctx, "runnerpool list installed repos failed; skipping registration check", "err", err, "vm", vm.Name)
+	if p.github == nil || skipRegistrationCheck {
 		return nil
 	}
 	for _, repo := range repos {
