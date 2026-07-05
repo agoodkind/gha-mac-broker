@@ -62,7 +62,7 @@ tilde expansion), never inlined.
 | `app.app_id` | GitHub App ID |
 | `app.private_key_path` | PEM private key on disk |
 | `app.webhook_secret_path` | file holding the webhook HMAC secret |
-| `app.capacity_token_path` | file holding the bearer token required on `GET /capacity` |
+| `app.capacity_token_path` | file holding the bearer token required on `GET /status` and `gha-mac-broker status` |
 | `runner_count` | number of persistent warm VMs the pool keeps booted (default 3) |
 | `max_idle` | recycle an idle VM after this long (hygiene; the cache is a host mount, so this is free) |
 | `max_age` | recycle a VM once it has run this long |
@@ -78,6 +78,7 @@ gha-mac-broker version
 gha-mac-broker jitconfig -repo agoodkind/lmd
 gha-mac-broker bind      -repo agoodkind/lmd
 gha-mac-broker serve
+gha-mac-broker status
 # override the default XDG path with -config:
 gha-mac-broker serve -config /path/to/config.toml
 ```
@@ -88,6 +89,7 @@ gha-mac-broker serve -config /path/to/config.toml
   before the pool exists.
 - `bind` clones a warm VM, registers it as an ephemeral runner, runs one job,
   and tears the VM down. It needs the golden image to be present.
+- `status` prints the bearer-guarded `/status` snapshot from a running broker.
 
 ## Architecture
 
