@@ -1,106 +1,474 @@
 #!/usr/bin/env bash
 #
-# install.sh downloads the signed gha-mac-broker binary from the latest GitHub
-# release and runs its `install` subcommand, which owns the full host setup
-# (config, secrets, golden image, and the launchd/systemd service).
-#
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/agoodkind/gha-mac-broker/main/install.sh | bash
-#
-# Local checkout:
-#   ./install.sh [flags]
-#
-# Flags:
-#   --version TAG     pin to a specific release tag (default: latest)
-#   --bin-dir DIR     override binary install dir (default: $XDG_BIN_HOME or
-#                     $HOME/.local/bin)
-#   --no-service      install the binary only; skip `gha-mac-broker install`
-#   --no-swift-mk     skip the default maintenance tool installer
-#   -h, --help        show this help
-#
-# Exit codes:
-#   0 success
-#   1 usage / unsupported platform
-#   2 download / extract / install failure
-
+# Generated installer core downloads and verifies the release binary.
+# gha-mac-broker host setup lives below the marker region.
 set -euo pipefail
 
-REPO="agoodkind/gha-mac-broker"
-BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
-VERSION=""
-DO_SERVICE=1
-DO_SWIFT_MK=1
-
+# BEGIN go-mk installer core (managed by go-mk bootstrap; do not edit)
 usage() {
-    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    cat <<'USAGE'
+install.sh installs a release binary from GitHub.
+
+Usage:
+  ./install.sh [flags]
+
+Flags:
+  --version TAG          pin a release tag
+  --channel rolling|stable
+                         choose release channel (default: rolling)
+  --bin-dir PATH         install dir (default: $XDG_BIN_HOME or $HOME/.local/bin)
+  --repo OWNER/NAME      GitHub repo override
+  --require-attestation  fail when GitHub attestation verification cannot run
+  --bin-only             skip repo-specific post-install steps
+  -h, --help             show this help
+
+Exit codes:
+  0 success
+  1 usage or unsupported platform
+  2 download, verify, or install failure
+USAGE
 }
 
-die() {
+usage_error() {
     printf 'install.sh: %s\n' "$*" >&2
     exit 1
 }
 
+install_error() {
+    printf 'install.sh: %s\n' "$*" >&2
+    exit 2
+}
+
+cleanup_path() {
+    local path_to_remove="$1"
+
+    if [[ -n "$path_to_remove" && -e "$path_to_remove" ]]; then
+        rm -rf "$path_to_remove"
+    fi
+}
+
 need() {
-    command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+    command -v "$1" >/dev/null 2>&1 || install_error "missing dependency: $1"
+}
+
+detect_os() {
+    case "$(uname -s)" in
+        Darwin)
+            printf '%s\n' "darwin"
+            ;;
+        Linux)
+            printf '%s\n' "linux"
+            ;;
+        *)
+            usage_error "unsupported OS: $(uname -s)"
+            ;;
+    esac
+}
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64 | amd64)
+            printf '%s\n' "amd64"
+            ;;
+        arm64 | aarch64)
+            printf '%s\n' "arm64"
+            ;;
+        *)
+            usage_error "unsupported arch: $(uname -m)"
+            ;;
+    esac
 }
 
 detect_platform() {
-    local os arch
-    case "$(uname -s)" in
-        Darwin) os=darwin ;;
-        Linux)  os=linux ;;
-        *) die "unsupported OS: $(uname -s)" ;;
-    esac
-    case "$(uname -m)" in
-        x86_64|amd64)  arch=amd64 ;;
-        arm64|aarch64) arch=arm64 ;;
-        *) die "unsupported arch: $(uname -m)" ;;
-    esac
-    printf '%s_%s' "$os" "$arch"
+    local os_name
+    local arch_name
+
+    os_name="$(detect_os)"
+    arch_name="$(detect_arch)"
+    printf '%s_%s\n' "$os_name" "$arch_name"
 }
 
-resolve_version() {
-    if [[ -n "$VERSION" ]]; then
-        printf '%s' "$VERSION"
-        return
+resolve_tag() {
+    local repo="$1"
+    local version="$2"
+    local channel="$3"
+
+    if [[ -n "$version" ]]; then
+        printf '%s\n' "$version"
+        return 0
     fi
-    # The releases list is newest-first and includes pre-releases, which the
-    # /releases/latest endpoint excludes; the broker publishes pre-releases.
-    # Parse the first tag_name with grep/sed so a fresh host needs no jq.
-    curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=1" \
-        | grep -m1 '"tag_name"' \
-        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
-        || die "failed to query latest release from $REPO"
+
+    case "$channel" in
+        rolling)
+            resolve_rolling_tag "$repo"
+            ;;
+        stable)
+            resolve_stable_tag "$repo"
+            ;;
+        *)
+            usage_error "--channel must be rolling or stable"
+            ;;
+    esac
 }
 
-install_bin() {
-    local platform tag url tmpdir tarball extracted
-    platform="$(detect_platform)"
-    tag="$(resolve_version)"
+resolve_rolling_tag() {
+    local repo="$1"
+    local releases_json
+    local tag
+
+    need curl
+    releases_json="$(curl -fsSL "https://api.github.com/repos/$repo/releases?per_page=10")" || install_error "could not fetch releases for $repo"
+    tag="$(first_release_tag "$releases_json")"
     if [[ -z "$tag" ]]; then
-        die "could not resolve release tag (use --version)"
+        install_error "no rolling release found for $repo"
+    fi
+    printf '%s\n' "$tag"
+}
+
+first_release_tag() {
+    local releases_json="$1"
+
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s\n' "$releases_json" | jq -r '[.[] | select(.draft != true) | .tag_name][0] // ""'
+        return 0
     fi
 
-    url="https://github.com/$REPO/releases/download/$tag/gha-mac-broker_${platform}.tar.gz"
-    tmpdir="$(mktemp -d)"
-    # Expand tmpdir into the trap now and fire on EXIT, so cleanup still runs
-    # when the function exits via die (which calls exit, skipping a RETURN trap).
-    # shellcheck disable=SC2064
-    trap "rm -rf '$tmpdir'" EXIT
+    need awk
+    need sed
+    printf '%s\n' "$releases_json" |
+        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        awk 'NF > 0 { print; exit }'
+}
 
-    tarball="$tmpdir/gha-mac-broker.tar.gz"
-    printf 'install.sh: downloading %s\n' "$url"
-    curl -fsSL "$url" -o "$tarball" || die "download failed: $url"
-    tar -xzf "$tarball" -C "$tmpdir" || die "extract failed: $tarball"
+resolve_stable_tag() {
+    local repo="$1"
+    local headers
+    local location
+    local tag
 
-    extracted="$tmpdir/gha-mac-broker"
-    if [[ ! -x "$extracted" ]]; then
-        die "binary not found in tarball at $extracted"
+    need curl
+    need awk
+    headers="$(curl -fsSI "https://github.com/$repo/releases/latest")" || install_error "no stable release found for $repo; try --channel rolling"
+    location="$(printf '%s\n' "$headers" | awk 'tolower($0) ~ /^location:/ { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }')"
+    if [[ -z "$location" ]]; then
+        install_error "no stable release found for $repo; try --channel rolling"
+    fi
+    tag="${location##*/}"
+    if [[ -z "$tag" || "$tag" == "latest" ]]; then
+        install_error "no stable release found for $repo; try --channel rolling"
+    fi
+    printf '%s\n' "$tag"
+}
+
+download_file() {
+    local url="$1"
+    local output_path="$2"
+
+    printf 'install.sh: downloading %s\n' "$url" >&2
+    curl -fsSL "$url" -o "$output_path" || install_error "download failed: $url"
+}
+
+checksum_binary() {
+    local os_name="$1"
+    local file_path="$2"
+
+    case "$os_name" in
+        darwin)
+            need shasum
+            shasum -a 256 "$file_path" | awk '{ print $1 }'
+            ;;
+        linux)
+            need sha256sum
+            sha256sum "$file_path" | awk '{ print $1 }'
+            ;;
+        *)
+            usage_error "unsupported OS: $os_name"
+            ;;
+    esac
+}
+
+expected_checksum() {
+    local checksums_path="$1"
+    local archive_name="$2"
+
+    awk -v archive_name="$archive_name" '
+        {
+            for (i = 2; i <= NF; i++) {
+                entry = $i
+                sub(/^\*/, "", entry)
+                if (entry == archive_name || entry == "./" archive_name) {
+                    print $1
+                    found = 1
+                    exit
+                }
+            }
+        }
+        END {
+            if (found != 1) {
+                exit 1
+            }
+        }
+    ' "$checksums_path"
+}
+
+verify_sha256() {
+    local os_name="$1"
+    local checksums_path="$2"
+    local tarball="$3"
+    local archive_name="$4"
+    local expected
+    local actual
+
+    expected="$(expected_checksum "$checksums_path" "$archive_name")" || install_error "checksums.txt has no entry for $archive_name"
+    actual="$(checksum_binary "$os_name" "$tarball")"
+    if [[ "$actual" != "$expected" ]]; then
+        install_error "sha256 mismatch for $archive_name"
+    fi
+    printf 'install.sh: sha256 verified for %s\n' "$archive_name" >&2
+}
+
+verify_attestation() {
+    local tarball="$1"
+    local repo="$2"
+    local require_attestation="$3"
+
+    if command -v gh >/dev/null 2>&1; then
+        if gh auth status >/dev/null 2>&1; then
+            gh attestation verify "$tarball" --repo "$repo" --signer-workflow agoodkind/go-makefile/.github/workflows/_release_build.yml || install_error "attestation verification failed"
+            return 0
+        fi
     fi
 
-    mkdir -p "$BIN_DIR"
-    install -m 0755 "$extracted" "$BIN_DIR/gha-mac-broker"
-    printf 'install.sh: installed %s (%s)\n' "$BIN_DIR/gha-mac-broker" "$tag"
+    if [[ "$require_attestation" -eq 1 ]]; then
+        install_error "GitHub attestation verification required, but gh is unavailable or unauthenticated"
+    fi
+
+    printf 'install.sh: WARNING: sha256 integrity was verified, but provenance was not verified because gh is unavailable or unauthenticated.\n' >&2
+}
+
+extract_binary() {
+    local tarball="$1"
+    local extract_dir="$2"
+    local binary="$3"
+    local extracted_path="$extract_dir/$binary"
+
+    need tar
+    mkdir -p "$extract_dir" || install_error "could not create extract dir: $extract_dir"
+    tar -xzf "$tarball" -C "$extract_dir" || install_error "extract failed: $tarball"
+    if [[ ! -x "$extracted_path" ]]; then
+        install_error "binary not found or not executable in tarball: $binary"
+    fi
+    printf '%s\n' "$extracted_path"
+}
+
+install_binary_atomically() {
+    local extracted_path="$1"
+    local bin_dir="$2"
+    local binary="$3"
+    local target_path="$bin_dir/$binary"
+    local temp_path
+
+    mkdir -p "$bin_dir" || install_error "could not create bin dir: $bin_dir"
+    temp_path="$(mktemp "$bin_dir/.$binary.tmp.XXXXXX")" || install_error "could not create temp install path in $bin_dir"
+    install -m 0755 "$extracted_path" "$temp_path" || {
+        rm -f "$temp_path"
+        install_error "install failed: $target_path"
+    }
+    mv -f "$temp_path" "$target_path" || {
+        rm -f "$temp_path"
+        install_error "atomic move failed: $target_path"
+    }
+    printf 'install.sh: installed %s\n' "$target_path" >&2
+}
+
+install_release() {
+    local repo="$1"
+    local binary="$2"
+    local tag="$3"
+    local bin_dir="$4"
+    local require_attestation="$5"
+    local platform
+    local os_name
+    local archive_name
+    local tmpdir
+    local tarball
+    local checksums_path
+    local extract_dir
+    local extracted_path
+
+    need curl
+    need awk
+    need sed
+    need install
+    platform="$(detect_platform)"
+    os_name="${platform%%_*}"
+    archive_name="${binary}_${platform}.tar.gz"
+    tmpdir="$(mktemp -d)" || install_error "could not create temp dir"
+    trap 'cleanup_path "$tmpdir"' EXIT
+    tarball="$tmpdir/$archive_name"
+    checksums_path="$tmpdir/checksums.txt"
+    extract_dir="$tmpdir/extract"
+
+    download_file "https://github.com/$repo/releases/download/$tag/$archive_name" "$tarball"
+    download_file "https://github.com/$repo/releases/download/$tag/checksums.txt" "$checksums_path"
+    verify_sha256 "$os_name" "$checksums_path" "$tarball" "$archive_name"
+    verify_attestation "$tarball" "$repo" "$require_attestation"
+    extracted_path="$(extract_binary "$tarball" "$extract_dir" "$binary")"
+    install_binary_atomically "$extracted_path" "$bin_dir" "$binary"
+    cleanup_path "$tmpdir"
+    trap - EXIT
+}
+
+print_installed_version() {
+    local installed_path="$1"
+    local version_output
+
+    if version_output="$("$installed_path" version 2>/dev/null)"; then
+        printf '%s\n' "$version_output"
+    fi
+}
+
+run_install() {
+    local repo="agoodkind/gha-mac-broker"
+    local binary="gha-mac-broker"
+    local bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
+    local version=""
+    local channel="rolling"
+    local require_attestation=0
+    local bin_only=0
+    local tag
+    local installed_path
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    usage_error "--version requires a tag"
+                fi
+                version="$1"
+                ;;
+            --channel)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    usage_error "--channel requires rolling or stable"
+                fi
+                channel="$1"
+                ;;
+            --bin-dir)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    usage_error "--bin-dir requires a path"
+                fi
+                bin_dir="$1"
+                ;;
+            --repo)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    usage_error "--repo requires OWNER/NAME"
+                fi
+                repo="$1"
+                ;;
+            --require-attestation)
+                require_attestation=1
+                ;;
+            --bin-only)
+                bin_only=1
+                ;;
+            -h | --help)
+                usage
+                return 0
+                ;;
+            *)
+                usage_error "unknown flag: $1 (try --help)"
+                ;;
+        esac
+        shift
+    done
+
+    if [[ -z "$repo" ]]; then
+        usage_error "--repo must not be empty"
+    fi
+    if [[ -z "$binary" ]]; then
+        usage_error "binary name must not be empty"
+    fi
+
+    tag="$(resolve_tag "$repo" "$version" "$channel")"
+    RESOLVED_TAG="$tag"
+    install_release "$repo" "$binary" "$tag" "$bin_dir" "$require_attestation"
+    installed_path="$bin_dir/$binary"
+
+    if [[ "$bin_only" -eq 0 ]]; then
+        post_install "$installed_path" || install_error "post_install failed"
+    fi
+
+    print_installed_version "$installed_path"
+}
+# END go-mk installer core
+
+CORE_ARGS=()
+DO_SWIFT_MK=1
+
+usage() {
+    cat <<'USAGE'
+install.sh installs gha-mac-broker from a GitHub release.
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/agoodkind/gha-mac-broker/main/install.sh | bash
+  ./install.sh [flags]
+
+Flags:
+  --version TAG          pin a release tag
+  --channel rolling|stable
+                         choose release channel (default: rolling)
+  --bin-dir PATH         install dir (default: $XDG_BIN_HOME or $HOME/.local/bin)
+  --repo OWNER/NAME      GitHub repo override
+  --require-attestation  fail when GitHub attestation verification cannot run
+  --bin-only             install the binary only, skip service setup
+  --no-service           install the binary only, skip service setup
+  --no-swift-mk          skip the default maintenance tool (swift-mk) installer
+  -h, --help             show this help
+
+Exit codes:
+  0 success
+  1 usage or unsupported platform
+  2 download, verify, or install failure
+USAGE
+}
+
+parse_gha_mac_broker_args() {
+    local option_name
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-service)
+                CORE_ARGS+=(--bin-only)
+                ;;
+            --no-swift-mk)
+                DO_SWIFT_MK=0
+                ;;
+            --version | --repo | --channel | --bin-dir)
+                option_name="$1"
+                CORE_ARGS+=("$option_name")
+                shift
+                if [[ $# -eq 0 ]]; then
+                    usage_error "$option_name requires a value"
+                fi
+                CORE_ARGS+=("$1")
+                ;;
+            --require-attestation | --bin-only)
+                CORE_ARGS+=("$1")
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            *)
+                usage_error "unknown flag: $1 (try --help)"
+                ;;
+        esac
+        shift
+    done
 }
 
 install_swift_mk() {
@@ -108,34 +476,31 @@ install_swift_mk() {
         return
     fi
 
-    printf 'install.sh: installing swift-mk for the default maintenance command\n'
+    # Install swift-mk before the broker install so the maintenance timer's
+    # default command resolves; best-effort, since the broker install's
+    # maintenance preflight warns separately if it is missing.
+    printf 'install.sh: installing swift-mk for the default maintenance command\n' >&2
     if curl -fsSL https://raw.githubusercontent.com/agoodkind/swift-makefile/main/install.sh | bash; then
-        printf 'install.sh: swift-mk installer completed\n'
+        printf 'install.sh: swift-mk installer completed\n' >&2
     else
-        printf 'install.sh: swift-mk installer failed; continuing because maintenance preflight will warn if needed\n' >&2
+        printf 'install.sh: swift-mk installer failed; continuing (maintenance preflight will warn if needed)\n' >&2
     fi
 }
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --version)    shift; VERSION="${1:?--version requires a value}" ;;
-        --bin-dir)    shift; BIN_DIR="${1:?--bin-dir requires a value}" ;;
-        --no-service) DO_SERVICE=0 ;;
-        --no-swift-mk) DO_SWIFT_MK=0 ;;
-        -h|--help)    usage; exit 0 ;;
-        *) die "unknown flag: $1 (try --help)" ;;
-    esac
-    shift
-done
+post_install() {
+    local installed_path="$1"
 
-need curl
-need tar
+    install_swift_mk
+    "$installed_path" install || install_error "gha-mac-broker install failed"
+    printf 'install.sh: done\n' >&2
+}
 
-install_bin
-install_swift_mk
+main() {
+    parse_gha_mac_broker_args "$@"
+    # The guarded expansion keeps a flagless curl|bash install working on the
+    # stock macOS bash 3.2, where "${CORE_ARGS[@]}" with an empty array trips
+    # set -u (fixed upstream only in bash 4.4).
+    run_install ${CORE_ARGS[@]+"${CORE_ARGS[@]}"}
+}
 
-if [[ "$DO_SERVICE" -eq 1 ]]; then
-    "$BIN_DIR/gha-mac-broker" install || die "gha-mac-broker install failed"
-fi
-
-printf 'install.sh: done\n'
+main "$@"

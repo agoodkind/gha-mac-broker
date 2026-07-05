@@ -202,6 +202,11 @@ func (c *Client) InstallationToken(ctx context.Context, installationID int64, re
 		Repositories: []string{repo},
 		Permissions:  tokenPermissions{Administration: "write", Actions: "write"},
 	}
+	slog.DebugContext(ctx, "minting installation token",
+		"installation_id", installationID,
+		"repositories", reqBody.Repositories,
+		"administration", reqBody.Permissions.Administration,
+		"actions", reqBody.Permissions.Actions)
 	encoded, err := json.Marshal(reqBody)
 	if err != nil {
 		slog.ErrorContext(ctx, "ghapp marshal token request failed", "err", err)

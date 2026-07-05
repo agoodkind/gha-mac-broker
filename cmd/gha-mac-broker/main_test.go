@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
+	"goodkind.io/go-makefile/selfupdate"
 )
 
 type staleRunnerClient struct {
@@ -114,4 +118,161 @@ func TestDeleteStaleRunnersListErrorDoesNotBlockStartup(t *testing.T) {
 	if len(client.deleted) != 0 {
 		t.Fatalf("deleted runners after list error = %v, want none", client.deleted)
 	}
+}
+
+func TestRunUpdateApplyRestartsServiceAfterAppliedUpdate(t *testing.T) {
+	var capturedOptions selfupdate.Options
+	restarted := false
+	withUpdateTestHooks(t, updateTestHooks{
+		apply: func(_ context.Context, options selfupdate.Options) (selfupdate.ApplyResult, error) {
+			capturedOptions = options
+			return selfupdate.ApplyResult{
+				CheckResult: selfupdate.CheckResult{
+					CurrentVersion:  "202607030215-16-122a5cc",
+					LatestTag:       "202607030301-b-1d33d4f",
+					AssetName:       "gha-mac-broker_darwin_arm64.tar.gz",
+					UpdateAvailable: true,
+				},
+				Applied: true,
+				DryRun:  false,
+			}, nil
+		},
+		restart: func(_ context.Context) (bool, error) {
+			restarted = true
+			return true, nil
+		},
+	})
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := runUpdateWithWriters(context.Background(), []string{"apply"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runUpdateWithWriters: %v\nstderr=%s", err, stderr.String())
+	}
+	if !restarted {
+		t.Fatal("service restart was not triggered")
+	}
+	if capturedOptions.Config.ValidateMatch != "gha-mac-broker " {
+		t.Fatalf("validate match = %q, want gha-mac-broker ", capturedOptions.Config.ValidateMatch)
+	}
+	if !strings.Contains(stdout.String(), "gha-mac-broker: update applied and service restarted") {
+		t.Fatalf("stdout = %q, want applied restart message", stdout.String())
+	}
+}
+
+func TestRunUpdateApplyDryRunDoesNotRestartService(t *testing.T) {
+	restarted := false
+	withUpdateTestHooks(t, updateTestHooks{
+		apply: func(_ context.Context, options selfupdate.Options) (selfupdate.ApplyResult, error) {
+			if !options.DryRun {
+				t.Fatal("dry-run option was not passed to selfupdate.Apply")
+			}
+			return selfupdate.ApplyResult{
+				CheckResult: selfupdate.CheckResult{
+					CurrentVersion:  "202607030215-16-122a5cc",
+					LatestTag:       "202607030301-b-1d33d4f",
+					AssetName:       "gha-mac-broker_darwin_arm64.tar.gz",
+					UpdateAvailable: true,
+				},
+				Applied: false,
+				DryRun:  true,
+			}, nil
+		},
+		restart: func(_ context.Context) (bool, error) {
+			restarted = true
+			return true, nil
+		},
+	})
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := runUpdateWithWriters(context.Background(), []string{"apply", "-dry-run"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runUpdateWithWriters: %v\nstderr=%s", err, stderr.String())
+	}
+	if restarted {
+		t.Fatal("service restart was triggered for a dry run")
+	}
+	if !strings.Contains(stdout.String(), "gha-mac-broker: update apply dry run ok") {
+		t.Fatalf("stdout = %q, want dry-run message", stdout.String())
+	}
+}
+
+func TestStartUpdateSchedulerStopsServeContextForRelaunch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopCalled := false
+	var capturedHooks selfupdate.SchedulerHooks
+	withUpdateTestHooks(t, updateTestHooks{
+		runScheduler: func(_ context.Context, hooks selfupdate.SchedulerHooks) {
+			capturedHooks = hooks
+		},
+	})
+
+	startUpdateScheduler(ctx, func() {
+		stopCalled = true
+		cancel()
+	}, slog.Default())
+
+	if capturedHooks.Enabled == nil || !capturedHooks.Enabled() {
+		t.Fatal("scheduler enabled hook is missing or false")
+	}
+	if capturedHooks.Mode == nil || capturedHooks.Mode() != selfupdate.ModeApply {
+		t.Fatalf("scheduler mode = %q, want apply", capturedHooks.Mode())
+	}
+	if capturedHooks.Options == nil {
+		t.Fatal("scheduler options hook is missing")
+	}
+	if capturedHooks.Options().Config.ValidateMatch != "gha-mac-broker " {
+		t.Fatalf("scheduler validate match = %q, want gha-mac-broker ", capturedHooks.Options().Config.ValidateMatch)
+	}
+	if capturedHooks.StopForRelaunch == nil {
+		t.Fatal("scheduler stop hook is missing")
+	}
+	capturedHooks.StopForRelaunch()
+	if !stopCalled {
+		t.Fatal("scheduler stop hook did not call serve stop function")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("serve context was not canceled")
+	}
+}
+
+type updateTestHooks struct {
+	check        func(context.Context, selfupdate.Options) (selfupdate.CheckResult, error)
+	apply        func(context.Context, selfupdate.Options) (selfupdate.ApplyResult, error)
+	loadState    func(string) (selfupdate.State, error)
+	restart      func(context.Context) (bool, error)
+	runScheduler func(context.Context, selfupdate.SchedulerHooks)
+}
+
+func withUpdateTestHooks(t *testing.T, hooks updateTestHooks) {
+	t.Helper()
+	oldCheck := checkUpdate
+	oldApply := applyUpdate
+	oldLoadState := loadUpdateState
+	oldRestart := restartManagedService
+	oldRunScheduler := runSelfUpdateScheduler
+	if hooks.check != nil {
+		checkUpdate = hooks.check
+	}
+	if hooks.apply != nil {
+		applyUpdate = hooks.apply
+	}
+	if hooks.loadState != nil {
+		loadUpdateState = hooks.loadState
+	}
+	if hooks.restart != nil {
+		restartManagedService = hooks.restart
+	}
+	if hooks.runScheduler != nil {
+		runSelfUpdateScheduler = hooks.runScheduler
+	}
+	t.Cleanup(func() {
+		checkUpdate = oldCheck
+		applyUpdate = oldApply
+		loadUpdateState = oldLoadState
+		restartManagedService = oldRestart
+		runSelfUpdateScheduler = oldRunScheduler
+	})
 }
