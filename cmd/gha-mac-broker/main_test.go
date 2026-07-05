@@ -4,7 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,9 +19,18 @@ import (
 )
 
 type staleRunnerClient struct {
-	runners []ghapp.Runner
-	listErr error
-	deleted []int64
+	repos        []string
+	listReposErr error
+	runners      []ghapp.Runner
+	listErr      error
+	deleted      []int64
+}
+
+func (c *staleRunnerClient) ListInstalledRepos(_ context.Context) ([]string, error) {
+	if c.listReposErr != nil {
+		return nil, c.listReposErr
+	}
+	return append([]string(nil), c.repos...), nil
 }
 
 func (c *staleRunnerClient) ListRunners(_ context.Context, _ string) ([]ghapp.Runner, error) {
@@ -29,6 +43,12 @@ func (c *staleRunnerClient) ListRunners(_ context.Context, _ string) ([]ghapp.Ru
 func (c *staleRunnerClient) DeleteRunner(_ context.Context, _ string, runnerID int64) error {
 	c.deleted = append(c.deleted, runnerID)
 	return nil
+}
+
+type roundTripFunc func(req *http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func testServeConfig() *config.Config {
@@ -54,13 +74,85 @@ func testServeConfig() *config.Config {
 			FastPullDir:      "",
 			FastPullParallel: 16,
 		},
-		Labels:       []string{"self-hosted", "macOS"},
-		AllowedRepos: []string{"owner/repo"},
+		Labels: []string{"self-hosted", "macOS"},
+	}
+}
+
+func TestRunStatusUsesCapacityTokenAndListenPort(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "capacity-token")
+	if err := os.WriteFile(tokenPath, []byte("status-token\n"), 0o600); err != nil {
+		t.Fatalf("write capacity token: %v", err)
+	}
+	configPath := filepath.Join(dir, "config.toml")
+	configBody := fmt.Sprintf(`
+listen_addr = "[::1]:23456"
+runner_count = 1
+labels = ["self-hosted"]
+
+[app]
+app_id = "1"
+private_key_path = "/tmp/private-key.pem"
+webhook_secret_path = "/tmp/webhook-secret"
+capacity_token_path = %q
+
+[tart]
+base_image = %q
+`, tokenPath, config.DefaultBaseImage)
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var capturedRequest *http.Request
+	oldClient := statusHTTPClient
+	statusHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			capturedRequest = req
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"snapshot":{"ready":true},"workers":[]}`)),
+			}, nil
+		}),
+	}
+	t.Cleanup(func() {
+		statusHTTPClient = oldClient
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runStatusWithWriters(context.Background(), []string{"-config", configPath}, &stdout, &stderr); err != nil {
+		t.Fatalf("runStatusWithWriters: %v\nstderr=%s", err, stderr.String())
+	}
+	if capturedRequest == nil {
+		t.Fatal("status request was not sent")
+	}
+	if capturedRequest.URL.String() != "http://localhost:23456/status" {
+		t.Fatalf("status url = %q, want http://localhost:23456/status", capturedRequest.URL.String())
+	}
+	if capturedRequest.Header.Get("Authorization") != "Bearer status-token" {
+		t.Fatalf("authorization = %q, want bearer token", capturedRequest.Header.Get("Authorization"))
+	}
+	if !strings.Contains(stdout.String(), `"workers":[]`) {
+		t.Fatalf("stdout = %q, want status JSON", stdout.String())
+	}
+}
+
+func TestStatusEndpointUsesLocalhost(t *testing.T) {
+	for _, listenAddr := range []string{"[::1]:23456", "127.0.0.1:23456", "0.0.0.0:23456"} {
+		statusURL, err := statusEndpoint(context.Background(), listenAddr)
+		if err != nil {
+			t.Fatalf("statusEndpoint(%q): %v", listenAddr, err)
+		}
+		if statusURL != "http://localhost:23456/status" {
+			t.Fatalf("status url for %q = %q, want http://localhost:23456/status", listenAddr, statusURL)
+		}
 	}
 }
 
 func TestDeleteStaleRunnersDeletesOfflineRunners(t *testing.T) {
 	client := &staleRunnerClient{
+		repos: []string{"owner/repo"},
 		runners: []ghapp.Runner{
 			{ID: 11, Name: "gha-old", Status: "offline", Busy: false},
 			{ID: 12, Name: "gha-new", Status: "online", Busy: true},
@@ -83,6 +175,7 @@ func TestDeleteStaleRunnersOnlyDeletesOfflineRunnersWithConfiguredPrefix(t *test
 	cfg := testServeConfig()
 	cfg.Tart.VMNamePrefix = "broker-managed"
 	client := &staleRunnerClient{
+		repos: []string{"owner/repo"},
 		runners: []ghapp.Runner{
 			{ID: 11, Name: "broker-managed-old", Status: "offline", Busy: false},
 			{ID: 12, Name: "external-runner", Status: "offline", Busy: false},
@@ -104,6 +197,7 @@ func TestDeleteStaleRunnersOnlyDeletesOfflineRunnersWithConfiguredPrefix(t *test
 
 func TestDeleteStaleRunnersListErrorDoesNotBlockStartup(t *testing.T) {
 	client := &staleRunnerClient{
+		repos:   []string{"owner/repo"},
 		runners: nil,
 		listErr: errors.New("github unavailable"),
 		deleted: nil,
@@ -113,6 +207,22 @@ func TestDeleteStaleRunnersListErrorDoesNotBlockStartup(t *testing.T) {
 
 	if len(client.deleted) != 0 {
 		t.Fatalf("deleted runners after list error = %v, want none", client.deleted)
+	}
+}
+
+func TestDeleteStaleRunnersRepoListErrorDoesNotBlockStartup(t *testing.T) {
+	client := &staleRunnerClient{
+		repos:        nil,
+		listReposErr: errors.New("github unavailable"),
+		runners:      nil,
+		listErr:      nil,
+		deleted:      nil,
+	}
+
+	deleteStaleRunners(context.Background(), testServeConfig(), client)
+
+	if len(client.deleted) != 0 {
+		t.Fatalf("deleted runners after repo list error = %v, want none", client.deleted)
 	}
 }
 

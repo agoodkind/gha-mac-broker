@@ -10,19 +10,27 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os/exec"
 	"strings"
 )
 
+const maxTeeTailBytes = 64 * 1024
+
 // CommandRunner runs `tart <args...>` and returns combined stdout. It is a field
 // so tests can stub the CLI.
 type CommandRunner func(ctx context.Context, bin string, args ...string) ([]byte, error)
 
-// Tart drives the tart binary. The run field is swappable in white-box tests.
+// TeeCommandRunner runs `tart <args...>` and mirrors combined output to sink.
+// It is a field so tests can stub streaming CLI paths.
+type TeeCommandRunner func(ctx context.Context, bin string, sink io.Writer, args ...string) ([]byte, error)
+
+// Tart drives the tart binary. Runner fields are swappable in white-box tests.
 type Tart struct {
-	bin string
-	run CommandRunner
+	bin    string
+	run    CommandRunner
+	runTee TeeCommandRunner
 }
 
 // New returns a Tart that invokes the given binary (default "tart").
@@ -30,7 +38,7 @@ func New(bin string) *Tart {
 	if bin == "" {
 		bin = "tart"
 	}
-	return &Tart{bin: bin, run: execRunner}
+	return &Tart{bin: bin, run: execRunner, runTee: execRunnerTee}
 }
 
 // command builds an [exec.Cmd] for the tart binary. Centralizing construction
@@ -48,6 +56,56 @@ func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error)
 	if err := cmd.Run(); err != nil {
 		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", strings.Join(args, " "))
 		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out.String()))
+	}
+	return out.Bytes(), nil
+}
+
+type tailBuffer struct {
+	limit int
+	buf   []byte
+}
+
+func newTailBuffer(limit int) *tailBuffer {
+	return &tailBuffer{
+		limit: limit,
+		buf:   make([]byte, 0, limit),
+	}
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	if b.limit <= 0 {
+		return len(p), nil
+	}
+	if len(p) >= b.limit {
+		b.buf = append(b.buf[:0], p[len(p)-b.limit:]...)
+		return len(p), nil
+	}
+	excess := len(b.buf) + len(p) - b.limit
+	if excess > 0 {
+		copy(b.buf, b.buf[excess:])
+		b.buf = b.buf[:len(b.buf)-excess]
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *tailBuffer) Bytes() []byte {
+	return b.buf
+}
+
+func execRunnerTee(ctx context.Context, bin string, sink io.Writer, args ...string) ([]byte, error) {
+	cmd := command(ctx, bin, args...)
+	out := newTailBuffer(maxTeeTailBytes)
+	writer := io.Writer(out)
+	if sink != nil {
+		writer = io.MultiWriter(out, sink)
+	}
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+	if err := cmd.Run(); err != nil {
+		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", strings.Join(args, " "))
+		tail := string(out.Bytes())
+		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(tail))
 	}
 	return out.Bytes(), nil
 }
@@ -94,6 +152,13 @@ func (t *Tart) Clone(ctx context.Context, source, name string, insecure bool) er
 func (t *Tart) Exec(ctx context.Context, name string, argv ...string) ([]byte, error) {
 	args := append([]string{"exec", name}, argv...)
 	return t.run(ctx, t.bin, args...)
+}
+
+// ExecTee runs a guest command and mirrors combined output to sink while it is
+// produced. It still returns the buffered combined output when the command exits.
+func (t *Tart) ExecTee(ctx context.Context, name string, sink io.Writer, argv ...string) ([]byte, error) {
+	args := append([]string{"exec", name}, argv...)
+	return t.runTee(ctx, t.bin, sink, args...)
 }
 
 // Stop gracefully stops a running VM.

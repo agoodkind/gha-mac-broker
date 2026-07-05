@@ -18,10 +18,8 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
-func TestLoadDefaultsAndAllowlist(t *testing.T) {
+func TestLoadDefaults(t *testing.T) {
 	path := writeConfig(t, `
-allowed_repos = ["agoodkind/lmd", "agoodkind/swift-makefile"]
-
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"
@@ -87,11 +85,21 @@ private_key_path = "/tmp/key.pem"
 	if image != DefaultBaseImage {
 		t.Errorf("mapped image = %q, want %q", image, DefaultBaseImage)
 	}
-	if !cfg.RepoAllowed("agoodkind/LMD") {
-		t.Error("allowlist should match case-insensitively")
-	}
-	if cfg.RepoAllowed("agoodkind/secret") {
-		t.Error("non-listed repo must not be allowed")
+}
+
+func TestLoadIgnoresLegacyAllowedReposKey(t *testing.T) {
+	path := writeConfig(t, `
+allowed_repos = ["agoodkind/lmd"]
+
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[tart]
+`)
+
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load with legacy allowed_repos key: %v", err)
 	}
 }
 
@@ -100,7 +108,8 @@ func TestLoadRunnerPoolSettings(t *testing.T) {
 runner_count = 5
 max_idle = "45m"
 max_age = "6h"
-allowed_repos = ["agoodkind/lmd"]
+max_bind = "90m"
+pickup_timeout = "7m"
 
 [app]
 app_id = "12345"
@@ -123,15 +132,19 @@ warm_budget = 7
 	if time.Duration(cfg.MaxAge) != 6*time.Hour {
 		t.Fatalf("max age = %s, want 6h0m0s", time.Duration(cfg.MaxAge))
 	}
+	if time.Duration(cfg.MaxBind) != 90*time.Minute {
+		t.Fatalf("max bind = %s, want 1h30m0s", time.Duration(cfg.MaxBind))
+	}
+	if time.Duration(cfg.PickupTimeout) != 7*time.Minute {
+		t.Fatalf("pickup timeout = %s, want 7m0s", time.Duration(cfg.PickupTimeout))
+	}
 	if cfg.Tart.WarmBudget != 7 {
 		t.Fatalf("warm budget = %d, want back-compat parse value 7", cfg.Tart.WarmBudget)
 	}
 }
 
-func TestResolveImageUsesConfiguredAllowlist(t *testing.T) {
+func TestResolveImageUsesConfiguredMappings(t *testing.T) {
 	path := writeConfig(t, `
-allowed_repos = ["agoodkind/lmd"]
-
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"
@@ -185,8 +198,7 @@ func TestResolveImageRejectsUnsafeConfiguredTag(t *testing.T) {
 			FastPull:     nil,
 			FastPullDir:  "",
 		},
-		Labels:       []string{"self-hosted"},
-		AllowedRepos: []string{"agoodkind/lmd"},
+		Labels: []string{"self-hosted"},
 	}
 	if _, ok := cfg.ResolveImage("tahoe", "raw"); ok {
 		t.Fatal("unsafe mapped tag should not resolve")
@@ -206,8 +218,6 @@ app_id = "12345"
 
 func TestLoadRejectsFastPullDirInsideCacheDir(t *testing.T) {
 	path := writeConfig(t, `
-allowed_repos = ["agoodkind/lmd"]
-
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"

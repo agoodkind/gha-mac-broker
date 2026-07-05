@@ -25,6 +25,8 @@ const maxBodyBytes = 1 << 20
 type pooler interface {
 	Enqueue(ctx context.Context, job runnerpool.Job) error
 	Ready() bool
+	Status(ctx context.Context) (runnerpool.Snapshot, []runnerpool.WorkerView)
+	CancelRun(jobID int64)
 }
 
 type webhookAction string
@@ -59,7 +61,12 @@ type capacityResponse struct {
 	Available bool `json:"available"`
 }
 
-// Server handles the /webhook, /capacity, and /healthz endpoints.
+type statusResponse struct {
+	Snapshot runnerpool.Snapshot     `json:"snapshot"`
+	Workers  []runnerpool.WorkerView `json:"workers"`
+}
+
+// Server handles the /webhook, /capacity, /status, and /healthz endpoints.
 type Server struct {
 	mux           *http.ServeMux
 	secret        []byte
@@ -81,6 +88,7 @@ func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs [
 	}
 	s.mux.HandleFunc("/webhook", s.handleWebhook)
 	s.mux.HandleFunc("/capacity", s.handleCapacity)
+	s.mux.HandleFunc("/status", s.handleStatus)
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	if len(webhookCIDRs) == 0 {
 		slog.Warn("webhook IP guard disabled: no CIDRs configured")
@@ -121,7 +129,10 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		slog.DebugContext(r.Context(), "workflow job in progress", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "runner", payload.WorkflowJob.RunnerName, "runner_id", payload.WorkflowJob.RunnerID)
 		w.WriteHeader(http.StatusNoContent)
 	case webhookActionCompleted:
-		slog.DebugContext(r.Context(), "workflow job completed", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "status", payload.WorkflowJob.Status, "conclusion", payload.WorkflowJob.Conclusion)
+		slog.DebugContext(r.Context(), "workflow job completed", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "job_id", payload.WorkflowJob.ID, "status", payload.WorkflowJob.Status, "conclusion", payload.WorkflowJob.Conclusion)
+		if payload.WorkflowJob.Conclusion == "cancelled" || payload.WorkflowJob.Conclusion == "skipped" {
+			s.pool.CancelRun(payload.WorkflowJob.ID)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.WriteHeader(http.StatusNoContent)
@@ -147,11 +158,6 @@ func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byt
 func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload webhookPayload) {
 	ctx := r.Context()
 	repo := payload.Repository.FullName
-	if !s.cfg.RepoAllowed(repo) {
-		slog.InfoContext(ctx, "webhook ignored", "reason", "repo not allowed", "repo", repo)
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
 	if !s.hasLabel(payload.WorkflowJob.Labels) {
 		slog.InfoContext(ctx, "webhook ignored", "reason", "no matching label", "repo", repo, "labels", payload.WorkflowJob.Labels)
 		w.WriteHeader(http.StatusNoContent)
@@ -180,17 +186,15 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.checkBearerToken(w, r) {
-		return
-	}
+	// /capacity is intentionally public. It returns only a coarse availability
+	// boolean and takes no action, so any consumer can probe it with no per-repo
+	// secret, which lets swift-makefile route every consumer to the pool from one
+	// place. The webhook that actually provisions runners stays HMAC-guarded, and
+	// /status stays bearer-guarded because it exposes worker internals.
 	repo := r.URL.Query().Get("repo")
 	macos := r.URL.Query().Get("os")
 	xcode := r.URL.Query().Get("xcode")
 	slog.DebugContext(r.Context(), "capacity request", "repo", repo, "os", macos, "xcode", xcode)
-	if !s.cfg.RepoAllowed(repo) {
-		writeJSON(w, capacityResponse{Available: false})
-		return
-	}
 	// Available only when the requested image resolves to the exact image the
 	// pool is running. The pool warms every VM on cfg.Tart.BaseImage, so a
 	// mappable-but-different tag cannot be served and must route to hosted.
@@ -200,6 +204,21 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, capacityResponse{Available: s.pool.Ready()})
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.checkBearerToken(w, r) {
+		return
+	}
+	snapshot, workers := s.pool.Status(r.Context())
+	writeJSON(w, statusResponse{
+		Snapshot: snapshot,
+		Workers:  workers,
+	})
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -273,7 +292,11 @@ func webhookClientIP(r *http.Request) string {
 	return host
 }
 
-func writeJSON(w http.ResponseWriter, payload capacityResponse) {
+type jsonResponse interface {
+	capacityResponse | statusResponse
+}
+
+func writeJSON[T jsonResponse](w http.ResponseWriter, payload T) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		slog.Error("marshal failed", "err", err)

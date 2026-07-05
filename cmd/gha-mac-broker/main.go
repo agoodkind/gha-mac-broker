@@ -9,6 +9,7 @@
 //	jitconfig          mint a repo-scoped JIT runner config (proves App auth)
 //	bind               clone a warm VM, run one ephemeral job, tear it down
 //	serve              run the HTTP daemon with warm pool and webhook handler
+//	status             print the daemon pool status JSON
 //	install            scaffold config and secrets, build golden, install the service
 //	uninstall          remove the installed service unit
 //	update             check, apply, or show release update state
@@ -24,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -57,6 +59,7 @@ const (
 	commandJITConfig   commandName = "jitconfig"
 	commandBind        commandName = "bind"
 	commandServe       commandName = "serve"
+	commandStatus      commandName = "status"
 	commandBuildGolden commandName = "build-golden"
 	commandInstall     commandName = "install"
 	commandUninstall   commandName = "uninstall"
@@ -89,6 +92,7 @@ var (
 	loadUpdateState        = selfupdate.LoadState
 	restartManagedService  = install.Restart
 	runSelfUpdateScheduler = selfupdate.RunScheduler
+	statusHTTPClient       = &http.Client{Timeout: httpTimeout}
 )
 
 func main() {
@@ -112,6 +116,8 @@ func main() {
 		err = runBind(ctx, args)
 	case commandServe:
 		err = runServe(ctx, args)
+	case commandStatus:
+		err = runStatus(ctx, args)
 	case commandBuildGolden:
 		err = runBuildGolden(ctx, args)
 	case commandInstall:
@@ -131,11 +137,77 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|build-golden|install|uninstall|update> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|status|build-golden|install|uninstall|update> [flags]")
 }
 
 func writeUserLine(writer io.Writer, line string) {
 	_, _ = io.WriteString(writer, line+"\n")
+}
+
+func runStatus(ctx context.Context, args []string) error {
+	return runStatusWithWriters(ctx, args, os.Stdout, os.Stderr)
+}
+
+func runStatusWithWriters(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	configPath := fs.String("config", "", "path to broker config TOML (default: XDG path)")
+	if err := fs.Parse(args); err != nil {
+		slog.ErrorContext(ctx, "status flag parse failed", "err", err)
+		return fmt.Errorf("status flags: %w", err)
+	}
+	if *configPath == "" {
+		*configPath = config.DefaultConfigPath()
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return fmt.Errorf("status: load config: %w", err)
+	}
+	capacityToken, err := cfg.ReadCapacityToken()
+	if err != nil {
+		return fmt.Errorf("status: read capacity token: %w", err)
+	}
+	if len(capacityToken) == 0 {
+		return fmt.Errorf("status: capacity token is not configured")
+	}
+	statusURL, err := statusEndpoint(ctx, cfg.ListenAddr)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+	if err != nil {
+		return fmt.Errorf("status: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+string(capacityToken))
+	resp, err := statusHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("status: request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		message := strings.TrimSpace(string(body))
+		if message == "" {
+			return fmt.Errorf("status: server returned %d", resp.StatusCode)
+		}
+		return fmt.Errorf("status: server returned %d: %s", resp.StatusCode, message)
+	}
+	if _, err := io.Copy(stdout, resp.Body); err != nil {
+		return fmt.Errorf("status: copy response: %w", err)
+	}
+	return nil
+}
+
+func statusEndpoint(ctx context.Context, listenAddr string) (string, error) {
+	_, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		slog.ErrorContext(ctx, "status listen address parse failed", "err", err, "listen_addr", listenAddr)
+		return "", fmt.Errorf("status: parse listen_addr %q: %w", listenAddr, err)
+	}
+	// Dial localhost so the CLI reaches the daemon whether it bound IPv6 or IPv4
+	// loopback. On macOS localhost resolves to IPv6 first, matching the daemon's
+	// default ::1 bind.
+	return "http://" + net.JoinHostPort("localhost", port) + "/status", nil
 }
 
 func runUpdate(ctx context.Context, args []string) error {
@@ -490,9 +562,6 @@ func runJITConfig(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if !cfg.RepoAllowed(*repo) {
-		return fmt.Errorf("repo %s is not in allowed_repos", *repo)
-	}
 
 	installationID, err := gh.InstallationID(ctx, owner, repoName)
 	if err != nil {
@@ -551,6 +620,7 @@ func runBind(ctx context.Context, args []string) error {
 }
 
 type staleRunnerCleaner interface {
+	ListInstalledRepos(ctx context.Context) ([]string, error)
 	ListRunners(ctx context.Context, repo string) ([]ghapp.Runner, error)
 	DeleteRunner(ctx context.Context, repo string, runnerID int64) error
 }
@@ -558,7 +628,12 @@ type staleRunnerCleaner interface {
 func deleteStaleRunners(ctx context.Context, cfg *config.Config, cleaner staleRunnerCleaner) {
 	totalDeleted := 0
 	runnerNamePrefix := cfg.Tart.VMNamePrefix
-	for _, repo := range cfg.AllowedRepos {
+	repos, err := cleaner.ListInstalledRepos(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "installed repository list failed; continuing startup", "err", err)
+		return
+	}
+	for _, repo := range repos {
 		runners, err := cleaner.ListRunners(ctx, repo)
 		if err != nil {
 			slog.WarnContext(ctx, "stale runner list failed; continuing startup", "err", err, "repo", repo)
@@ -681,6 +756,7 @@ func runServe(ctx context.Context, args []string) error {
 type runnerPoolBinder interface {
 	runnerpool.Warmer
 	runnerpool.Runner
+	runnerpool.ActiveJobProber
 }
 
 type orphanSweeper interface {
@@ -697,11 +773,12 @@ func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBin
 		Image:          cfg.Tart.BaseImage,
 		MaxIdle:        time.Duration(cfg.MaxIdle),
 		MaxAge:         time.Duration(cfg.MaxAge),
+		MaxBind:        time.Duration(cfg.MaxBind),
+		PickupTimeout:  time.Duration(cfg.PickupTimeout),
 		RunToken:       runToken,
-		AllowedRepos:   cfg.AllowedRepos,
 		WarmRetryDelay: 0,
 		Now:            time.Now,
-	}, binder, binder, github), nil
+	}, binder, binder, github, binder), nil
 }
 
 func newRunToken(ctx context.Context) (string, error) {
