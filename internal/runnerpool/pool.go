@@ -482,7 +482,7 @@ func (p *Pool) checkHealth(ctx context.Context, vm *broker.WarmVM, repos []strin
 			return fmt.Errorf("runnerpool: list runners %s: %w", repo, err)
 		}
 		for _, runner := range runners {
-			if runner.Name == vm.Name {
+			if runnerNameBelongsToVM(vm.Name, runner.Name, p.options.JobsPerVM) {
 				slog.WarnContext(ctx, "runnerpool idle vm still registered", "repo", repo, "vm", vm.Name)
 				return fmt.Errorf("runnerpool: idle vm %s still registered in %s", vm.Name, repo)
 			}
@@ -831,6 +831,18 @@ func runnerNameForSlot(vmName string, slotIndex int, slotCount int) string {
 		return vmName
 	}
 	return fmt.Sprintf("%s-slot-%d", vmName, slotIndex)
+}
+
+func runnerNameBelongsToVM(vmName string, runnerName string, slotCount int) bool {
+	if slotCount <= 1 {
+		return runnerName == vmName
+	}
+	for slotIndex := range slotCount {
+		if runnerName == runnerNameForSlot(vmName, slotIndex, slotCount) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Pool) teardownVM(ctx context.Context, vm *broker.WarmVM) {

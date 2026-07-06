@@ -107,6 +107,7 @@ type fakeRunner struct {
 	calls     []runCall
 	started   chan runCall
 	release   chan struct{}
+	runErr    error
 	active    int
 	maxActive int
 }
@@ -117,6 +118,7 @@ func newFakeRunner(buffer int) *fakeRunner {
 		calls:     nil,
 		started:   make(chan runCall, buffer),
 		release:   nil,
+		runErr:    nil,
 		active:    0,
 		maxActive: 0,
 	}
@@ -156,7 +158,7 @@ func (r *fakeRunner) RunJob(ctx context.Context, vm *broker.WarmVM, repo string,
 		case <-r.release:
 		}
 	}
-	return nil
+	return r.runErr
 }
 
 func (r *fakeRunner) Release() {
@@ -531,6 +533,43 @@ func TestStatusReportsSlotViewsForMultiSlotWorker(t *testing.T) {
 	calls := prober.Calls()
 	if len(calls) != 1 || calls[0] != "vm-slots#0" {
 		t.Fatalf("prober calls = %v, want [vm-slots#0]", calls)
+	}
+}
+
+func TestStatusSingleSlotKeepsLastErrorEmptyAfterRunJobError(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newFakeRunner(1)
+	runner.runErr = errors.New("transient run error")
+	pool := New(testOptionsWithSlots(clock, 1, 1), warmer, runner, newFakeGitHub(), nil)
+	ctx := startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo", JobID: 1, RunID: 42}); err != nil {
+		t.Fatalf("Enqueue job: %v", err)
+	}
+	waitStarted(t, runner)
+	waitFor(t, func() bool {
+		snapshot := pool.Snapshot()
+		return snapshot.Idle == 1 && snapshot.Busy == 0 && snapshot.Queued == 0
+	})
+
+	_, workers := pool.Status(context.Background())
+	if len(workers) != 1 {
+		t.Fatalf("workers = %+v, want 1 worker", workers)
+	}
+	worker := workers[0]
+	if worker.LastError != "" {
+		t.Fatalf("single-slot last error = %q, want empty", worker.LastError)
+	}
+	if worker.RunID != 0 {
+		t.Fatalf("single-slot run id = %d, want 0", worker.RunID)
+	}
+	if worker.BindAgeSeconds != 0 {
+		t.Fatalf("single-slot bind age seconds = %d, want 0", worker.BindAgeSeconds)
+	}
+	if worker.Slots != nil {
+		t.Fatalf("single-slot slots = %+v, want nil", worker.Slots)
 	}
 }
 
@@ -1209,6 +1248,29 @@ func TestReconcileReplacesIdleVMWithStaleGitHubRunner(t *testing.T) {
 
 	if err := pool.Reconcile(ctx); err == nil {
 		t.Fatal("Reconcile should report the stale GitHub runner")
+	}
+	waitFor(t, func() bool {
+		return len(warmer.WarmNames()) == 2
+	})
+	torn := warmer.TornNames()
+	if len(torn) != 1 || torn[0] != firstVM {
+		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
+	}
+}
+
+func TestReconcileReplacesIdleVMWithStaleGitHubSlotRunner(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newFakeRunner(1)
+	github := newFakeGitHub()
+	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, github, nil)
+	ctx := startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+	firstVM := warmer.WarmNames()[0]
+	github.SetRunners("owner/repo", []ghapp.Runner{{Name: firstVM + "-slot-1", Status: "offline"}})
+
+	if err := pool.Reconcile(ctx); err == nil {
+		t.Fatal("Reconcile should report the stale GitHub slot runner")
 	}
 	waitFor(t, func() bool {
 		return len(warmer.WarmNames()) == 2

@@ -89,9 +89,6 @@ func workerView(index int, state workerState, now time.Time, jobsPerVM int) Work
 		slot := state.slots[0]
 		view.RunID = slot.runID
 		view.BindAgeSeconds = bindAgeSeconds(slot.boundAt, now)
-		if slot.lastErr != nil {
-			view.LastError = slot.lastErr.Error()
-		}
 		return view
 	}
 	view.Slots = make([]SlotView, 0, len(state.slots))
