@@ -37,6 +37,9 @@ private_key_path = "/tmp/key.pem"
 	if cfg.RunnerCount != 3 {
 		t.Errorf("default runner count = %d", cfg.RunnerCount)
 	}
+	if cfg.JobsPerVM != 1 {
+		t.Errorf("default jobs per VM = %d", cfg.JobsPerVM)
+	}
 	// MaxIdle and MaxAge are honored verbatim, so an unset value stays zero and
 	// disables that recycle trigger rather than defaulting.
 	if time.Duration(cfg.MaxIdle) != 0 {
@@ -106,6 +109,7 @@ private_key_path = "/tmp/key.pem"
 func TestLoadRunnerPoolSettings(t *testing.T) {
 	path := writeConfig(t, `
 runner_count = 5
+jobs_per_vm = 2
 max_idle = "45m"
 max_age = "6h"
 max_bind = "90m"
@@ -125,6 +129,9 @@ warm_budget = 7
 	}
 	if cfg.RunnerCount != 5 {
 		t.Fatalf("runner count = %d, want 5", cfg.RunnerCount)
+	}
+	if cfg.JobsPerVM != 2 {
+		t.Fatalf("jobs per VM = %d, want 2", cfg.JobsPerVM)
 	}
 	if time.Duration(cfg.MaxIdle) != 45*time.Minute {
 		t.Fatalf("max idle = %s, want 45m0s", time.Duration(cfg.MaxIdle))
@@ -213,6 +220,26 @@ app_id = "12345"
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for missing required fields")
+	}
+}
+
+func TestLoadRejectsJobsPerVMLessThanOne(t *testing.T) {
+	path := writeConfig(t, `
+runner_count = 1
+jobs_per_vm = -1
+
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[tart]
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for jobs_per_vm less than 1")
+	}
+	if !strings.Contains(err.Error(), "jobs_per_vm must be at least 1") {
+		t.Errorf("error = %q, want jobs_per_vm validation", err.Error())
 	}
 }
 

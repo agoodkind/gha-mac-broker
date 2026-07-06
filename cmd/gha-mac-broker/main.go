@@ -770,6 +770,7 @@ func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBin
 	}
 	return runnerpool.New(runnerpool.Options{
 		RunnerCount:    cfg.RunnerCount,
+		JobsPerVM:      cfg.JobsPerVM,
 		Image:          cfg.Tart.BaseImage,
 		MaxIdle:        time.Duration(cfg.MaxIdle),
 		MaxAge:         time.Duration(cfg.MaxAge),

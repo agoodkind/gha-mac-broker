@@ -25,6 +25,7 @@ const (
 	defaultWarmBudget   = 2
 	defaultGoldenBudget = 3
 	defaultRunnerCount  = 3
+	defaultJobsPerVM    = 1
 	cirrusImagePrefix   = "ghcr.io/cirruslabs/"
 	// defaultFastPullParallel is the skopeo layer-copy concurrency used when
 	// fast_pull_parallel is unset. ghcr throttles each connection, so more
@@ -39,6 +40,9 @@ type Config struct {
 
 	// RunnerCount is the number of persistent worker VMs kept warm.
 	RunnerCount int `toml:"runner_count"`
+
+	// JobsPerVM is the number of concurrent runner slots inside each warm VM.
+	JobsPerVM int `toml:"jobs_per_vm"`
 
 	// MaxIdle is the idle age after which a worker VM is recycled. Zero or unset
 	// disables idle recycling; the value is honored verbatim, not defaulted.
@@ -189,6 +193,9 @@ func (c *Config) applyDefaults() {
 	if c.RunnerCount == 0 {
 		c.RunnerCount = defaultRunnerCount
 	}
+	if c.JobsPerVM == 0 {
+		c.JobsPerVM = defaultJobsPerVM
+	}
 	if c.Tart.Binary == "" {
 		c.Tart.Binary = "tart"
 	}
@@ -247,6 +254,9 @@ func (c *Config) validate() error {
 	}
 	if c.RunnerCount < 1 {
 		return fmt.Errorf("config: runner_count must be at least 1")
+	}
+	if c.JobsPerVM < 1 {
+		return fmt.Errorf("config: jobs_per_vm must be at least 1")
 	}
 	if c.MaxIdle < 0 {
 		return fmt.Errorf("config: max_idle must not be negative")
