@@ -17,6 +17,7 @@ import (
 
 const (
 	defaultRunnerCount       = 3
+	defaultJobsPerVM         = 1
 	defaultWarmRetryDelay    = 5 * time.Second
 	defaultReconcileInterval = time.Minute
 	defaultMaxBind           = 65 * time.Minute
@@ -33,6 +34,7 @@ type Job struct {
 // Options configures a persistent worker pool.
 type Options struct {
 	RunnerCount    int
+	JobsPerVM      int
 	Image          string
 	MaxIdle        time.Duration
 	MaxAge         time.Duration
@@ -55,10 +57,22 @@ type Snapshot struct {
 
 // WorkerView is a concurrency-safe per-worker status row.
 type WorkerView struct {
+	Index          int        `json:"index"`
+	VM             string     `json:"vm"`
+	Phase          string     `json:"phase"`
+	RunID          int64      `json:"run_id"`
+	BindAgeSeconds int64      `json:"bind_age_seconds"`
+	ActiveJob      *bool      `json:"active_job"`
+	LastError      string     `json:"last_error"`
+	Slots          []SlotView `json:"slots,omitempty"`
+}
+
+// SlotView is a concurrency-safe status row for one runner slot in a VM.
+type SlotView struct {
 	Index          int    `json:"index"`
-	VM             string `json:"vm"`
 	Phase          string `json:"phase"`
 	RunID          int64  `json:"run_id"`
+	JobID          int64  `json:"job_id"`
 	BindAgeSeconds int64  `json:"bind_age_seconds"`
 	ActiveJob      *bool  `json:"active_job"`
 	LastError      string `json:"last_error"`
@@ -76,12 +90,12 @@ type Warmer interface {
 // Runner executes one JIT job on a warm VM. *broker.Binder satisfies this
 // interface.
 type Runner interface {
-	RunJob(ctx context.Context, vm *broker.WarmVM, repo string, runnerName string) error
+	RunJob(ctx context.Context, vm *broker.WarmVM, repo string, runnerName string, slotIndex int, slotCount int) error
 }
 
-// ActiveJobProber checks whether a busy worker VM is running a job process.
+// ActiveJobProber checks whether a busy worker slot is running a job process.
 type ActiveJobProber interface {
-	HasActiveJob(ctx context.Context, vm *broker.WarmVM) (bool, error)
+	HasActiveJob(ctx context.Context, vm *broker.WarmVM, slotIndex int, slotCount int) (bool, error)
 }
 
 // RunnerLister lists GitHub runners for idle VM health checks.
@@ -94,10 +108,15 @@ type workerState struct {
 	vm        *broker.WarmVM
 	bornAt    time.Time
 	idleSince time.Time
-	boundAt   time.Time
 	warming   bool
-	busy      bool
 	recycle   bool
+	slots     []slotState
+	lastErr   error
+}
+
+type slotState struct {
+	boundAt   time.Time
+	busy      bool
 	jobID     int64
 	runID     int64
 	jobCancel context.CancelFunc
@@ -139,7 +158,7 @@ func New(options Options, warmer Warmer, runner Runner, github RunnerLister, pro
 		mu:           sync.Mutex{},
 		cond:         nil,
 		queue:        nil,
-		states:       make([]workerState, options.RunnerCount),
+		states:       newWorkerStates(options.RunnerCount, options.JobsPerVM),
 		started:      false,
 		shuttingDown: false,
 		done:         make(chan struct{}),
@@ -157,6 +176,9 @@ func normalizeOptions(options Options) Options {
 	if options.RunnerCount <= 0 {
 		options.RunnerCount = defaultRunnerCount
 	}
+	if options.JobsPerVM <= 0 {
+		options.JobsPerVM = defaultJobsPerVM
+	}
 	if options.WarmRetryDelay <= 0 {
 		options.WarmRetryDelay = defaultWarmRetryDelay
 	}
@@ -173,6 +195,14 @@ func normalizeOptions(options Options) Options {
 		options.RunToken = "pool"
 	}
 	return options
+}
+
+func newWorkerStates(runnerCount int, jobsPerVM int) []workerState {
+	states := make([]workerState, runnerCount)
+	for index := range states {
+		states[index].slots = make([]slotState, jobsPerVM)
+	}
+	return states
 }
 
 // Start launches the fixed worker set. Calling Start more than once is a no-op.
@@ -240,7 +270,7 @@ func (p *Pool) Enqueue(ctx context.Context, job Job) error {
 		return errors.New("runnerpool: enqueue after shutdown")
 	}
 	p.queue = append(p.queue, job)
-	p.cond.Signal()
+	p.cond.Broadcast()
 	return nil
 }
 
@@ -256,88 +286,6 @@ func (p *Pool) Snapshot() Snapshot {
 	return p.snapshotLocked()
 }
 
-type statusProbeTarget struct {
-	viewIndex int
-	vm        *broker.WarmVM
-}
-
-// Status returns a pool snapshot plus per-worker views. Active-job probes run
-// after the pool lock is released so a slow guest probe cannot block workers.
-func (p *Pool) Status(ctx context.Context) (Snapshot, []WorkerView) {
-	p.mu.Lock()
-	snapshot := p.snapshotLocked()
-	now := p.options.Now()
-	views := make([]WorkerView, 0, len(p.states))
-	probeTargets := make([]statusProbeTarget, 0, len(p.states))
-	for index, state := range p.states {
-		view := workerView(index, state, now)
-		views = append(views, view)
-		if p.prober != nil && state.busy && state.vm != nil {
-			probeTargets = append(probeTargets, statusProbeTarget{
-				viewIndex: index,
-				vm:        state.vm,
-			})
-		}
-	}
-	prober := p.prober
-	p.mu.Unlock()
-
-	if prober == nil {
-		return snapshot, views
-	}
-	for _, target := range probeTargets {
-		active, err := prober.HasActiveJob(ctx, target.vm)
-		if err != nil {
-			slog.WarnContext(ctx, "runnerpool active job probe failed", "err", err, "vm", target.vm.Name)
-			continue
-		}
-		activeJob := active
-		views[target.viewIndex].ActiveJob = &activeJob
-	}
-	return snapshot, views
-}
-
-func workerView(index int, state workerState, now time.Time) WorkerView {
-	view := WorkerView{
-		Index:          index,
-		VM:             "",
-		Phase:          workerPhase(state),
-		RunID:          state.runID,
-		BindAgeSeconds: 0,
-		ActiveJob:      nil,
-		LastError:      "",
-	}
-	if state.vm != nil {
-		view.VM = state.vm.Name
-	}
-	if state.busy && !state.boundAt.IsZero() {
-		bindAge := now.Sub(state.boundAt)
-		if bindAge > 0 {
-			view.BindAgeSeconds = int64(bindAge.Seconds())
-		}
-	}
-	if state.lastErr != nil {
-		view.LastError = state.lastErr.Error()
-	}
-	return view
-}
-
-func workerPhase(state workerState) string {
-	if state.recycle {
-		return "recycle"
-	}
-	if state.warming {
-		return "warming"
-	}
-	if state.vm == nil {
-		return "empty"
-	}
-	if state.busy {
-		return "busy"
-	}
-	return "idle"
-}
-
 func (p *Pool) snapshotLocked() Snapshot {
 	snapshot := Snapshot{
 		RunnerCount: p.options.RunnerCount,
@@ -350,25 +298,27 @@ func (p *Pool) snapshotLocked() Snapshot {
 	if !p.started || p.shuttingDown {
 		return snapshot
 	}
-	active := 0
+	activeSlots := 0
 	for _, state := range p.states {
 		alive := state.vm != nil && !state.recycle && state.lastErr == nil
 		if alive {
-			active++
+			activeSlots += len(state.slots)
 		}
-		if alive && !state.busy {
-			snapshot.Idle++
-		}
-		if state.busy {
-			snapshot.Busy++
+		for _, slot := range state.slots {
+			if alive && !slot.busy {
+				snapshot.Idle++
+			}
+			if slot.busy {
+				snapshot.Busy++
+			}
 		}
 	}
 	// The pool is healthy when at least one worker VM can serve a job. A single
 	// worker warming, recycling, or errored does not take the whole pool down,
 	// so routine recycling never sheds every consumer to hosted while other VMs
 	// remain live.
-	snapshot.Healthy = active > 0
-	snapshot.Ready = active > 0 && (snapshot.Idle > 0 || snapshot.Queued < active)
+	snapshot.Healthy = activeSlots > 0
+	snapshot.Ready = activeSlots > 0 && (snapshot.Idle > 0 || snapshot.Queued < activeSlots)
 	return snapshot
 }
 
@@ -412,12 +362,14 @@ func (p *Pool) installedReposForHealth(ctx context.Context, candidates []idleCan
 }
 
 type busyCandidate struct {
-	index   int
-	vm      *broker.WarmVM
-	boundAt time.Time
-	jobID   int64
-	runID   int64
-	now     time.Time
+	index     int
+	slotIndex int
+	slotCount int
+	vm        *broker.WarmVM
+	boundAt   time.Time
+	jobID     int64
+	runID     int64
+	now       time.Time
 }
 
 func (p *Pool) reapBusyWorkers(ctx context.Context) {
@@ -432,9 +384,9 @@ func (p *Pool) reapBusyWorkers(ctx context.Context) {
 		if p.prober == nil {
 			continue
 		}
-		active, err := p.prober.HasActiveJob(ctx, candidate.vm)
+		active, err := p.prober.HasActiveJob(ctx, candidate.vm, candidate.slotIndex, candidate.slotCount)
 		if err != nil {
-			slog.WarnContext(ctx, "runnerpool active job probe failed", "err", err, "vm", candidate.vm.Name)
+			slog.WarnContext(ctx, "runnerpool active job probe failed", "err", err, "vm", candidate.vm.Name, "slot", candidate.slotIndex)
 			if pastMaxBind {
 				p.requestBusyRecycle(candidate)
 			}
@@ -450,19 +402,26 @@ func (p *Pool) busyCandidates() []busyCandidate {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.options.Now()
-	candidates := make([]busyCandidate, 0, len(p.states))
+	candidates := make([]busyCandidate, 0, len(p.states)*p.options.JobsPerVM)
 	for index, state := range p.states {
-		if state.vm == nil || !state.busy || state.recycle || state.boundAt.IsZero() {
+		if state.vm == nil {
 			continue
 		}
-		candidates = append(candidates, busyCandidate{
-			index:   index,
-			vm:      state.vm,
-			boundAt: state.boundAt,
-			jobID:   state.jobID,
-			runID:   state.runID,
-			now:     now,
-		})
+		for slotIndex, slot := range state.slots {
+			if !slot.busy || slot.boundAt.IsZero() {
+				continue
+			}
+			candidates = append(candidates, busyCandidate{
+				index:     index,
+				slotIndex: slotIndex,
+				slotCount: len(state.slots),
+				vm:        state.vm,
+				boundAt:   slot.boundAt,
+				jobID:     slot.jobID,
+				runID:     slot.runID,
+				now:       now,
+			})
+		}
 	}
 	return candidates
 }
@@ -481,7 +440,7 @@ func (p *Pool) idleCandidates() []idleCandidate {
 	now := p.options.Now()
 	candidates := make([]idleCandidate, 0, len(p.states))
 	for index, state := range p.states {
-		if state.vm == nil || state.warming || state.busy || state.recycle {
+		if state.vm == nil || state.warming || workerBusy(state) || state.recycle {
 			continue
 		}
 		candidates = append(candidates, idleCandidate{
@@ -536,11 +495,10 @@ func (p *Pool) requestRecycle(index int, vm *broker.WarmVM, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	state := &p.states[index]
-	if state.vm == nil || state.vm.Name != vm.Name || state.busy {
+	if state.vm == nil || state.vm.Name != vm.Name || workerBusy(*state) {
 		return
 	}
 	state.recycle = true
-	state.jobCancel = nil
 	state.lastErr = err
 	p.cond.Broadcast()
 }
@@ -551,17 +509,22 @@ func (p *Pool) requestBusyRecycle(candidate busyCandidate) {
 	state := &p.states[candidate.index]
 	if state.vm == nil ||
 		state.vm.Name != candidate.vm.Name ||
-		!state.busy ||
-		state.recycle ||
-		state.jobID != candidate.jobID ||
-		state.runID != candidate.runID ||
-		!state.boundAt.Equal(candidate.boundAt) {
+		candidate.slotIndex < 0 ||
+		candidate.slotIndex >= len(state.slots) {
+		p.mu.Unlock()
+		return
+	}
+	slot := &state.slots[candidate.slotIndex]
+	if !slot.busy ||
+		slot.jobID != candidate.jobID ||
+		slot.runID != candidate.runID ||
+		!slot.boundAt.Equal(candidate.boundAt) {
 		p.mu.Unlock()
 		return
 	}
 	state.recycle = true
-	cancel = state.jobCancel
-	state.jobCancel = nil
+	cancel = slot.jobCancel
+	slot.jobCancel = nil
 	p.cond.Broadcast()
 	p.mu.Unlock()
 	if cancel != nil {
@@ -569,21 +532,27 @@ func (p *Pool) requestBusyRecycle(candidate busyCandidate) {
 	}
 }
 
-// CancelRun reaps the busy worker bound to a workflow job id, if one is still
-// running. The run id stays only as observable status on the worker.
+// CancelRun reaps the busy slot bound to a workflow job id, if one is still
+// running. The run id stays as observable status on the slot.
 func (p *Pool) CancelRun(jobID int64) {
 	var cancel context.CancelFunc
 	p.mu.Lock()
 	for index := range p.states {
 		state := &p.states[index]
-		if !state.busy || state.jobID != jobID {
-			continue
+		for slotIndex := range state.slots {
+			slot := &state.slots[slotIndex]
+			if !slot.busy || slot.jobID != jobID {
+				continue
+			}
+			state.recycle = true
+			cancel = slot.jobCancel
+			slot.jobCancel = nil
+			p.cond.Broadcast()
+			break
 		}
-		state.recycle = true
-		cancel = state.jobCancel
-		state.jobCancel = nil
-		p.cond.Broadcast()
-		break
+		if cancel != nil {
+			break
+		}
 	}
 	p.mu.Unlock()
 	if cancel != nil {
@@ -621,52 +590,76 @@ func (p *Pool) Shutdown(ctx context.Context) {
 }
 
 func (p *Pool) workerLoop(ctx context.Context, index int) {
-	var vm *broker.WarmVM
-	var bornAt time.Time
 	for {
-		if vm == nil {
-			warmed, ok := p.warmWorker(ctx, index)
-			if !ok {
-				p.clearWorker(index)
-				return
-			}
-			vm = warmed
-			bornAt = p.options.Now()
-		}
-
-		job, recycle, ok := p.waitForJobOrRecycle(ctx, index, vm, bornAt)
+		vm, ok := p.warmWorker(ctx, index)
 		if !ok {
-			p.teardownVM(context.WithoutCancel(ctx), vm)
 			p.clearWorker(index)
 			return
 		}
-		if recycle {
-			p.teardownVM(context.WithoutCancel(ctx), vm)
-			vm = nil
-			bornAt = time.Time{}
-			continue
+		p.activateWorker(index, vm, p.options.Now())
+		recycle, ok := p.runWorkerSlots(ctx, index, vm)
+		p.teardownVM(context.WithoutCancel(ctx), vm)
+		p.clearWorker(index)
+		if !ok || !recycle {
+			return
 		}
+	}
+}
 
-		jobCtx, cancel := context.WithCancel(ctx)
-		p.setJobCancel(index, cancel)
-		var err error
-		var recycleAfterJob bool
-		func() {
-			defer cancel()
-			err = p.runner.RunJob(jobCtx, vm, job.Repo, vm.Name)
-			recycleAfterJob = p.finishJobOrRecycle(index, jobCtx)
-		}()
-		if err != nil {
-			slog.WarnContext(ctx, "runnerpool job failed", "err", err, "repo", job.Repo, "job_id", job.JobID, "run_id", job.RunID, "vm", vm.Name)
+func (p *Pool) runWorkerSlots(ctx context.Context, index int, vm *broker.WarmVM) (bool, bool) {
+	slotCtx, cancelSlots := context.WithCancel(ctx)
+	var slotWG sync.WaitGroup
+	for slotIndex := range p.options.JobsPerVM {
+		slot := slotIndex
+		slotWG.Go(func() {
+			defer recoverGoroutine(slotCtx, "runnerpool slot")
+			p.slotLoop(slotCtx, index, slot, vm)
+		})
+	}
+	recycle, ok := p.waitForWorkerRecycleOrShutdown(ctx, index, vm)
+	cancelSlots()
+	p.mu.Lock()
+	p.cond.Broadcast()
+	p.mu.Unlock()
+	slotWG.Wait()
+	return recycle, ok
+}
+
+func (p *Pool) waitForWorkerRecycleOrShutdown(ctx context.Context, index int, vm *broker.WarmVM) (bool, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for {
+		state := &p.states[index]
+		if p.shuttingDown || ctx.Err() != nil {
+			return false, false
 		}
-		if recycleAfterJob {
-			p.teardownVM(context.WithoutCancel(ctx), vm)
-			vm = nil
-			bornAt = time.Time{}
-			if ctx.Err() != nil {
-				p.clearWorker(index)
-				return
-			}
+		if state.vm == nil || state.vm.Name != vm.Name {
+			return true, true
+		}
+		if state.recycle && !workerBusy(*state) {
+			state.vm = nil
+			state.recycle = false
+			state.warming = true
+			state.idleSince = time.Time{}
+			p.resetWorkerSlotsLocked(state)
+			p.cond.Broadcast()
+			return true, true
+		}
+		p.cond.Wait()
+	}
+}
+
+func (p *Pool) slotLoop(ctx context.Context, index int, slotIndex int, vm *broker.WarmVM) {
+	for {
+		job, jobCtx, cancel, ok := p.waitForSlotJob(ctx, index, slotIndex, vm)
+		if !ok {
+			return
+		}
+		err := p.runner.RunJob(jobCtx, vm, job.Repo, runnerNameForSlot(vm.Name, slotIndex, p.options.JobsPerVM), slotIndex, p.options.JobsPerVM)
+		cancel()
+		p.finishSlotJob(index, slotIndex, vm, err)
+		if err != nil {
+			slog.WarnContext(ctx, "runnerpool job failed", "err", err, "repo", job.Repo, "job_id", job.JobID, "run_id", job.RunID, "vm", vm.Name, "slot", slotIndex)
 		}
 	}
 }
@@ -699,14 +692,12 @@ func (p *Pool) markWarming(index int) {
 	defer p.mu.Unlock()
 	state := &p.states[index]
 	state.vm = nil
+	state.bornAt = time.Time{}
 	state.idleSince = time.Time{}
-	state.boundAt = time.Time{}
 	state.warming = true
-	state.busy = false
 	state.recycle = false
-	state.jobID = 0
-	state.runID = 0
-	state.jobCancel = nil
+	state.lastErr = nil
+	p.resetWorkerSlotsLocked(state)
 	p.cond.Broadcast()
 }
 
@@ -716,97 +707,100 @@ func (p *Pool) markWarmError(index int, err error) {
 	state := &p.states[index]
 	state.lastErr = err
 	state.warming = false
-	state.boundAt = time.Time{}
-	state.jobID = 0
-	state.runID = 0
-	state.jobCancel = nil
+	state.recycle = false
+	p.resetWorkerSlotsLocked(state)
 	p.cond.Broadcast()
 }
 
-func (p *Pool) waitForJobOrRecycle(ctx context.Context, index int, vm *broker.WarmVM, bornAt time.Time) (Job, bool, bool) {
+func (p *Pool) activateWorker(index int, vm *broker.WarmVM, bornAt time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	state := &p.states[index]
 	state.vm = vm
 	state.bornAt = bornAt
 	state.idleSince = p.options.Now()
-	state.boundAt = time.Time{}
 	state.warming = false
-	state.busy = false
-	state.jobID = 0
-	state.runID = 0
-	state.jobCancel = nil
+	state.recycle = false
 	state.lastErr = nil
+	p.resetWorkerSlotsLocked(state)
 	p.cond.Broadcast()
+}
+
+func (p *Pool) waitForSlotJob(ctx context.Context, index int, slotIndex int, vm *broker.WarmVM) (Job, context.Context, context.CancelFunc, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	for {
 		if p.shuttingDown || ctx.Err() != nil {
-			return Job{Repo: "", JobID: 0, RunID: 0}, false, false
+			return emptyJob(), nil, nil, false
 		}
-		if state.recycle {
-			state.vm = nil
-			state.recycle = false
-			state.warming = true
-			state.idleSince = time.Time{}
-			state.boundAt = time.Time{}
-			state.jobID = 0
-			state.runID = 0
-			state.jobCancel = nil
-			p.cond.Broadcast()
-			return Job{Repo: "", JobID: 0, RunID: 0}, true, true
+		state := &p.states[index]
+		if state.vm == nil || state.vm.Name != vm.Name || state.recycle {
+			return emptyJob(), nil, nil, false
+		}
+		if slotIndex < 0 || slotIndex >= len(state.slots) {
+			return emptyJob(), nil, nil, false
+		}
+		slot := &state.slots[slotIndex]
+		if slot.busy {
+			p.cond.Wait()
+			continue
 		}
 		if len(p.queue) > 0 {
-			job := p.queue[0]
-			// Advance the head and zero the removed slot so the dequeue is O(1)
-			// and the popped Job's references are not retained by the backing
-			// array.
-			p.queue[0] = Job{Repo: "", JobID: 0, RunID: 0}
-			p.queue = p.queue[1:]
-			state.busy = true
+			job := p.dequeueJobLocked()
+			jobCtx, cancel := context.WithCancel(ctx)
+			slot.busy = true
 			state.idleSince = time.Time{}
-			state.boundAt = p.options.Now()
-			state.jobID = job.JobID
-			state.runID = job.RunID
-			state.jobCancel = nil
+			slot.boundAt = p.options.Now()
+			slot.jobID = job.JobID
+			slot.runID = job.RunID
+			slot.jobCancel = cancel
+			slot.lastErr = nil
 			p.cond.Broadcast()
-			return job, false, true
+			return job, jobCtx, cancel, true
 		}
 		p.cond.Wait()
 	}
 }
 
-func (p *Pool) setJobCancel(index int, cancel context.CancelFunc) {
-	cancelNow := false
-	p.mu.Lock()
-	state := &p.states[index]
-	if state.busy && !state.recycle {
-		state.jobCancel = cancel
-	} else {
-		cancelNow = true
-	}
-	p.mu.Unlock()
-	if cancelNow {
-		cancel()
+func (p *Pool) dequeueJobLocked() Job {
+	job := p.queue[0]
+	// Advance the head and zero the removed slot so the dequeue is O(1)
+	// and the popped Job's references are not retained by the backing array.
+	p.queue[0] = Job{Repo: "", JobID: 0, RunID: 0}
+	p.queue = p.queue[1:]
+	return job
+}
+
+func emptyJob() Job {
+	return Job{
+		Repo:  "",
+		JobID: 0,
+		RunID: 0,
 	}
 }
 
-func (p *Pool) finishJobOrRecycle(index int, jobCtx context.Context) bool {
+func (p *Pool) finishSlotJob(index int, slotIndex int, vm *broker.WarmVM, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	state := &p.states[index]
-	recycleAfterJob := state.recycle || jobCtx.Err() != nil
-	state.busy = false
-	state.boundAt = time.Time{}
-	state.jobID = 0
-	state.runID = 0
-	state.jobCancel = nil
-	if recycleAfterJob {
-		state.vm = nil
-		state.recycle = false
-		state.warming = true
-		state.idleSince = time.Time{}
+	if state.vm == nil || state.vm.Name != vm.Name || slotIndex < 0 || slotIndex >= len(state.slots) {
+		return
+	}
+	slot := &state.slots[slotIndex]
+	slot.busy = false
+	slot.boundAt = time.Time{}
+	slot.jobID = 0
+	slot.runID = 0
+	slot.jobCancel = nil
+	slot.lastErr = err
+	if !workerBusy(*state) {
+		if state.recycle {
+			state.idleSince = time.Time{}
+		} else {
+			state.idleSince = p.options.Now()
+		}
 	}
 	p.cond.Broadcast()
-	return recycleAfterJob
 }
 
 func (p *Pool) clearWorker(index int) {
@@ -816,16 +810,27 @@ func (p *Pool) clearWorker(index int) {
 		vm:        nil,
 		bornAt:    time.Time{},
 		idleSince: time.Time{},
-		boundAt:   time.Time{},
 		warming:   false,
-		busy:      false,
 		recycle:   false,
-		jobID:     0,
-		runID:     0,
-		jobCancel: nil,
+		slots:     make([]slotState, p.options.JobsPerVM),
 		lastErr:   nil,
 	}
 	p.cond.Broadcast()
+}
+
+func (p *Pool) resetWorkerSlotsLocked(state *workerState) {
+	if len(state.slots) != p.options.JobsPerVM {
+		state.slots = make([]slotState, p.options.JobsPerVM)
+		return
+	}
+	resetSlots(state.slots)
+}
+
+func runnerNameForSlot(vmName string, slotIndex int, slotCount int) string {
+	if slotCount <= 1 {
+		return vmName
+	}
+	return fmt.Sprintf("%s-slot-%d", vmName, slotIndex)
 }
 
 func (p *Pool) teardownVM(ctx context.Context, vm *broker.WarmVM) {
