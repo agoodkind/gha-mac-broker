@@ -135,15 +135,46 @@ func uninstallLaunchdMaintenance(ctx context.Context, cfg Config) error {
 }
 
 func preflightMaintenanceCommand(ctx context.Context, commandLine, searchPath string) {
-	fields := strings.Fields(commandLine)
-	if len(fields) == 0 {
+	binary := commandBinary(commandLine)
+	if binary == "" {
 		return
 	}
-	binary := fields[0]
 	if !commandBinaryOnPath(binary, searchPath) {
 		slog.WarnContext(ctx, "maintenance command binary not found on the launchd PATH; continuing",
 			"binary", binary, "path", searchPath)
 	}
+}
+
+// commandBinary returns the executable a shell command line runs, skipping a
+// leading `env` and any NAME=VALUE assignments (e.g. `env FOO=1 swift-mk ...` or
+// `FOO=1 swift-mk ...`), so the preflight checks the real binary.
+func commandBinary(commandLine string) string {
+	for field := range strings.FieldsSeq(commandLine) {
+		if field == "env" || isEnvAssignment(field) {
+			continue
+		}
+		return field
+	}
+	return ""
+}
+
+// isEnvAssignment reports whether field is a shell NAME=VALUE assignment (a
+// name of word characters before '=', and no '/', which would mark a path).
+func isEnvAssignment(field string) bool {
+	eq := strings.IndexByte(field, '=')
+	if eq <= 0 || strings.IndexByte(field[:eq], '/') >= 0 {
+		return false
+	}
+	for _, r := range field[:eq] {
+		if !isEnvNameChar(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func isEnvNameChar(r rune) bool {
+	return r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }
 
 // commandBinaryOnPath reports whether binary is an executable reachable via

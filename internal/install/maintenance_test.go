@@ -121,6 +121,22 @@ func TestInstallLaunchdMaintenanceRendersLaunchdFiles(t *testing.T) {
 	}
 }
 
+func TestCommandBinarySkipsEnvAssignments(t *testing.T) {
+	cases := map[string]string{
+		"swift-mk cache prune":         "swift-mk",
+		"FOO=1 BAR=2 swift-mk prune":   "swift-mk",
+		"env FOO=1 swift-mk prune":     "swift-mk",
+		"/usr/local/bin/swift-mk prct": "/usr/local/bin/swift-mk",
+		"":                             "",
+		"   ":                          "",
+	}
+	for input, want := range cases {
+		if got := commandBinary(input); got != want {
+			t.Errorf("commandBinary(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 // uninstallLaunchdMaintenance is un-gated, so the boot-out and file removal run
 // on any platform, including the Ubuntu CI runner, with launchctl mocked.
 func TestUninstallLaunchdMaintenanceRemovesFiles(t *testing.T) {
