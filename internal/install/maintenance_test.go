@@ -48,10 +48,10 @@ func (r *recordingCommandRunner) build(_ context.Context, name string, args ...s
 	})
 }
 
-func TestInstallMaintenanceTimerRendersLaunchdFiles(t *testing.T) {
-	if runtime.GOOS != osDarwin {
-		t.Skipf("launchd maintenance installer is darwin-only, got %s", runtime.GOOS)
-	}
+// installLaunchdMaintenance is the un-gated worker, so this exercises render,
+// file-write, and the launchctl calls (mocked) on any platform, including the
+// Ubuntu CI runner. The runtime.GOOS gate lives only in the production dispatch.
+func TestInstallLaunchdMaintenanceRendersLaunchdFiles(t *testing.T) {
 	home := t.TempDir()
 	cfg := sampleConfig()
 	cfg.Home = home
@@ -66,8 +66,8 @@ func TestInstallMaintenanceTimerRendersLaunchdFiles(t *testing.T) {
 	restore := replaceCommandRunner(recorder.build)
 	t.Cleanup(restore)
 
-	if err := installMaintenanceTimer(context.Background(), cfg); err != nil {
-		t.Fatalf("installMaintenanceTimer: %v", err)
+	if err := installLaunchdMaintenance(context.Background(), cfg); err != nil {
+		t.Fatalf("installLaunchdMaintenance: %v", err)
 	}
 
 	scriptPath := maintenanceScriptPath(cfg)
@@ -121,32 +121,41 @@ func TestInstallMaintenanceTimerRendersLaunchdFiles(t *testing.T) {
 	}
 }
 
-func TestInstallMaintenanceTimerUninstallsOnEmptyCommand(t *testing.T) {
-	if runtime.GOOS != osDarwin {
-		t.Skipf("maintenance timer is darwin-only, got %s", runtime.GOOS)
-	}
+// uninstallLaunchdMaintenance is un-gated, so the boot-out and file removal run
+// on any platform, including the Ubuntu CI runner, with launchctl mocked.
+func TestUninstallLaunchdMaintenanceRemovesFiles(t *testing.T) {
+	home := t.TempDir()
 	cfg := sampleConfig()
-	cfg.Home = t.TempDir()
+	cfg.Home = home
+	cfg.ConfigDir = filepath.Join(home, ".config", "gha-mac-broker")
+	cfg.ConfigPath = filepath.Join(cfg.ConfigDir, "config.toml")
+	cfg.LogPath = filepath.Join(home, "Library", "Logs", "gha-mac-broker.log")
 	cfg.Maintenance = config.MaintenanceConfig{
-		Command:         "",
-		IntervalSeconds: 3600,
+		Command:         "printf maintenance-test",
+		IntervalSeconds: 900,
 	}
 	recorder := &recordingCommandRunner{calls: nil}
 	t.Cleanup(replaceCommandRunner(recorder.build))
 
-	if err := installMaintenanceTimer(context.Background(), cfg); err != nil {
-		t.Fatalf("installMaintenanceTimer: %v", err)
+	if err := installLaunchdMaintenance(context.Background(), cfg); err != nil {
+		t.Fatalf("installLaunchdMaintenance: %v", err)
 	}
-	// An empty command disables maintenance by uninstalling any existing timer,
-	// so it boots out the launchd job rather than doing nothing.
-	if len(recorder.calls) != 1 {
-		t.Fatalf("launchctl calls = %d, want 1 (bootout)", len(recorder.calls))
+	if err := uninstallLaunchdMaintenance(context.Background(), cfg); err != nil {
+		t.Fatalf("uninstallLaunchdMaintenance: %v", err)
 	}
-	if recorder.calls[0].name != "launchctl" || recorder.calls[0].args[0] != "bootout" {
-		t.Fatalf("command = %#v, want launchctl bootout", recorder.calls[0])
+	for _, path := range []string{maintenanceScriptPath(cfg), maintenancePlistPath(cfg)} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat %s err = %v, want not exist", path, err)
+		}
 	}
-	if _, err := os.Stat(maintenanceScriptPath(cfg)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("maintenance script stat err = %v, want not exist", err)
+	var bootouts int
+	for _, call := range recorder.calls {
+		if call.name == "launchctl" && len(call.args) > 0 && call.args[0] == "bootout" {
+			bootouts++
+		}
+	}
+	if bootouts < 1 {
+		t.Fatalf("expected at least one launchctl bootout, calls = %#v", recorder.calls)
 	}
 }
 

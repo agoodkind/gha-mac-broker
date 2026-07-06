@@ -46,8 +46,9 @@ func installMaintenanceTimer(ctx context.Context, cfg Config) error {
 	if cfg.Maintenance.Command == "" {
 		// An empty command disables maintenance. Actively remove any previously
 		// installed timer so re-running install after disabling does not leave a
-		// stale job loaded.
-		return uninstallMaintenanceTimer(ctx, cfg)
+		// stale job loaded. The darwin gate above already passed, so call the
+		// worker directly.
+		return uninstallLaunchdMaintenance(ctx, cfg)
 	}
 	preflightMaintenanceCommand(ctx, cfg.Maintenance.Command)
 	return installLaunchdMaintenance(ctx, cfg)
@@ -109,6 +110,13 @@ func uninstallMaintenanceTimer(ctx context.Context, cfg Config) error {
 		slog.DebugContext(ctx, "maintenance timer uninstall skipped on non-darwin OS", "os", runtime.GOOS)
 		return nil
 	}
+	return uninstallLaunchdMaintenance(ctx, cfg)
+}
+
+// uninstallLaunchdMaintenance boots out and removes the launchd job. It carries
+// no OS gate so tests exercise it on any platform through the mocked
+// commandRunner; the production callers apply the darwin gate.
+func uninstallLaunchdMaintenance(ctx context.Context, cfg Config) error {
 	target := fmt.Sprintf("gui/%d/%s", os.Getuid(), maintenanceLaunchdLabel)
 	if out, err := commandRunner(ctx, "launchctl", "bootout", target).CombinedOutput(); err != nil {
 		slog.WarnContext(ctx, "launchctl maintenance bootout ignored (likely not loaded)", "err", err, "out", string(out))
