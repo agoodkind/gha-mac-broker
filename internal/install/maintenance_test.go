@@ -98,6 +98,13 @@ func TestInstallMaintenanceTimerRendersLaunchdFiles(t *testing.T) {
 		"<string>" + scriptPath + "</string>",
 		"<integer>900</integer>",
 		"<string>" + filepath.Join(home, "Library", "Logs", "gha-mac-broker-maintenance.log") + "</string>",
+		// The launchd job runs in a minimal env, so the plist must set PATH (with
+		// the user bin dir where swift-mk installs) and HOME.
+		"<key>EnvironmentVariables</key>",
+		"<key>PATH</key>",
+		"<string>" + filepath.Join(home, ".local", "bin") + ":",
+		"<key>HOME</key>",
+		"<string>" + home + "</string>",
 	} {
 		if !strings.Contains(plistText, want) {
 			t.Errorf("maintenance plist missing %q\n%s", want, plistText)
@@ -114,23 +121,29 @@ func TestInstallMaintenanceTimerRendersLaunchdFiles(t *testing.T) {
 	}
 }
 
-func TestInstallMaintenanceTimerSkipsEmptyCommand(t *testing.T) {
+func TestInstallMaintenanceTimerUninstallsOnEmptyCommand(t *testing.T) {
+	if runtime.GOOS != osDarwin {
+		t.Skipf("maintenance timer is darwin-only, got %s", runtime.GOOS)
+	}
 	cfg := sampleConfig()
 	cfg.Home = t.TempDir()
 	cfg.Maintenance = config.MaintenanceConfig{
 		Command:         "",
 		IntervalSeconds: 3600,
 	}
-	restore := replaceCommandRunner(func(_ context.Context, name string, args ...string) combinedOutputRunner {
-		t.Fatalf("unexpected command %s %v", name, args)
-		return combinedOutputFunc(func() ([]byte, error) {
-			return nil, nil
-		})
-	})
-	t.Cleanup(restore)
+	recorder := &recordingCommandRunner{calls: nil}
+	t.Cleanup(replaceCommandRunner(recorder.build))
 
 	if err := installMaintenanceTimer(context.Background(), cfg); err != nil {
 		t.Fatalf("installMaintenanceTimer: %v", err)
+	}
+	// An empty command disables maintenance by uninstalling any existing timer,
+	// so it boots out the launchd job rather than doing nothing.
+	if len(recorder.calls) != 1 {
+		t.Fatalf("launchctl calls = %d, want 1 (bootout)", len(recorder.calls))
+	}
+	if recorder.calls[0].name != "launchctl" || recorder.calls[0].args[0] != "bootout" {
+		t.Fatalf("command = %#v, want launchctl bootout", recorder.calls[0])
 	}
 	if _, err := os.Stat(maintenanceScriptPath(cfg)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("maintenance script stat err = %v, want not exist", err)

@@ -476,6 +476,14 @@ install_swift_mk() {
         return
     fi
 
+    # The maintenance timer is darwin-only and swift-mk ships only for Apple
+    # silicon macOS, so skip the installer on any other OS rather than running
+    # its network install pointlessly.
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        printf 'install.sh: skipping swift-mk installer on non-macOS host\n' >&2
+        return
+    fi
+
     # Install swift-mk before the broker install so the maintenance timer's
     # default command resolves; best-effort, since the broker install's
     # maintenance preflight warns separately if it is missing.

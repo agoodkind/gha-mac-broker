@@ -34,15 +34,20 @@ type maintenanceTemplateData struct {
 	ScriptPath      string
 	LogPath         string
 	IntervalSeconds int
+	Home            string
+	Path            string
 }
 
 func installMaintenanceTimer(ctx context.Context, cfg Config) error {
-	if cfg.Maintenance.Command == "" {
-		return nil
-	}
 	if runtime.GOOS != osDarwin {
 		slog.DebugContext(ctx, "maintenance timer skipped on non-darwin OS", "os", runtime.GOOS)
 		return nil
+	}
+	if cfg.Maintenance.Command == "" {
+		// An empty command disables maintenance. Actively remove any previously
+		// installed timer so re-running install after disabling does not leave a
+		// stale job loaded.
+		return uninstallMaintenanceTimer(ctx, cfg)
 	}
 	preflightMaintenanceCommand(ctx, cfg.Maintenance.Command)
 	return installLaunchdMaintenance(ctx, cfg)
@@ -140,7 +145,25 @@ func maintenanceData(cfg Config) maintenanceTemplateData {
 		ScriptPath:      maintenanceScriptPath(cfg),
 		LogPath:         maintenanceLogPath(cfg),
 		IntervalSeconds: cfg.Maintenance.IntervalSeconds,
+		Home:            cfg.Home,
+		Path:            maintenancePath(cfg),
 	}
+}
+
+// maintenancePath is the PATH the launchd job runs with. launchd starts with a
+// minimal PATH, so a command installed into ~/.local/bin (where install.sh puts
+// swift-mk) would otherwise fail with "command not found". The user bin dirs go
+// first, then the common Homebrew and system locations.
+func maintenancePath(cfg Config) string {
+	return strings.Join([]string{
+		filepath.Join(cfg.Home, ".local", "bin"),
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+		"/usr/bin",
+		"/bin",
+		"/usr/sbin",
+		"/sbin",
+	}, ":")
 }
 
 func maintenanceScriptPath(cfg Config) string {

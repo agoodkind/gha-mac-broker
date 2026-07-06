@@ -36,8 +36,11 @@ the install location, `--no-service` to install only the binary, or
 set `app.app_id` in the config, place the App private key at
 `app.private_key_path`, and set up the Cloudflare tunnel.
 
-Host prerequisites are Tart, skopeo, and swift-mk. On macOS, install Tart and
-skopeo with `brew install cirruslabs/cli/tart skopeo`. Install swift-mk with:
+Host prerequisites are Tart and skopeo; on macOS install them with
+`brew install cirruslabs/cli/tart skopeo`. swift-mk is only needed if you keep
+the default maintenance command, and the maintenance timer is macOS-only, so it
+is not required on Linux. `install.sh` installs swift-mk for you on macOS unless
+you pass `--no-swift-mk`; to install it by hand:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/agoodkind/swift-makefile/main/install.sh | bash
