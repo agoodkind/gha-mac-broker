@@ -45,3 +45,10 @@ fast_pull_parallel   = 16
 macos = "tahoe"
 xcode = "26.5"
 tag   = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
+
+[maintenance]
+# A shell command run on an interval by a launchd timer the installer provisions.
+# Empty disables the timer. The default bounds the shared pool build cache: it updates
+# swift-mk to the latest signed release, then prunes the cache to a size cap.
+command = "swift-mk update apply || true; exec swift-mk cache prune --max-bytes 53687091200 --path $HOME/pool-cache"
+interval_seconds = 3600

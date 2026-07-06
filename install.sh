@@ -407,6 +407,7 @@ run_install() {
 # END go-mk installer core
 
 CORE_ARGS=()
+DO_SWIFT_MK=1
 
 usage() {
     cat <<'USAGE'
@@ -425,6 +426,7 @@ Flags:
   --require-attestation  fail when GitHub attestation verification cannot run
   --bin-only             install the binary only, skip service setup
   --no-service           install the binary only, skip service setup
+  --no-swift-mk          skip the default maintenance tool (swift-mk) installer
   -h, --help             show this help
 
 Exit codes:
@@ -441,6 +443,9 @@ parse_gha_mac_broker_args() {
         case "$1" in
             --no-service)
                 CORE_ARGS+=(--bin-only)
+                ;;
+            --no-swift-mk)
+                DO_SWIFT_MK=0
                 ;;
             --version | --repo | --channel | --bin-dir)
                 option_name="$1"
@@ -466,9 +471,34 @@ parse_gha_mac_broker_args() {
     done
 }
 
+install_swift_mk() {
+    if [[ "$DO_SWIFT_MK" -ne 1 ]]; then
+        return
+    fi
+
+    # The maintenance timer is darwin-only and swift-mk ships only for Apple
+    # silicon macOS, so skip the installer on any other OS rather than running
+    # its network install pointlessly.
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        printf 'install.sh: skipping swift-mk installer on non-macOS host\n' >&2
+        return
+    fi
+
+    # Install swift-mk before the broker install so the maintenance timer's
+    # default command resolves; best-effort, since the broker install's
+    # maintenance preflight warns separately if it is missing.
+    printf 'install.sh: installing swift-mk for the default maintenance command\n' >&2
+    if curl -fsSL https://raw.githubusercontent.com/agoodkind/swift-makefile/main/install.sh | bash; then
+        printf 'install.sh: swift-mk installer completed\n' >&2
+    else
+        printf 'install.sh: swift-mk installer failed; continuing (maintenance preflight will warn if needed)\n' >&2
+    fi
+}
+
 post_install() {
     local installed_path="$1"
 
+    install_swift_mk
     "$installed_path" install || install_error "gha-mac-broker install failed"
     printf 'install.sh: done\n' >&2
 }

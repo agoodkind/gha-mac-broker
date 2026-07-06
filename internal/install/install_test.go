@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"goodkind.io/gha-mac-broker/internal/config"
 )
 
 func sampleConfig() Config {
@@ -16,6 +18,10 @@ func sampleConfig() Config {
 		ConfigDir:  "/Users/test/.config/gha-mac-broker",
 		LogPath:    "/Users/test/Library/Logs/gha-mac-broker.log",
 		ConfigPath: "/Users/test/.config/gha-mac-broker/config.toml",
+		Maintenance: config.MaintenanceConfig{
+			Command:         "",
+			IntervalSeconds: 0,
+		},
 	}
 }
 

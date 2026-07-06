@@ -8,10 +8,13 @@ package install
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
 	"strings"
+
+	"goodkind.io/gha-mac-broker/internal/config"
 )
 
 // Config is the set of resolved paths the installer renders into the service
@@ -27,6 +30,8 @@ type Config struct {
 	LogPath string
 	// ConfigPath is the config.toml path the daemon is told to load.
 	ConfigPath string
+	// Maintenance configures the optional launchd maintenance timer.
+	Maintenance config.MaintenanceConfig
 }
 
 // Install runs the full host setup in order: config dir, config.toml, secrets,
@@ -45,10 +50,19 @@ func Install(ctx context.Context, cfg Config) error {
 		return err
 	}
 	ensureWebhookCIDRs(ctx, cfg.ConfigDir)
-	if err := buildGoldenIfAbsent(ctx, cfg.ConfigPath); err != nil {
+	runtimeConfig, err := config.Load(cfg.ConfigPath)
+	if err != nil {
+		slog.ErrorContext(ctx, "load config for install failed", "err", err, "path", cfg.ConfigPath)
+		return fmt.Errorf("install: load config: %w", err)
+	}
+	if err := buildGoldenIfAbsent(ctx, runtimeConfig); err != nil {
 		return err
 	}
 	if err := installUnit(ctx, cfg); err != nil {
+		return err
+	}
+	cfg.Maintenance = runtimeConfig.Maintenance
+	if err := installMaintenanceTimer(ctx, cfg); err != nil {
 		return err
 	}
 
@@ -56,12 +70,28 @@ func Install(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// Uninstall reverses only the service-unit step: it boots out the launchd job
-// or disables the systemd unit, then removes the unit file. The config
+// Uninstall reverses the installed service units: it boots out the launchd jobs
+// or disables the systemd unit, then removes the unit files. The config
 // directory, secrets, and golden image are left in place.
 func Uninstall(ctx context.Context, cfg Config) error {
 	slog.InfoContext(ctx, "uninstall starting", "config", cfg.ConfigPath)
-	return uninstallUnit(ctx, cfg)
+	// Attempt both uninstalls even if the first fails, so a unit-uninstall error
+	// cannot leave an active maintenance timer behind.
+	unitErr := uninstallUnit(ctx, cfg)
+	maintErr := uninstallMaintenanceTimer(ctx, cfg)
+	if err := errors.Join(unitErr, maintErr); err != nil {
+		slog.ErrorContext(ctx, "uninstall completed with errors", "err", err)
+		return err
+	}
+	return nil
+}
+
+type combinedOutputRunner interface {
+	CombinedOutput() ([]byte, error)
+}
+
+var commandRunner = func(ctx context.Context, name string, args ...string) combinedOutputRunner {
+	return command(ctx, name, args...)
 }
 
 // command builds an [exec.Cmd] for an external tool. Centralizing construction
