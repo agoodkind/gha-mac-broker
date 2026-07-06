@@ -25,16 +25,27 @@ func TestRunJobRemoteCommandKeepsLegacySingleSlotPath(t *testing.T) {
 func TestRunJobRemoteCommandUsesSlotHomeAndTMPDIR(t *testing.T) {
 	command := runJobRemoteCommand("encoded-jit", 1, 2)
 	for _, fragment := range []string{
-		"actions-runner-1",
-		`TMPDIR="$HOME/tmp-1"`,
+		`base_home="$HOME"`,
+		`runner_home="$base_home/actions-runner-1"`,
+		`export TMPDIR="$base_home/tmp-1"`,
+		`export HOME="$base_home/slot-home-1"`,
+		`mkdir -p "$HOME"`,
 		"./run.sh --jitconfig 'encoded-jit'",
 	} {
 		if !strings.Contains(command, fragment) {
 			t.Fatalf("slot command = %q, want fragment %q", command, fragment)
 		}
 	}
+	homeIndex := strings.Index(command, `export HOME="$base_home/slot-home-1"`)
+	cdIndex := strings.Index(command, `cd "$runner_home"`)
+	if homeIndex < 0 || cdIndex < 0 || homeIndex > cdIndex {
+		t.Fatalf("slot command = %q, want HOME exported before cd into runner home", command)
+	}
 	if strings.Contains(command, "cd ~/actions-runner &&") {
 		t.Fatalf("slot command = %q, want no legacy runner home", command)
+	}
+	if strings.Contains(command, `runner_home="$HOME/actions-runner-1"`) {
+		t.Fatalf("slot command = %q, want runner home from base home", command)
 	}
 }
 
@@ -51,10 +62,32 @@ func TestCloneRunnerSlotsCommandCopiesGoldenRunnerToSlotDirs(t *testing.T) {
 		"slot_count=3",
 		`cp -R "$HOME/actions-runner" "$runner_home"`,
 		`mkdir -p "$tmp_dir"`,
+		`warm_cache_paths=(`,
+		`".local"`,
+		`".swiftpm"`,
+		`".cache"`,
+		`"Library/Caches/org.swift.swiftpm"`,
+		`"Library/Caches/Homebrew"`,
+		`"Library/Developer/Xcode/DerivedData"`,
+		`".gitconfig"`,
+		`".netrc"`,
+		`slot_home="$HOME/slot-home-$slot_index"`,
+		`rm -rf "$slot_home"`,
+		`mkdir -p "$slot_home"`,
+		`source_path="$HOME/$warm_cache_path"`,
+		`dest_path="$slot_home/$warm_cache_path"`,
+		`mkdir -p "$(dirname "$dest_path")"`,
+		`cp -cR "$source_path" "$dest_path"`,
+		`cp -R "$source_path" "$dest_path"`,
 	} {
 		if !strings.Contains(command, fragment) {
 			t.Fatalf("clone command = %q, want fragment %q", command, fragment)
 		}
+	}
+	// The toolchain is keyed by source hash and restored per slot by actions/cache,
+	// so it must not be seeded into the slot home (a seed/cache merge risk).
+	if strings.Contains(command, ".swift-mk-ci-toolchain") {
+		t.Fatalf("clone command = %q, want no toolchain in the warm cache seed", command)
 	}
 }
 
