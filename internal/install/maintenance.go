@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -50,7 +49,7 @@ func installMaintenanceTimer(ctx context.Context, cfg Config) error {
 		// worker directly.
 		return uninstallLaunchdMaintenance(ctx, cfg)
 	}
-	preflightMaintenanceCommand(ctx, cfg.Maintenance.Command)
+	preflightMaintenanceCommand(ctx, cfg.Maintenance.Command, maintenancePath(cfg))
 	return installLaunchdMaintenance(ctx, cfg)
 }
 
@@ -135,15 +134,40 @@ func uninstallLaunchdMaintenance(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-func preflightMaintenanceCommand(ctx context.Context, commandLine string) {
+func preflightMaintenanceCommand(ctx context.Context, commandLine, searchPath string) {
 	fields := strings.Fields(commandLine)
 	if len(fields) == 0 {
 		return
 	}
 	binary := fields[0]
-	if _, err := exec.LookPath(binary); err != nil {
-		slog.WarnContext(ctx, "maintenance command binary not found on PATH; continuing", "err", err, "binary", binary)
+	if !commandBinaryOnPath(binary, searchPath) {
+		slog.WarnContext(ctx, "maintenance command binary not found on the launchd PATH; continuing",
+			"binary", binary, "path", searchPath)
 	}
+}
+
+// commandBinaryOnPath reports whether binary is an executable reachable via
+// searchPath, the same colon-separated PATH the launchd job runs with. Checking
+// against that PATH rather than the installer's own avoids a false warning for a
+// binary in ~/.local/bin and catches one missing from the job's actual PATH.
+func commandBinaryOnPath(binary, searchPath string) bool {
+	if strings.Contains(binary, "/") {
+		return isExecutableFile(binary)
+	}
+	for dir := range strings.SplitSeq(searchPath, ":") {
+		if dir == "" {
+			continue
+		}
+		if isExecutableFile(filepath.Join(dir, binary)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
 }
 
 func maintenanceData(cfg Config) maintenanceTemplateData {

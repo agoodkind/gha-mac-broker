@@ -8,6 +8,7 @@ package install
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -74,10 +75,15 @@ func Install(ctx context.Context, cfg Config) error {
 // directory, secrets, and golden image are left in place.
 func Uninstall(ctx context.Context, cfg Config) error {
 	slog.InfoContext(ctx, "uninstall starting", "config", cfg.ConfigPath)
-	if err := uninstallUnit(ctx, cfg); err != nil {
+	// Attempt both uninstalls even if the first fails, so a unit-uninstall error
+	// cannot leave an active maintenance timer behind.
+	unitErr := uninstallUnit(ctx, cfg)
+	maintErr := uninstallMaintenanceTimer(ctx, cfg)
+	if err := errors.Join(unitErr, maintErr); err != nil {
+		slog.ErrorContext(ctx, "uninstall completed with errors", "err", err)
 		return err
 	}
-	return uninstallMaintenanceTimer(ctx, cfg)
+	return nil
 }
 
 type combinedOutputRunner interface {
