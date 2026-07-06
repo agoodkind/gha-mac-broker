@@ -2,6 +2,14 @@
 
 The runner pool keeps a fixed set of persistent warm VMs and drains a FIFO job queue through [Pool](../../internal/runnerpool/pool.go). Each worker owns one or more slots. [runWorkerSlots](../../internal/runnerpool/pool.go) starts one [slotLoop](../../internal/runnerpool/pool.go) for each configured slot, and each slot launches a fresh ephemeral GitHub JIT runner for the bound job through [RunJob](../../internal/broker/bind.go). [finishSlotJob](../../internal/runnerpool/pool.go) records the completed slot as no longer busy.
 
+## Slot Isolation
+
+When a worker owns more than one slot, the slots run concurrent jobs on one VM as the same macOS user, so each slot needs an isolated filesystem to avoid sharing a mutable cache. [cloneRunnerSlots](../../internal/broker/bind.go) runs [clone-runner-slots.sh](../../internal/broker/guest/clone-runner-slots.sh) once per warm VM, which gives each slot its own GitHub runner install, its own TMPDIR, and its own HOME at `~/slot-home-<index>`. [runJobRemoteCommand](../../internal/broker/bind.go) renders [run-slot-job.sh](../../internal/broker/guest/run-slot-job.sh), which exports HOME to that per-slot home before launching the runner, so the whole job resolves the home directory to the slot's own home and two co-tenant slots never share a HOME-rooted cache.
+
+Each per-slot HOME is seeded warm from the base home by cloning the by-presence caches (mise, SwiftPM, Homebrew, Xcode DerivedData, and git config) with an APFS copy-on-write clone, so a slot starts warm without sharing a directory. The swift-mk toolchain is not seeded, because it is keyed by source hash and restored per slot by actions/cache, so seeding it would risk a seed and cache merge on the same directory.
+
+A single-slot worker keeps the base HOME and the legacy runner path through [runJobRemoteCommand](../../internal/broker/bind.go), so a one-slot pool behaves as it did before slots existed. The rendered slot commands are enforced by [TestRunJobRemoteCommandUsesSlotHomeAndTMPDIR](../../internal/broker/bind_test.go), [TestRunJobRemoteCommandKeepsLegacySingleSlotPath](../../internal/broker/bind_test.go), and [TestCloneRunnerSlotsCommandCopiesGoldenRunnerToSlotDirs](../../internal/broker/bind_test.go).
+
 ## Reap Contract
 
 A JIT runner serves one GitHub Actions job and then exits under the broker path in [RunJob](../../internal/broker/bind.go). A busy worker whose bound job is cancelled, skipped, or stale is reaped by marking that worker for recycle through [CancelRun](../../internal/runnerpool/pool.go), [reapBusyWorkers](../../internal/runnerpool/pool.go), [busyCandidates](../../internal/runnerpool/pool.go), and [requestBusyRecycle](../../internal/runnerpool/pool.go).
