@@ -204,7 +204,13 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 
 func runJobRemoteCommand(encodedJITConfig string, slotIndex int, slotCount int) string {
 	if slotCount <= 1 {
-		return fmt.Sprintf("cd %s && ./run.sh --jitconfig %s", runnerHome, shellQuote(encodedJITConfig))
+		// GCM_INTERACTIVE=never and GIT_TERMINAL_PROMPT=0 make a git 401 fail fast
+		// instead of wedging the slot on git-credential-manager's interactive prompt,
+		// which a headless CI VM can never answer. The multi-slot path sets the same
+		// two in run-slot-job.sh.
+		return fmt.Sprintf(
+			"cd %s && export GCM_INTERACTIVE=never GIT_TERMINAL_PROMPT=0 && ./run.sh --jitconfig %s",
+			runnerHome, shellQuote(encodedJITConfig))
 	}
 	replacer := strings.NewReplacer(
 		"{{SLOT_INDEX}}", strconv.Itoa(slotIndex),
