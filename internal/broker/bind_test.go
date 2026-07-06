@@ -16,7 +16,7 @@ func TestActiveJobProbeScriptAvoidsSelfMatch(t *testing.T) {
 
 func TestRunJobRemoteCommandKeepsLegacySingleSlotPath(t *testing.T) {
 	command := runJobRemoteCommand("encoded-jit", 0, 1)
-	want := "cd ~/actions-runner && ./run.sh --jitconfig encoded-jit"
+	want := "cd ~/actions-runner && ./run.sh --jitconfig 'encoded-jit'"
 	if command != want {
 		t.Fatalf("single-slot command = %q, want %q", command, want)
 	}

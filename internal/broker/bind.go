@@ -204,7 +204,7 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 
 func runJobRemoteCommand(encodedJITConfig string, slotIndex int, slotCount int) string {
 	if slotCount <= 1 {
-		return fmt.Sprintf("cd %s && ./run.sh --jitconfig %s", runnerHome, encodedJITConfig)
+		return fmt.Sprintf("cd %s && ./run.sh --jitconfig %s", runnerHome, shellQuote(encodedJITConfig))
 	}
 	replacer := strings.NewReplacer(
 		"{{SLOT_INDEX}}", strconv.Itoa(slotIndex),
