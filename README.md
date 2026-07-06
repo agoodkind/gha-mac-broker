@@ -26,21 +26,10 @@ reusable workflow, not in the broker.
 curl -fsSL https://raw.githubusercontent.com/agoodkind/gha-mac-broker/main/install.sh | bash
 ```
 
-The script downloads the signed binary from the latest release into
-`${XDG_BIN_HOME:-$HOME/.local/bin}` and runs `gha-mac-broker install`, which
-scaffolds the config and secrets, builds the golden Tart image when missing,
-and installs the launchd (macOS) or systemd (Linux) user service. Every step is
-idempotent. Pass `--version <tag>` to pin a release, `--bin-dir <dir>` to change
-the install location, `--no-service` to install only the binary, or
-`--no-swift-mk` to skip the default maintenance tool installer. After install,
-set `app.app_id` in the config, place the App private key at
-`app.private_key_path`, and set up the Cloudflare tunnel.
-
 Host prerequisites are Tart and skopeo; on macOS install them with
 `brew install cirruslabs/cli/tart skopeo`. swift-mk is only needed if you keep
 the default maintenance command, and the maintenance timer is macOS-only, so it
-is not required on Linux. `install.sh` installs swift-mk for you on macOS unless
-you pass `--no-swift-mk`; to install it by hand:
+is not required on Linux. To install swift-mk by hand:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/agoodkind/swift-makefile/main/install.sh | bash
