@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -844,15 +846,19 @@ func runnerNameBelongsToVM(vmName string, runnerName string, slotCount int) bool
 	if runnerName == vmName {
 		return true
 	}
-	if slotCount <= 1 {
-		return false
-	}
-	for slotIndex := range slotCount {
-		if runnerName == runnerNameForSlot(vmName, slotIndex, slotCount) {
-			return true
+	if slotCount > 1 {
+		for slotIndex := range slotCount {
+			if runnerName == runnerNameForSlot(vmName, slotIndex, slotCount) {
+				return true
+			}
 		}
 	}
-	return false
+	slotSuffix, found := strings.CutPrefix(runnerName, vmName+"-slot-")
+	if !found {
+		return false
+	}
+	slotIndex, err := strconv.Atoi(slotSuffix)
+	return err == nil && slotIndex >= 0
 }
 
 func (p *Pool) teardownVM(ctx context.Context, vm *broker.WarmVM) {

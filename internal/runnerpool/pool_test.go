@@ -1324,6 +1324,12 @@ func TestRunnerNameBelongsToVMMatchesExactNameWithMultipleSlots(t *testing.T) {
 	}
 }
 
+func TestRunnerNameBelongsToVMMatchesStaleSlotNameWithSingleSlot(t *testing.T) {
+	if !runnerNameBelongsToVM("vm-slots", "vm-slots-slot-1", 1) {
+		t.Fatal("stale slot runner name did not match single-slot VM name")
+	}
+}
+
 func TestReconcileListsInstalledReposOnceForMultipleIdleCandidates(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	clock := newMutableClock(now)
