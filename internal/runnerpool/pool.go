@@ -655,9 +655,16 @@ func (p *Pool) slotLoop(ctx context.Context, index int, slotIndex int, vm *broke
 		if !ok {
 			return
 		}
-		err := p.runner.RunJob(jobCtx, vm, job.Repo, runnerNameForSlot(vm.Name, slotIndex, p.options.JobsPerVM), slotIndex, p.options.JobsPerVM)
-		cancel()
-		p.finishSlotJob(index, slotIndex, vm, err)
+		err := func() (err error) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					err = fmt.Errorf("panic: %v", recovered)
+				}
+				cancel()
+				p.finishSlotJob(index, slotIndex, vm, err)
+			}()
+			return p.runner.RunJob(jobCtx, vm, job.Repo, runnerNameForSlot(vm.Name, slotIndex, p.options.JobsPerVM), slotIndex, p.options.JobsPerVM)
+		}()
 		if err != nil {
 			slog.WarnContext(ctx, "runnerpool job failed", "err", err, "repo", job.Repo, "job_id", job.JobID, "run_id", job.RunID, "vm", vm.Name, "slot", slotIndex)
 		}
@@ -834,8 +841,11 @@ func runnerNameForSlot(vmName string, slotIndex int, slotCount int) string {
 }
 
 func runnerNameBelongsToVM(vmName string, runnerName string, slotCount int) bool {
+	if runnerName == vmName {
+		return true
+	}
 	if slotCount <= 1 {
-		return runnerName == vmName
+		return false
 	}
 	for slotIndex := range slotCount {
 		if runnerName == runnerNameForSlot(vmName, slotIndex, slotCount) {

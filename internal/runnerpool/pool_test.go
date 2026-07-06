@@ -108,6 +108,7 @@ type fakeRunner struct {
 	started   chan runCall
 	release   chan struct{}
 	runErr    error
+	panicErr  error
 	active    int
 	maxActive int
 }
@@ -119,6 +120,7 @@ func newFakeRunner(buffer int) *fakeRunner {
 		started:   make(chan runCall, buffer),
 		release:   nil,
 		runErr:    nil,
+		panicErr:  nil,
 		active:    0,
 		maxActive: 0,
 	}
@@ -151,6 +153,9 @@ func (r *fakeRunner) RunJob(ctx context.Context, vm *broker.WarmVM, repo string,
 		r.mu.Unlock()
 	}()
 	r.started <- call
+	if r.panicErr != nil {
+		panic(r.panicErr)
+	}
 	if r.release != nil {
 		select {
 		case <-ctx.Done():
@@ -643,6 +648,38 @@ func TestVMWithTwoSlotsRunsTwoConcurrentJobs(t *testing.T) {
 		return snapshot.Busy == 1 && snapshot.Idle == 1
 	})
 	runner.Release()
+}
+
+func TestSlotRunJobPanicFreesSlot(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newFakeRunner(1)
+	runner.panicErr = errors.New("runner crashed")
+	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, newFakeGitHub(), nil)
+	ctx := startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo", JobID: 1, RunID: 42}); err != nil {
+		t.Fatalf("Enqueue job: %v", err)
+	}
+	call := waitStarted(t, runner)
+	waitFor(t, func() bool {
+		snapshot := pool.Snapshot()
+		return snapshot.Busy == 0 && snapshot.Idle == 2
+	})
+
+	_, workers := pool.Status(context.Background())
+	if len(workers) != 1 {
+		t.Fatalf("workers = %+v, want 1 worker", workers)
+	}
+	worker := workers[0]
+	if len(worker.Slots) != 2 {
+		t.Fatalf("slots = %+v, want 2 slots", worker.Slots)
+	}
+	slot := worker.Slots[call.SlotIndex]
+	if slot.LastError != "panic: runner crashed" {
+		t.Fatalf("slot last error = %q, want panic: runner crashed", slot.LastError)
+	}
 }
 
 func TestJobsPerVMOneKeepsSingleInflightCapacity(t *testing.T) {
@@ -1278,6 +1315,12 @@ func TestReconcileReplacesIdleVMWithStaleGitHubSlotRunner(t *testing.T) {
 	torn := warmer.TornNames()
 	if len(torn) != 1 || torn[0] != firstVM {
 		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
+	}
+}
+
+func TestRunnerNameBelongsToVMMatchesExactNameWithMultipleSlots(t *testing.T) {
+	if !runnerNameBelongsToVM("vm-slots", "vm-slots", 2) {
+		t.Fatal("bare runner name did not match multi-slot VM name")
 	}
 }
 
