@@ -25,6 +25,7 @@ const (
 	defaultWarmBudget                 = 2
 	defaultGoldenBudget               = 3
 	defaultRunnerCount                = 3
+	defaultJobsPerVM                  = 1
 	defaultMaintenanceIntervalSeconds = 3600
 	cirrusImagePrefix                 = "ghcr.io/cirruslabs/"
 	// defaultFastPullParallel is the skopeo layer-copy concurrency used when
@@ -41,6 +42,9 @@ type Config struct {
 	// RunnerCount is the number of persistent worker VMs kept warm.
 	RunnerCount int `toml:"runner_count"`
 
+	// JobsPerVM is the number of concurrent runner slots inside each warm VM.
+	JobsPerVM int `toml:"jobs_per_vm"`
+
 	// MaxIdle is the idle age after which a worker VM is recycled. Zero or unset
 	// disables idle recycling; the value is honored verbatim, not defaulted.
 	MaxIdle Duration `toml:"max_idle"`
@@ -48,6 +52,14 @@ type Config struct {
 	// MaxAge is the total age after which a worker VM is recycled. Zero or unset
 	// disables age recycling; the value is honored verbatim, not defaulted.
 	MaxAge Duration `toml:"max_age"`
+
+	// MaxBind is the maximum time a busy worker may stay bound before a dead
+	// job probe can recycle it. Zero or unset uses the runner pool default.
+	MaxBind Duration `toml:"max_bind"`
+
+	// PickupTimeout is the time a busy worker may stay bound before a no-active
+	// job probe can recycle it. Zero or unset uses the runner pool default.
+	PickupTimeout Duration `toml:"pickup_timeout"`
 
 	// App identifies the GitHub App and where its private key lives.
 	App AppConfig `toml:"app"`
@@ -61,10 +73,6 @@ type Config struct {
 	// Labels are the runner labels every JIT runner registers with. The
 	// self-hosted job in CI targets one of these.
 	Labels []string `toml:"labels"`
-
-	// AllowedRepos is the owner/repo allowlist the broker will serve. A queued
-	// job for any other repository is ignored.
-	AllowedRepos []string `toml:"allowed_repos"`
 }
 
 // AppConfig holds GitHub App identity and secret references.
@@ -198,6 +206,9 @@ func (c *Config) applyDefaults() {
 	if c.RunnerCount == 0 {
 		c.RunnerCount = defaultRunnerCount
 	}
+	if c.JobsPerVM == 0 {
+		c.JobsPerVM = defaultJobsPerVM
+	}
 	if c.Tart.Binary == "" {
 		c.Tart.Binary = "tart"
 	}
@@ -254,20 +265,26 @@ func (c *Config) validate() error {
 	if c.App.PrivateKeyPath == "" {
 		missing = append(missing, "app.private_key_path")
 	}
-	if len(c.AllowedRepos) == 0 {
-		missing = append(missing, "allowed_repos")
-	}
 	if len(missing) > 0 {
 		return fmt.Errorf("config: missing required fields: %s", strings.Join(missing, ", "))
 	}
 	if c.RunnerCount < 1 {
 		return fmt.Errorf("config: runner_count must be at least 1")
 	}
+	if c.JobsPerVM < 1 {
+		return fmt.Errorf("config: jobs_per_vm must be at least 1")
+	}
 	if c.MaxIdle < 0 {
 		return fmt.Errorf("config: max_idle must not be negative")
 	}
 	if c.MaxAge < 0 {
 		return fmt.Errorf("config: max_age must not be negative")
+	}
+	if c.MaxBind < 0 {
+		return fmt.Errorf("config: max_bind must not be negative")
+	}
+	if c.PickupTimeout < 0 {
+		return fmt.Errorf("config: pickup_timeout must not be negative")
 	}
 	if !safeCirrusImageTag(c.Tart.BaseImage) {
 		return fmt.Errorf("config: tart.base_image must be a ghcr.io/cirruslabs/macos-*-xcode:* tag")
@@ -362,16 +379,6 @@ func safeCirrusImageTag(tag string) bool {
 		return false
 	}
 	return !strings.ContainsAny(macosPart, "/ \t\r\n")
-}
-
-// RepoAllowed reports whether owner/repo is in the allowlist.
-func (c *Config) RepoAllowed(fullName string) bool {
-	for _, r := range c.AllowedRepos {
-		if strings.EqualFold(r, fullName) {
-			return true
-		}
-	}
-	return false
 }
 
 // ReadPrivateKey reads the App private key bytes from disk.

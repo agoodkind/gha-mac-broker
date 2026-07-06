@@ -8,10 +8,13 @@ package broker
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +40,28 @@ const heartbeatFile = "/tmp/gha-broker.alive"
 
 // runnerHome is where the golden image keeps the GitHub Actions runner.
 const runnerHome = "~/actions-runner"
+
+//go:embed guest/clone-runner-slots.sh
+var cloneRunnerSlotsScript string
+
+//go:embed guest/run-slot-job.sh
+var runSlotJobScript string
+
+// activeJobProbeTimeout bounds /status guest process checks.
+const activeJobProbeTimeout = 5 * time.Second
+
+// activeJobProbeScript prints "yes" when a Runner.Worker is running, "no" only
+// when pgrep exits 1 (no match), and otherwise propagates pgrep's nonzero exit
+// so a real probe failure surfaces as an Exec error rather than a false "no".
+// A masked error would let the pickup-timeout reap path drop a healthy worker.
+const activeJobProbeScript = "pgrep -f '[R]unner\\.Worker' >/dev/null 2>&1; rc=$?; if [ \"$rc\" -eq 0 ]; then echo yes; elif [ \"$rc\" -eq 1 ]; then echo no; else exit \"$rc\"; fi"
+
+type activeJobProbeResult string
+
+const (
+	activeJobProbeResultYes activeJobProbeResult = "yes"
+	activeJobProbeResultNo  activeJobProbeResult = "no"
+)
 
 // WarmVM is a booted, vsock-ready VM that has not yet been bound to a job. Name
 // is safe to read from any goroutine once Warm returns.
@@ -106,6 +131,12 @@ func (b *Binder) Warm(ctx context.Context, image, id string) (*WarmVM, error) {
 		return nil, err
 	}
 
+	if err := b.cloneRunnerSlots(ctx, vmName); err != nil {
+		_ = bootCmd.Process.Kill()
+		b.teardown(ctx, vmName)
+		return nil, err
+	}
+
 	// The touch loop outlives this call (the VM stays in the pool), so it runs
 	// on a context detached from ctx and is stopped explicitly in Teardown.
 	touchCtx, stopTouch := context.WithCancel(context.WithoutCancel(ctx))
@@ -121,16 +152,24 @@ func (b *Binder) Warm(ctx context.Context, image, id string) (*WarmVM, error) {
 	return &WarmVM{Name: vmName, Image: image, boot: bootCmd, stopTouch: stopTouch}, nil
 }
 
-// RunJob checks the allowlist, mints a JIT config, and runs one ephemeral GitHub
-// Actions job on the warm VM over vsock. runnerName is the runner registration
-// name.
-func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo, runnerName string) error {
+func (b *Binder) cloneRunnerSlots(ctx context.Context, vmName string) error {
+	remote := cloneRunnerSlotsCommand(normalizedJobsPerVM(b.cfg))
+	if remote == "" {
+		return nil
+	}
+	if _, err := b.vm.Exec(ctx, vmName, "bash", "-lc", remote); err != nil {
+		slog.ErrorContext(ctx, "runner slot clone failed", "err", err, "vm", vmName)
+		return fmt.Errorf("broker: clone runner slots on %s: %w", vmName, err)
+	}
+	return nil
+}
+
+// RunJob mints a JIT config and runs one ephemeral GitHub Actions job on the
+// warm VM over vsock. runnerName is the runner registration name.
+func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName string, slotIndex int, slotCount int) error {
 	owner, repoName, ok := strings.Cut(repo, "/")
 	if !ok {
 		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
-	}
-	if !b.cfg.RepoAllowed(repo) {
-		return fmt.Errorf("broker: repo %s is not in allowed_repos", repo)
 	}
 
 	jit, err := b.generateJIT(ctx, owner, repoName, runnerName)
@@ -138,14 +177,88 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo, runnerName string
 		return err
 	}
 
-	remote := fmt.Sprintf("cd %s && ./run.sh --jitconfig %s", runnerHome, jit.EncodedJITConfig)
-	slog.InfoContext(ctx, "running ephemeral job", "repo", repo, "vm", vm.Name, "runner", jit.Runner.Name)
-	if _, err := b.vm.Exec(ctx, vm.Name, "bash", "-lc", remote); err != nil {
-		slog.ErrorContext(ctx, "job run failed", "err", err, "vm", vm.Name)
+	remote := runJobRemoteCommand(jit.EncodedJITConfig, slotIndex, slotCount)
+	slog.InfoContext(ctx, "running ephemeral job", "repo", repo, "vm", vm.Name, "runner", jit.Runner.Name, "slot", slotIndex)
+	runLog, runLogPath, err := openRunLog(ctx, vm.Name, slotIndex, slotCount)
+	if err != nil {
+		slog.WarnContext(ctx, "run log open failed; using buffered exec", "err", err, "vm", vm.Name, "path", runLogPath)
+		if _, err := b.vm.Exec(ctx, vm.Name, "bash", "-lc", remote); err != nil {
+			slog.ErrorContext(ctx, "job run failed", "err", err, "vm", vm.Name, "slot", slotIndex)
+			return fmt.Errorf("broker: run job on %s: %w", vm.Name, err)
+		}
+		slog.InfoContext(ctx, "job complete", "repo", repo, "vm", vm.Name, "slot", slotIndex)
+		return nil
+	}
+	defer func() {
+		if err := runLog.Close(); err != nil {
+			slog.WarnContext(ctx, "run log close failed", "err", err, "vm", vm.Name, "path", runLogPath)
+		}
+	}()
+	if _, err := b.vm.ExecTee(ctx, vm.Name, runLog, "bash", "-lc", remote); err != nil {
+		slog.ErrorContext(ctx, "job run failed", "err", err, "vm", vm.Name, "slot", slotIndex)
 		return fmt.Errorf("broker: run job on %s: %w", vm.Name, err)
 	}
-	slog.InfoContext(ctx, "job complete", "repo", repo, "vm", vm.Name)
+	slog.InfoContext(ctx, "job complete", "repo", repo, "vm", vm.Name, "slot", slotIndex)
 	return nil
+}
+
+func runJobRemoteCommand(encodedJITConfig string, slotIndex int, slotCount int) string {
+	if slotCount <= 1 {
+		return fmt.Sprintf("cd %s && ./run.sh --jitconfig %s", runnerHome, shellQuote(encodedJITConfig))
+	}
+	replacer := strings.NewReplacer(
+		"{{SLOT_INDEX}}", strconv.Itoa(slotIndex),
+		"{{JIT_CONFIG}}", shellQuote(encodedJITConfig),
+	)
+	return replacer.Replace(runSlotJobScript)
+}
+
+func cloneRunnerSlotsCommand(slotCount int) string {
+	if slotCount <= 1 {
+		return ""
+	}
+	replacer := strings.NewReplacer("{{SLOT_COUNT}}", strconv.Itoa(slotCount))
+	return replacer.Replace(cloneRunnerSlotsScript)
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func openRunLog(ctx context.Context, vmName string, slotIndex int, slotCount int) (*os.File, string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		slog.WarnContext(ctx, "resolve home dir for run log failed", "err", err, "vm", vmName)
+		return nil, "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	logDir := filepath.Join(home, "Library", "Logs", "gha-mac-broker")
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		slog.WarnContext(ctx, "create run log dir failed", "err", err, "vm", vmName, "path", logDir)
+		return nil, logDir, fmt.Errorf("create run log dir: %w", err)
+	}
+	logName := vmName
+	if slotCount > 1 {
+		logName = fmt.Sprintf("%s-slot-%d", vmName, slotIndex)
+	}
+	logPath := filepath.Join(logDir, "run-"+safeLogName(logName)+".log")
+	// Truncate rather than append: the pool reuses VM names across jobs, so
+	// appending would grow run-<vm>.log without bound and interleave unrelated
+	// jobs. Each job replaces the prior, leaving the latest job's output for a
+	// post-mortem of a wedge on that VM.
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		slog.WarnContext(ctx, "open run log failed", "err", err, "vm", vmName, "path", logPath)
+		return nil, logPath, fmt.Errorf("open run log: %w", err)
+	}
+	return file, logPath, nil
+}
+
+func safeLogName(name string) string {
+	replacer := strings.NewReplacer("/", "_", "\\", "_")
+	return replacer.Replace(name)
 }
 
 // Teardown stops the liveness touch loop, kills the boot process if running,
@@ -167,6 +280,36 @@ func (b *Binder) CheckAlive(ctx context.Context, vm *WarmVM) error {
 		return fmt.Errorf("broker: check alive %s: %w", vm.Name, err)
 	}
 	return nil
+}
+
+// HasActiveJob reports whether the guest is running an actions job worker for a slot.
+func (b *Binder) HasActiveJob(ctx context.Context, vm *WarmVM, slotIndex int, slotCount int) (bool, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, activeJobProbeTimeout)
+	defer cancel()
+	command := activeJobProbeCommand(slotIndex, slotCount)
+	out, err := b.vm.Exec(probeCtx, vm.Name, "bash", "-lc", command)
+	if err != nil {
+		slog.WarnContext(probeCtx, "active job probe failed", "err", err, "vm", vm.Name, "slot", slotIndex)
+		return false, fmt.Errorf("broker: probe active job on %s slot %d: %w", vm.Name, slotIndex, err)
+	}
+	result := activeJobProbeResult(strings.TrimSpace(string(out)))
+	switch result {
+	case activeJobProbeResultYes:
+		return true, nil
+	case activeJobProbeResultNo:
+		return false, nil
+	default:
+		slog.WarnContext(probeCtx, "active job probe returned unexpected output", "vm", vm.Name, "slot", slotIndex, "output", result)
+		return false, fmt.Errorf("broker: active job probe on %s slot %d returned %q", vm.Name, slotIndex, string(result))
+	}
+}
+
+func activeJobProbeCommand(slotIndex int, slotCount int) string {
+	if slotCount <= 1 {
+		return activeJobProbeScript
+	}
+	pattern := fmt.Sprintf("actions-runner-%d/bin/[R]unner\\.Worker", slotIndex)
+	return fmt.Sprintf(`pgrep -f %s >/dev/null 2>&1; rc=$?; if [ "$rc" -eq 0 ]; then echo yes; elif [ "$rc" -eq 1 ]; then echo no; else exit "$rc"; fi`, shellQuote(pattern))
 }
 
 // List returns the Tart VM names visible to the broker host.
@@ -217,21 +360,25 @@ func (b *Binder) SweepOrphans(ctx context.Context) {
 }
 
 // BindOnce clones a warm VM, registers it as an ephemeral runner for repo, runs
-// one job, and tears the VM down. id makes the VM and runner names unique. repo
-// is owner/repo and must be in the allowlist.
+// one job, and tears the VM down. id makes the VM and runner names unique.
 func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
 	if _, _, ok := strings.Cut(repo, "/"); !ok {
 		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
-	}
-	if !b.cfg.RepoAllowed(repo) {
-		return fmt.Errorf("broker: repo %s is not in allowed_repos", repo)
 	}
 	vm, err := b.Warm(ctx, b.cfg.Tart.BaseImage, id)
 	if err != nil {
 		return err
 	}
 	defer b.Teardown(ctx, vm)
-	return b.RunJob(ctx, vm, repo, vm.Name)
+	jobsPerVM := normalizedJobsPerVM(b.cfg)
+	return b.RunJob(ctx, vm, repo, vm.Name, 0, jobsPerVM)
+}
+
+func normalizedJobsPerVM(cfg *config.Config) int {
+	if cfg == nil || cfg.JobsPerVM < 1 {
+		return 1
+	}
+	return cfg.JobsPerVM
 }
 
 // bootCommand builds the headless boot command with the cache dir mounted.

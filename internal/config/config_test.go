@@ -18,10 +18,8 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
-func TestLoadDefaultsAndAllowlist(t *testing.T) {
+func TestLoadDefaults(t *testing.T) {
 	path := writeConfig(t, `
-allowed_repos = ["agoodkind/lmd", "agoodkind/swift-makefile"]
-
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"
@@ -38,6 +36,9 @@ private_key_path = "/tmp/key.pem"
 	}
 	if cfg.RunnerCount != 3 {
 		t.Errorf("default runner count = %d", cfg.RunnerCount)
+	}
+	if cfg.JobsPerVM != 1 {
+		t.Errorf("default jobs per VM = %d", cfg.JobsPerVM)
 	}
 	// MaxIdle and MaxAge are honored verbatim, so an unset value stays zero and
 	// disables that recycle trigger rather than defaulting.
@@ -93,11 +94,21 @@ private_key_path = "/tmp/key.pem"
 	if image != DefaultBaseImage {
 		t.Errorf("mapped image = %q, want %q", image, DefaultBaseImage)
 	}
-	if !cfg.RepoAllowed("agoodkind/LMD") {
-		t.Error("allowlist should match case-insensitively")
-	}
-	if cfg.RepoAllowed("agoodkind/secret") {
-		t.Error("non-listed repo must not be allowed")
+}
+
+func TestLoadIgnoresLegacyAllowedReposKey(t *testing.T) {
+	path := writeConfig(t, `
+allowed_repos = ["agoodkind/lmd"]
+
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[tart]
+`)
+
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load with legacy allowed_repos key: %v", err)
 	}
 }
 
@@ -131,9 +142,11 @@ interval_seconds = 900
 func TestLoadRunnerPoolSettings(t *testing.T) {
 	path := writeConfig(t, `
 runner_count = 5
+jobs_per_vm = 2
 max_idle = "45m"
 max_age = "6h"
-allowed_repos = ["agoodkind/lmd"]
+max_bind = "90m"
+pickup_timeout = "7m"
 
 [app]
 app_id = "12345"
@@ -150,21 +163,28 @@ warm_budget = 7
 	if cfg.RunnerCount != 5 {
 		t.Fatalf("runner count = %d, want 5", cfg.RunnerCount)
 	}
+	if cfg.JobsPerVM != 2 {
+		t.Fatalf("jobs per VM = %d, want 2", cfg.JobsPerVM)
+	}
 	if time.Duration(cfg.MaxIdle) != 45*time.Minute {
 		t.Fatalf("max idle = %s, want 45m0s", time.Duration(cfg.MaxIdle))
 	}
 	if time.Duration(cfg.MaxAge) != 6*time.Hour {
 		t.Fatalf("max age = %s, want 6h0m0s", time.Duration(cfg.MaxAge))
 	}
+	if time.Duration(cfg.MaxBind) != 90*time.Minute {
+		t.Fatalf("max bind = %s, want 1h30m0s", time.Duration(cfg.MaxBind))
+	}
+	if time.Duration(cfg.PickupTimeout) != 7*time.Minute {
+		t.Fatalf("pickup timeout = %s, want 7m0s", time.Duration(cfg.PickupTimeout))
+	}
 	if cfg.Tart.WarmBudget != 7 {
 		t.Fatalf("warm budget = %d, want back-compat parse value 7", cfg.Tart.WarmBudget)
 	}
 }
 
-func TestResolveImageUsesConfiguredAllowlist(t *testing.T) {
+func TestResolveImageUsesConfiguredMappings(t *testing.T) {
 	path := writeConfig(t, `
-allowed_repos = ["agoodkind/lmd"]
-
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"
@@ -218,12 +238,7 @@ func TestResolveImageRejectsUnsafeConfiguredTag(t *testing.T) {
 			FastPull:     nil,
 			FastPullDir:  "",
 		},
-		Maintenance: MaintenanceConfig{
-			Command:         "",
-			IntervalSeconds: 0,
-		},
-		Labels:       []string{"self-hosted"},
-		AllowedRepos: []string{"agoodkind/lmd"},
+		Labels: []string{"self-hosted"},
 	}
 	if _, ok := cfg.ResolveImage("tahoe", "raw"); ok {
 		t.Fatal("unsafe mapped tag should not resolve")
@@ -241,10 +256,28 @@ app_id = "12345"
 	}
 }
 
+func TestLoadRejectsJobsPerVMLessThanOne(t *testing.T) {
+	path := writeConfig(t, `
+runner_count = 1
+jobs_per_vm = -1
+
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[tart]
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for jobs_per_vm less than 1")
+	}
+	if !strings.Contains(err.Error(), "jobs_per_vm must be at least 1") {
+		t.Errorf("error = %q, want jobs_per_vm validation", err.Error())
+	}
+}
+
 func TestLoadRejectsFastPullDirInsideCacheDir(t *testing.T) {
 	path := writeConfig(t, `
-allowed_repos = ["agoodkind/lmd"]
-
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"

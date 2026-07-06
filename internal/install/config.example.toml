@@ -1,18 +1,13 @@
 listen_addr = "[::1]:8080"
 runner_count = 3
+# Concurrent runner slots per warm VM.
+jobs_per_vm = 1
 max_idle = "2h"
 max_age = "24h"
+max_bind = "65m"
+pickup_timeout = "5m"
 
 labels = ["self-hosted", "macOS", "ARM64", "agk-local-macos-26"]
-
-allowed_repos = [
-  "agoodkind/lmd",
-  "agoodkind/iphone-cell-tunnel",
-  "agoodkind/macos-fan-curve",
-  "agoodkind/macos-smc-fan",
-  "agoodkind/stickies-improved",
-  "agoodkind/swift-makefile",
-]
 
 # Paths are read verbatim with no shell tilde expansion, so use absolute paths
 # (replace "you" with your username).

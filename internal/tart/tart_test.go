@@ -1,8 +1,12 @@
 package tart
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -65,6 +69,90 @@ func TestExecArgsAndExitCode(t *testing.T) {
 
 	if _, err := tt.Exec(context.Background(), "warm-1", "false"); err == nil {
 		t.Error("Exec should surface a non-zero guest exit code as an error")
+	}
+}
+
+func TestExecTeeWritesOutputToSink(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	script := "#!/usr/bin/env bash\nprintf 'stdout-line\\n'\nprintf 'stderr-line\\n' >&2\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+	tt := New(bin)
+	var sink bytes.Buffer
+
+	out, err := tt.ExecTee(context.Background(), "warm-1", &sink, "bash", "-lc", "echo ignored")
+	if err != nil {
+		t.Fatalf("ExecTee: %v", err)
+	}
+	for _, want := range []string{"stdout-line", "stderr-line"} {
+		if !strings.Contains(sink.String(), want) {
+			t.Fatalf("sink = %q, want %q", sink.String(), want)
+		}
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("out = %q, want %q", out, want)
+		}
+	}
+}
+
+func TestExecTeeReturnsBoundedTailAndStreamsFullOutput(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	script := "#!/usr/bin/env bash\nfor i in {1..70000}; do printf 'x'; done\nprintf 'tail-marker\\n'\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+	tt := New(bin)
+	var sink bytes.Buffer
+
+	out, err := tt.ExecTee(context.Background(), "warm-1", &sink, "bash", "-lc", "echo ignored")
+	if err != nil {
+		t.Fatalf("ExecTee: %v", err)
+	}
+	if sink.Len() != 70012 {
+		t.Fatalf("sink len = %d, want 70012", sink.Len())
+	}
+	const expectedTailLimit = 64 * 1024
+	if len(out) > expectedTailLimit {
+		t.Fatalf("out len = %d, want at most %d", len(out), expectedTailLimit)
+	}
+	if !strings.Contains(string(out), "tail-marker") {
+		t.Fatalf("out = %q, want trailing marker", out)
+	}
+}
+
+func TestExecTeeUsesInjectedRunner(t *testing.T) {
+	var gotBin string
+	var gotArgs []string
+	stub := func(_ context.Context, bin string, sink io.Writer, args ...string) ([]byte, error) {
+		gotBin = bin
+		gotArgs = args
+		if _, err := sink.Write([]byte("tee-line\n")); err != nil {
+			return nil, err
+		}
+		return []byte("buffered-line\n"), nil
+	}
+	tt := New("fake-tart")
+	tt.runTee = stub
+	var sink bytes.Buffer
+
+	out, err := tt.ExecTee(context.Background(), "warm-1", &sink, "bash", "-lc", "echo ignored")
+	if err != nil {
+		t.Fatalf("ExecTee: %v", err)
+	}
+	if gotBin != "fake-tart" {
+		t.Fatalf("tee bin = %q, want fake-tart", gotBin)
+	}
+	wantArgs := []string{"exec", "warm-1", "bash", "-lc", "echo ignored"}
+	if !slices.Equal(gotArgs, wantArgs) {
+		t.Fatalf("tee args = %v, want %v", gotArgs, wantArgs)
+	}
+	if sink.String() != "tee-line\n" {
+		t.Fatalf("sink = %q, want tee-line", sink.String())
+	}
+	if string(out) != "buffered-line\n" {
+		t.Fatalf("out = %q, want buffered-line", out)
 	}
 }
 
