@@ -3,6 +3,7 @@ package install
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,34 @@ func TestRenderSystemd(t *testing.T) {
 		}
 	}
 	assertNoMarkers(t, rendered)
+}
+
+func TestInstallLaunchdBootsOutBeforeBootstrap(t *testing.T) {
+	home := t.TempDir()
+	cfg := sampleConfig()
+	cfg.Home = home
+	cfg.ConfigDir = filepath.Join(home, ".config", "gha-mac-broker")
+	cfg.ConfigPath = filepath.Join(cfg.ConfigDir, "config.toml")
+	cfg.LogPath = filepath.Join(home, "Library", "Logs", "gha-mac-broker.log")
+	recorder := &recordingCommandRunner{calls: nil}
+	t.Cleanup(replaceCommandRunner(recorder.build))
+
+	if err := installLaunchd(context.Background(), cfg); err != nil {
+		t.Fatalf("installLaunchd: %v", err)
+	}
+
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	target := domain + "/" + launchdLabel
+	if len(recorder.calls) != 2 {
+		t.Fatalf("launchctl calls = %d, want 2: %#v", len(recorder.calls), recorder.calls)
+	}
+	if recorder.calls[0].name != "launchctl" || recorder.calls[0].args[0] != "bootout" || recorder.calls[0].args[1] != target {
+		t.Fatalf("first command = %#v, want launchctl bootout %s", recorder.calls[0], target)
+	}
+	if recorder.calls[1].name != "launchctl" || recorder.calls[1].args[0] != "bootstrap" || recorder.calls[1].args[1] != domain || recorder.calls[1].args[2] != plistPath {
+		t.Fatalf("second command = %#v, want launchctl bootstrap %s %s", recorder.calls[1], domain, plistPath)
+	}
 }
 
 // TestEmbeddedConfigMatchesRepoRoot guards against the embedded scaffold copy
