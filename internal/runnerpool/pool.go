@@ -286,7 +286,7 @@ func (p *Pool) Enqueue(ctx context.Context, job Job) error {
 	return nil
 }
 
-// Ready reports whether the pool is healthy and has free or near-free capacity.
+// Ready reports whether the pool has immediate capacity for the next job.
 func (p *Pool) Ready() bool {
 	return p.Snapshot().Ready
 }
@@ -330,7 +330,12 @@ func (p *Pool) snapshotLocked() Snapshot {
 	// so routine recycling never sheds every consumer to hosted while other VMs
 	// remain live.
 	snapshot.Healthy = activeSlots > 0
-	snapshot.Ready = activeSlots > 0 && (snapshot.Idle > 0 || snapshot.Queued < activeSlots)
+	// Ready means a genuinely idle slot exists for the next job, net of jobs
+	// already queued ahead. Idle only counts alive, non-busy slots, so
+	// activeSlots == 0 yields Idle == 0 and Ready == false. Never report the
+	// optimistic bet that a busy slot will free soon, since a long build can
+	// strand the job and the broker contract is truthful capacity.
+	snapshot.Ready = snapshot.Idle > snapshot.Queued
 	return snapshot
 }
 
