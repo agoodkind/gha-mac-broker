@@ -61,6 +61,13 @@ type Config struct {
 	// job probe can recycle it. Zero or unset uses the runner pool default.
 	PickupTimeout Duration `toml:"pickup_timeout"`
 
+	// StallTimeout is the low CPU duration after which a live job is logged as
+	// stalled. Zero or unset uses the runner pool default.
+	StallTimeout Duration `toml:"stall_timeout"`
+
+	// StallReap allows a stalled busy worker to be recycled after logging.
+	StallReap bool `toml:"stall_reap"`
+
 	// App identifies the GitHub App and where its private key lives.
 	App AppConfig `toml:"app"`
 
@@ -285,6 +292,9 @@ func (c *Config) validate() error {
 	}
 	if c.PickupTimeout < 0 {
 		return fmt.Errorf("config: pickup_timeout must not be negative")
+	}
+	if c.StallTimeout < 0 {
+		return fmt.Errorf("config: stall_timeout must not be negative")
 	}
 	if !safeCirrusImageTag(c.Tart.BaseImage) {
 		return fmt.Errorf("config: tart.base_image must be a ghcr.io/cirruslabs/macos-*-xcode:* tag")

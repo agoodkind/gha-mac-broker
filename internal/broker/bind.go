@@ -311,12 +311,43 @@ func (b *Binder) HasActiveJob(ctx context.Context, vm *WarmVM, slotIndex int, sl
 	}
 }
 
+// SlotCPUActivity returns the aggregate CPU percent for one slot job process tree.
+func (b *Binder) SlotCPUActivity(ctx context.Context, vm *WarmVM, slotIndex int, slotCount int) (float64, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, activeJobProbeTimeout)
+	defer cancel()
+	command := slotCPUActivityCommand(slotIndex, slotCount)
+	out, err := b.vm.Exec(probeCtx, vm.Name, "bash", "-lc", command)
+	if err != nil {
+		slog.WarnContext(probeCtx, "slot cpu activity probe failed", "err", err, "vm", vm.Name, "slot", slotIndex)
+		return 0, fmt.Errorf("broker: probe slot cpu activity on %s slot %d: %w", vm.Name, slotIndex, err)
+	}
+	output := strings.TrimSpace(string(out))
+	cpuActivity, err := strconv.ParseFloat(output, 64)
+	if err != nil {
+		slog.WarnContext(probeCtx, "slot cpu activity probe returned unexpected output", "vm", vm.Name, "slot", slotIndex, "output", output)
+		return 0, fmt.Errorf("broker: slot cpu activity probe on %s slot %d returned %q", vm.Name, slotIndex, output)
+	}
+	return cpuActivity, nil
+}
+
 func activeJobProbeCommand(slotIndex int, slotCount int) string {
 	if slotCount <= 1 {
 		return activeJobProbeScript
 	}
-	pattern := fmt.Sprintf("actions-runner-%d/bin/[R]unner\\.Worker", slotIndex)
+	pattern := runnerWorkerPattern(slotIndex, slotCount)
 	return fmt.Sprintf(`pgrep -f %s >/dev/null 2>&1; rc=$?; if [ "$rc" -eq 0 ]; then echo yes; elif [ "$rc" -eq 1 ]; then echo no; else exit "$rc"; fi`, shellQuote(pattern))
+}
+
+func slotCPUActivityCommand(slotIndex int, slotCount int) string {
+	pattern := runnerWorkerPattern(slotIndex, slotCount)
+	return fmt.Sprintf(`roots=$(pgrep -f %s 2>/dev/null); rc=$?; if [ "$rc" -eq 1 ]; then echo -1; exit 0; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi; ps -Ao pid=,ppid=,pcpu= | awk -v roots="$roots" 'BEGIN { split(roots, root_parts, /[[:space:]]+/); for (i in root_parts) { if (root_parts[i] != "") { active[root_parts[i]] = 1 } } } { pid[NR] = $1; ppid[NR] = $2; cpu[NR] = $3 + 0 } END { changed = 1; while (changed) { changed = 0; for (i = 1; i <= NR; i++) { if (active[ppid[i]] && !active[pid[i]]) { active[pid[i]] = 1; changed = 1 } } } total = 0; for (i = 1; i <= NR; i++) { if (active[pid[i]]) { total += cpu[i] } } printf "%%.1f\n", total }'`, shellQuote(pattern))
+}
+
+func runnerWorkerPattern(slotIndex int, slotCount int) string {
+	if slotCount <= 1 {
+		return "[R]unner\\.Worker"
+	}
+	return fmt.Sprintf("actions-runner-%d/bin/[R]unner\\.Worker", slotIndex)
 }
 
 // List returns the Tart VM names visible to the broker host.
