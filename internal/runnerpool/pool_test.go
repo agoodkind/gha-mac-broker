@@ -1,10 +1,13 @@
 package runnerpool
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -247,20 +250,28 @@ func (g *fakeGitHub) RunnerCalls() []string {
 }
 
 type fakeActiveJobProber struct {
-	mu       sync.Mutex
-	active   map[string]bool
-	calls    []string
-	probeErr error
-	onProbe  func()
+	mu          sync.Mutex
+	active      map[string]bool
+	calls       []string
+	probeErr    error
+	onProbe     func()
+	cpuActivity map[string]float64
+	cpuCalls    []string
+	cpuProbeErr error
+	onCPUProbe  func()
 }
 
 func newFakeActiveJobProber(active map[string]bool) *fakeActiveJobProber {
 	return &fakeActiveJobProber{
-		mu:       sync.Mutex{},
-		active:   active,
-		calls:    nil,
-		probeErr: nil,
-		onProbe:  nil,
+		mu:          sync.Mutex{},
+		active:      active,
+		calls:       nil,
+		probeErr:    nil,
+		onProbe:     nil,
+		cpuActivity: make(map[string]float64),
+		cpuCalls:    nil,
+		cpuProbeErr: nil,
+		onCPUProbe:  nil,
 	}
 }
 
@@ -278,16 +289,42 @@ func (p *fakeActiveJobProber) HasActiveJob(_ context.Context, vm *broker.WarmVM,
 	return p.active[key], nil
 }
 
+func (p *fakeActiveJobProber) SlotCPUActivity(_ context.Context, vm *broker.WarmVM, slotIndex int, slotCount int) (float64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := probeKey(vm.Name, slotIndex, slotCount)
+	p.cpuCalls = append(p.cpuCalls, key)
+	if p.cpuProbeErr != nil {
+		return 0, p.cpuProbeErr
+	}
+	if p.onCPUProbe != nil {
+		p.onCPUProbe()
+	}
+	return p.cpuActivity[key], nil
+}
+
 func (p *fakeActiveJobProber) Calls() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]string(nil), p.calls...)
 }
 
+func (p *fakeActiveJobProber) CPUCalls() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.cpuCalls...)
+}
+
 func (p *fakeActiveJobProber) SetActive(vmName string, active bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.active[vmName] = active
+}
+
+func (p *fakeActiveJobProber) SetCPUActivity(vmName string, cpuActivity float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cpuActivity[vmName] = cpuActivity
 }
 
 func probeKey(vmName string, slotIndex int, slotCount int) string {
@@ -377,6 +414,18 @@ func startTestPool(t *testing.T, pool *Pool) context.Context {
 		pool.Shutdown(shutdownCtx)
 	})
 	return ctx
+}
+
+func captureTestLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buffer := &bytes.Buffer{}
+	previous := slog.Default()
+	logger := slog.New(slog.NewTextHandler(buffer, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	slog.SetDefault(logger)
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+	})
+	return buffer
 }
 
 func busyWorkerState(vmName string, bornAt time.Time, boundAt time.Time, jobID int64, runID int64, cancel context.CancelFunc) workerState {
@@ -887,8 +936,10 @@ func TestReconcileReapsBusyWorkerAfterPickupTimeoutWithoutActiveJob(t *testing.T
 	options.PickupTimeout = time.Minute
 	options.MaxBind = time.Hour
 	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
+	prober.SetCPUActivity("vm-busy", 90)
 	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
 	cancelCount := 0
+	logs := captureTestLogs(t)
 
 	pool.mu.Lock()
 	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func() {
@@ -914,6 +965,12 @@ func TestReconcileReapsBusyWorkerAfterPickupTimeoutWithoutActiveJob(t *testing.T
 	calls := prober.Calls()
 	if len(calls) != 1 || calls[0] != "vm-busy" {
 		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
+	}
+	if cpuCalls := prober.CPUCalls(); len(cpuCalls) != 0 {
+		t.Fatalf("cpu calls = %v, want none", cpuCalls)
+	}
+	if !strings.Contains(logs.String(), "runnerpool reaping worker (no active job process)") {
+		t.Fatalf("logs = %q, want no active job reap warning", logs.String())
 	}
 }
 
@@ -951,6 +1008,186 @@ func TestReconcileKeepsBusyWorkerWithActiveJobAfterPickupTimeout(t *testing.T) {
 	calls := prober.Calls()
 	if len(calls) != 1 || calls[0] != "vm-busy" {
 		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
+	}
+}
+
+func TestReconcileReapsStalledBusyWorkerWhenStallReapEnabled(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	options.StallTimeout = 2 * time.Minute
+	options.StallReap = true
+	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
+	prober.SetCPUActivity("vm-busy", 0)
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+	logs := captureTestLogs(t)
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 1001, 42, func() {
+		cancelCount++
+	})
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	clock.Advance(options.StallTimeout)
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if !pool.states[0].recycle {
+		t.Fatal("stalled worker recycle = false, want true")
+	}
+	if pool.states[0].slots[0].jobCancel != nil {
+		t.Fatal("stalled worker jobCancel is still set")
+	}
+	if cancelCount != 1 {
+		t.Fatalf("cancel count = %d, want 1", cancelCount)
+	}
+	if !strings.Contains(logs.String(), "runnerpool worker stalled (no cpu progress)") {
+		t.Fatalf("logs = %q, want stalled worker warning", logs.String())
+	}
+}
+
+func TestReconcileLogsStalledBusyWorkerWhenStallReapDisabled(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	options.StallTimeout = 2 * time.Minute
+	options.StallReap = false
+	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
+	prober.SetCPUActivity("vm-busy", 0)
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+	logs := captureTestLogs(t)
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 1001, 42, func() {
+		cancelCount++
+	})
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	clock.Advance(options.StallTimeout)
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].recycle {
+		t.Fatal("stalled worker recycle = true with stall reap disabled, want false")
+	}
+	if pool.states[0].slots[0].jobCancel == nil {
+		t.Fatal("stalled worker jobCancel = nil, want still set")
+	}
+	if cancelCount != 0 {
+		t.Fatalf("cancel count = %d, want 0", cancelCount)
+	}
+	if !strings.Contains(logs.String(), "runnerpool worker stalled (no cpu progress)") {
+		t.Fatalf("logs = %q, want stalled worker warning", logs.String())
+	}
+}
+
+func TestReconcileKeepsProgressingBusyWorkerPastStallTimeout(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	options.StallTimeout = 2 * time.Minute
+	options.StallReap = true
+	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
+	prober.SetCPUActivity("vm-busy", 90)
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 1001, 42, func() {
+		cancelCount++
+	})
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	clock.Advance(options.StallTimeout)
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].recycle {
+		t.Fatal("progressing worker recycle = true, want false")
+	}
+	if !pool.states[0].slots[0].cpuStalledSince.IsZero() {
+		t.Fatalf("cpu stalled since = %v, want zero", pool.states[0].slots[0].cpuStalledSince)
+	}
+	if cancelCount != 0 {
+		t.Fatalf("cancel count = %d, want 0", cancelCount)
+	}
+}
+
+func TestReconcileResetsStallClockWhenCPUProgressReturns(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	options.StallTimeout = 2 * time.Minute
+	options.StallReap = true
+	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
+	prober.SetCPUActivity("vm-busy", 0)
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 1001, 42, func() {
+		cancelCount++
+	})
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	clock.Advance(time.Minute)
+	prober.SetCPUActivity("vm-busy", 90)
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	pool.mu.Lock()
+	if !pool.states[0].slots[0].cpuStalledSince.IsZero() {
+		t.Fatalf("cpu stalled since after progress = %v, want zero", pool.states[0].slots[0].cpuStalledSince)
+	}
+	pool.mu.Unlock()
+
+	clock.Advance(options.StallTimeout)
+	prober.SetCPUActivity("vm-busy", 0)
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("third Reconcile: %v", err)
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].recycle {
+		t.Fatal("worker recycle = true after reset stall clock, want false")
+	}
+	if !pool.states[0].slots[0].cpuStalledSince.Equal(clock.Now()) {
+		t.Fatalf("cpu stalled since = %v, want %v", pool.states[0].slots[0].cpuStalledSince, clock.Now())
+	}
+	if cancelCount != 0 {
+		t.Fatalf("cancel count = %d, want 0", cancelCount)
 	}
 }
 
@@ -1095,8 +1332,10 @@ func TestReconcileReapsBusyWorkerPastMaxBindWhenProbeErrors(t *testing.T) {
 	options.MaxBind = 2 * time.Minute
 	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
 	prober.probeErr = errors.New("guest probe failed")
+	prober.SetCPUActivity("vm-busy", 90)
 	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
 	cancelCount := 0
+	logs := captureTestLogs(t)
 
 	pool.mu.Lock()
 	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.MaxBind-time.Second), 0, 42, func() {
@@ -1122,6 +1361,12 @@ func TestReconcileReapsBusyWorkerPastMaxBindWhenProbeErrors(t *testing.T) {
 	calls := prober.Calls()
 	if len(calls) != 1 || calls[0] != "vm-busy" {
 		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
+	}
+	if cpuCalls := prober.CPUCalls(); len(cpuCalls) != 0 {
+		t.Fatalf("cpu calls = %v, want none", cpuCalls)
+	}
+	if !strings.Contains(logs.String(), "runnerpool reaping worker (probe error past max_bind)") {
+		t.Fatalf("logs = %q, want probe error reap warning", logs.String())
 	}
 }
 
