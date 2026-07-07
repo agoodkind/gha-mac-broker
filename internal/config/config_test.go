@@ -147,8 +147,6 @@ max_idle = "45m"
 max_age = "6h"
 max_bind = "90m"
 pickup_timeout = "7m"
-stall_timeout = "11m"
-stall_reap = true
 
 [app]
 app_id = "12345"
@@ -179,12 +177,6 @@ warm_budget = 7
 	}
 	if time.Duration(cfg.PickupTimeout) != 7*time.Minute {
 		t.Fatalf("pickup timeout = %s, want 7m0s", time.Duration(cfg.PickupTimeout))
-	}
-	if time.Duration(cfg.StallTimeout) != 11*time.Minute {
-		t.Fatalf("stall timeout = %s, want 11m0s", time.Duration(cfg.StallTimeout))
-	}
-	if !cfg.StallReap {
-		t.Fatal("stall reap = false, want true")
 	}
 	if cfg.Tart.WarmBudget != 7 {
 		t.Fatalf("warm budget = %d, want back-compat parse value 7", cfg.Tart.WarmBudget)
@@ -300,24 +292,5 @@ fast_pull_dir = "/tmp/pool-cache/fastpull-blobs"
 	}
 	if !strings.Contains(err.Error(), "must not be inside") {
 		t.Errorf("error = %q, want it to mention the containment violation", err.Error())
-	}
-}
-
-func TestLoadRejectsNegativeStallTimeout(t *testing.T) {
-	path := writeConfig(t, `
-stall_timeout = "-1m"
-
-[app]
-app_id = "12345"
-private_key_path = "/tmp/key.pem"
-
-[tart]
-`)
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("expected error for negative stall timeout")
-	}
-	if !strings.Contains(err.Error(), "stall_timeout must not be negative") {
-		t.Errorf("error = %q, want stall_timeout validation", err.Error())
 	}
 }

@@ -65,8 +65,6 @@ tilde expansion), never inlined.
 | `max_age` | recycle a VM once it has run this long |
 | `max_bind` | probe a busy worker after this long and recycle it only when active work is not confirmed |
 | `pickup_timeout` | probe a newly bound busy worker after this long and recycle it when no active job exists |
-| `stall_timeout` | warn when a live busy worker has no CPU progress for this long after pickup timeout, default 10m |
-| `stall_reap` | recycle a stalled busy worker after the warning when true, default false |
 | `tart.base_image` | Cirrus image the golden is built from (runner baked in, unconfigured) |
 | `tart.cache_dir` | host dir mounted into each VM, survives VM deletion |
 
