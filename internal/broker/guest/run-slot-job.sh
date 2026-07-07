@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fail fast on any git credential request instead of hanging the slot. A headless
-# CI VM cannot answer git-credential-manager's interactive prompt, so a git 401
-# (for example a GitHub rate-limit on an unauthenticated clone) would otherwise
-# wedge the slot at 0% CPU until the bind timeout.
-export GCM_INTERACTIVE=never
+# SwiftPM clone URLs already include the GitHub token, so no credential helper
+# is needed. Clear credential.helper for this process tree so
+# git-credential-manager is never invoked, since its credential store path can
+# deadlock in the headless VM. Keep terminal prompts off so a 401 fails fast.
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=credential.helper
+export GIT_CONFIG_VALUE_0=
 export GIT_TERMINAL_PROMPT=0
 
 base_home="$HOME"

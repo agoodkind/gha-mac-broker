@@ -16,9 +16,12 @@ func TestActiveJobProbeScriptAvoidsSelfMatch(t *testing.T) {
 
 func TestRunJobRemoteCommandKeepsLegacySingleSlotPath(t *testing.T) {
 	command := runJobRemoteCommand("encoded-jit", 0, 1)
-	want := "cd ~/actions-runner && export GCM_INTERACTIVE=never GIT_TERMINAL_PROMPT=0 && ./run.sh --jitconfig 'encoded-jit'"
+	want := "cd ~/actions-runner && export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= GIT_TERMINAL_PROMPT=0 && ./run.sh --jitconfig 'encoded-jit'"
 	if command != want {
 		t.Fatalf("single-slot command = %q, want %q", command, want)
+	}
+	if strings.Contains(command, "GCM_INTERACTIVE") {
+		t.Fatalf("single slot command = %q, want no GCM_INTERACTIVE", command)
 	}
 }
 
@@ -30,7 +33,9 @@ func TestRunJobRemoteCommandUsesSlotHomeAndTMPDIR(t *testing.T) {
 		`export TMPDIR="$base_home/tmp-1"`,
 		`export HOME="$base_home/slot-home-1"`,
 		`mkdir -p "$HOME"`,
-		"export GCM_INTERACTIVE=never",
+		"export GIT_CONFIG_COUNT=1",
+		"export GIT_CONFIG_KEY_0=credential.helper",
+		"export GIT_CONFIG_VALUE_0=",
 		"export GIT_TERMINAL_PROMPT=0",
 		"./run.sh --jitconfig 'encoded-jit'",
 	} {
@@ -48,6 +53,9 @@ func TestRunJobRemoteCommandUsesSlotHomeAndTMPDIR(t *testing.T) {
 	}
 	if strings.Contains(command, `runner_home="$HOME/actions-runner-1"`) {
 		t.Fatalf("slot command = %q, want runner home from base home", command)
+	}
+	if strings.Contains(command, "GCM_INTERACTIVE") {
+		t.Fatalf("slot command = %q, want no GCM_INTERACTIVE", command)
 	}
 }
 

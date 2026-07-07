@@ -204,12 +204,13 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 
 func runJobRemoteCommand(encodedJITConfig string, slotIndex int, slotCount int) string {
 	if slotCount <= 1 {
-		// GCM_INTERACTIVE=never and GIT_TERMINAL_PROMPT=0 make a git 401 fail fast
-		// instead of wedging the slot on git-credential-manager's interactive prompt,
-		// which a headless CI VM can never answer. The multi-slot path sets the same
-		// two in run-slot-job.sh.
+		// Git clone URLs already carry the token, so no credential helper is
+		// needed. Clear credential.helper for this process tree so GCM is never
+		// invoked, since its credential store path can deadlock in the headless VM.
+		// GIT_TERMINAL_PROMPT=0 keeps a 401 failing fast. The multi slot path sets
+		// the same environment in run-slot-job.sh.
 		return fmt.Sprintf(
-			"cd %s && export GCM_INTERACTIVE=never GIT_TERMINAL_PROMPT=0 && ./run.sh --jitconfig %s",
+			"cd %s && export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= GIT_TERMINAL_PROMPT=0 && ./run.sh --jitconfig %s",
 			runnerHome, shellQuote(encodedJITConfig))
 	}
 	replacer := strings.NewReplacer(
