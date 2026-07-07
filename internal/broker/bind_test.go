@@ -110,3 +110,26 @@ func TestActiveJobProbeCommandTargetsSlotRunner(t *testing.T) {
 		t.Fatalf("active job probe command = %q, want bracketed Runner.Worker pattern", command)
 	}
 }
+
+func TestSlotCPUActivityCommandTargetsSlotRunnerAndSumsSubtree(t *testing.T) {
+	command := slotCPUActivityCommand(2, 4)
+	for _, fragment := range []string{
+		"actions-runner-2/bin/[R]unner\\.Worker",
+		"ps -Ao pid=,ppid=,pcpu=",
+		`awk -v roots="$roots"`,
+		"while (changed)",
+		`printf "%.1f\n", total`,
+	} {
+		if !strings.Contains(command, fragment) {
+			t.Fatalf("slot cpu activity command = %q, want fragment %q", command, fragment)
+		}
+	}
+	if strings.Contains(command, "bin/Runner.Worker") {
+		t.Fatalf("slot cpu activity command = %q, want bracketed Runner.Worker pattern", command)
+	}
+	for _, disallowed := range []string{"head", "tail", "sort"} {
+		if strings.Contains(command, disallowed) {
+			t.Fatalf("slot cpu activity command = %q, want no %s", command, disallowed)
+		}
+	}
+}

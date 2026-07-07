@@ -6,6 +6,10 @@ max_idle = "2h"
 max_age = "24h"
 max_bind = "65m"
 pickup_timeout = "5m"
+# Detect and warn on no CPU progress after this duration. Zero uses 10m.
+stall_timeout = "10m"
+# Defaults false, so stalls are detected and logged only. Set true to reap a wedged slot.
+stall_reap = false
 
 labels = ["self-hosted", "macOS", "ARM64", "agk-local-macos-26"]
 
