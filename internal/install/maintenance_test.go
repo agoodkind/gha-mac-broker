@@ -13,7 +13,9 @@ import (
 )
 
 type recordingCommandRunner struct {
-	calls []recordedCommand
+	calls                []recordedCommand
+	launchctlPrintErrors []error
+	launchctlPrintCount  int
 }
 
 type recordedCommand struct {
@@ -39,6 +41,24 @@ func (r *recordingCommandRunner) build(_ context.Context, name string, args ...s
 	copiedArgs := append([]string(nil), args...)
 	r.calls = append(r.calls, recordedCommand{name: name, args: copiedArgs})
 	if name == "launchctl" && len(args) > 0 && args[0] == "bootout" {
+		return combinedOutputFunc(func() ([]byte, error) {
+			return []byte("not loaded"), errors.New("not loaded")
+		})
+	}
+	if name == "launchctl" && len(args) > 0 && args[0] == "print" {
+		printIndex := r.launchctlPrintCount
+		r.launchctlPrintCount++
+		if printIndex < len(r.launchctlPrintErrors) {
+			err := r.launchctlPrintErrors[printIndex]
+			if err != nil {
+				return combinedOutputFunc(func() ([]byte, error) {
+					return []byte("not loaded"), err
+				})
+			}
+			return combinedOutputFunc(func() ([]byte, error) {
+				return []byte("loaded"), nil
+			})
+		}
 		return combinedOutputFunc(func() ([]byte, error) {
 			return []byte("not loaded"), errors.New("not loaded")
 		})

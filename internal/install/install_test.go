@@ -3,11 +3,14 @@ package install
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"goodkind.io/gha-mac-broker/internal/config"
 )
@@ -57,30 +60,89 @@ func TestRenderSystemd(t *testing.T) {
 }
 
 func TestInstallLaunchdBootsOutBeforeBootstrap(t *testing.T) {
-	home := t.TempDir()
-	cfg := sampleConfig()
-	cfg.Home = home
-	cfg.ConfigDir = filepath.Join(home, ".config", "gha-mac-broker")
-	cfg.ConfigPath = filepath.Join(cfg.ConfigDir, "config.toml")
-	cfg.LogPath = filepath.Join(home, "Library", "Logs", "gha-mac-broker.log")
-	recorder := &recordingCommandRunner{calls: nil}
-	t.Cleanup(replaceCommandRunner(recorder.build))
+	t.Run("waits for running service to unload", func(t *testing.T) {
+		home := t.TempDir()
+		cfg := sampleConfig()
+		cfg.Home = home
+		cfg.ConfigDir = filepath.Join(home, ".config", "gha-mac-broker")
+		cfg.ConfigPath = filepath.Join(cfg.ConfigDir, "config.toml")
+		cfg.LogPath = filepath.Join(home, "Library", "Logs", "gha-mac-broker.log")
+		notLoadedErr := errors.New("not loaded")
+		recorder := &recordingCommandRunner{
+			calls:                nil,
+			launchctlPrintErrors: []error{nil, notLoadedErr},
+		}
+		t.Cleanup(replaceCommandRunner(recorder.build))
+		var sleeps []time.Duration
+		t.Cleanup(replaceLaunchdPollSleep(func(duration time.Duration) {
+			sleeps = append(sleeps, duration)
+		}))
 
-	if err := installLaunchd(context.Background(), cfg); err != nil {
-		t.Fatalf("installLaunchd: %v", err)
-	}
+		if err := installLaunchd(context.Background(), cfg); err != nil {
+			t.Fatalf("installLaunchd: %v", err)
+		}
 
-	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
-	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	target := domain + "/" + launchdLabel
-	if len(recorder.calls) != 2 {
-		t.Fatalf("launchctl calls = %d, want 2: %#v", len(recorder.calls), recorder.calls)
-	}
-	if recorder.calls[0].name != "launchctl" || recorder.calls[0].args[0] != "bootout" || recorder.calls[0].args[1] != target {
-		t.Fatalf("first command = %#v, want launchctl bootout %s", recorder.calls[0], target)
-	}
-	if recorder.calls[1].name != "launchctl" || recorder.calls[1].args[0] != "bootstrap" || recorder.calls[1].args[1] != domain || recorder.calls[1].args[2] != plistPath {
-		t.Fatalf("second command = %#v, want launchctl bootstrap %s %s", recorder.calls[1], domain, plistPath)
+		plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
+		domain := fmt.Sprintf("gui/%d", os.Getuid())
+		target := domain + "/" + launchdLabel
+		want := []recordedCommand{
+			{name: "launchctl", args: []string{"bootout", target}},
+			{name: "launchctl", args: []string{"print", target}},
+			{name: "launchctl", args: []string{"print", target}},
+			{name: "launchctl", args: []string{"bootstrap", domain, plistPath}},
+		}
+		if !reflect.DeepEqual(recorder.calls, want) {
+			t.Fatalf("launchctl calls = %#v, want %#v", recorder.calls, want)
+		}
+		if !reflect.DeepEqual(sleeps, []time.Duration{launchdUnloadPollInterval}) {
+			t.Fatalf("poll sleeps = %#v, want %#v", sleeps, []time.Duration{launchdUnloadPollInterval})
+		}
+	})
+
+	t.Run("bootstraps when service is already unloaded", func(t *testing.T) {
+		home := t.TempDir()
+		cfg := sampleConfig()
+		cfg.Home = home
+		cfg.ConfigDir = filepath.Join(home, ".config", "gha-mac-broker")
+		cfg.ConfigPath = filepath.Join(cfg.ConfigDir, "config.toml")
+		cfg.LogPath = filepath.Join(home, "Library", "Logs", "gha-mac-broker.log")
+		notLoadedErr := errors.New("not loaded")
+		recorder := &recordingCommandRunner{
+			calls:                nil,
+			launchctlPrintErrors: []error{notLoadedErr},
+		}
+		t.Cleanup(replaceCommandRunner(recorder.build))
+		var sleeps []time.Duration
+		t.Cleanup(replaceLaunchdPollSleep(func(duration time.Duration) {
+			sleeps = append(sleeps, duration)
+		}))
+
+		if err := installLaunchd(context.Background(), cfg); err != nil {
+			t.Fatalf("installLaunchd: %v", err)
+		}
+
+		plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
+		domain := fmt.Sprintf("gui/%d", os.Getuid())
+		target := domain + "/" + launchdLabel
+		want := []recordedCommand{
+			{name: "launchctl", args: []string{"bootout", target}},
+			{name: "launchctl", args: []string{"print", target}},
+			{name: "launchctl", args: []string{"bootstrap", domain, plistPath}},
+		}
+		if !reflect.DeepEqual(recorder.calls, want) {
+			t.Fatalf("launchctl calls = %#v, want %#v", recorder.calls, want)
+		}
+		if len(sleeps) != 0 {
+			t.Fatalf("poll sleeps = %#v, want none", sleeps)
+		}
+	})
+}
+
+func replaceLaunchdPollSleep(sleep func(time.Duration)) func() {
+	original := launchdPollSleep
+	launchdPollSleep = sleep
+	return func() {
+		launchdPollSleep = original
 	}
 }
 

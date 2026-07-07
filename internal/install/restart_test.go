@@ -2,6 +2,7 @@ package install
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,9 @@ func TestRestartLaunchdBootsOutAndBootstrapsExistingPlist(t *testing.T) {
 	var commands []capturedServiceCommand
 	withRestartTestHooks(t, "darwin", home, func(_ context.Context, name string, args ...string) ([]byte, error) {
 		commands = append(commands, capturedServiceCommand{name: name, args: append([]string(nil), args...)})
+		if name == "launchctl" && len(args) > 0 && args[0] == "print" {
+			return []byte("not loaded"), errors.New("not loaded")
+		}
 		return nil, nil
 	})
 
@@ -41,6 +45,7 @@ func TestRestartLaunchdBootsOutAndBootstrapsExistingPlist(t *testing.T) {
 	target := domain + "/" + launchdLabel
 	want := []capturedServiceCommand{
 		{name: "launchctl", args: []string{"bootout", target}},
+		{name: "launchctl", args: []string{"print", target}},
 		{name: "launchctl", args: []string{"bootstrap", domain, plistPath}},
 	}
 	if !reflect.DeepEqual(commands, want) {

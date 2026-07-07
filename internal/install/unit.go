@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"text/template"
+	"time"
 )
 
 // launchdTemplate is the embedded macOS launchd plist template.
@@ -33,11 +34,15 @@ const (
 	// unitFileMode is the mode for the written service unit.
 	unitFileMode = 0o644
 	// logFileMode is the mode for the touched launchd log file.
-	logFileMode = 0o644
+	logFileMode               = 0o644
+	launchdUnloadPollLimit    = 50
+	launchdUnloadPollInterval = 200 * time.Millisecond
 	// osDarwin and osLinux are the supported [runtime.GOOS] values.
 	osDarwin = "darwin"
 	osLinux  = "linux"
 )
+
+var launchdPollSleep = time.Sleep
 
 type templateData interface {
 	Config | maintenanceTemplateData
@@ -113,16 +118,49 @@ func installLaunchd(ctx context.Context, cfg Config) error {
 	}
 
 	target := fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel)
-	if out, err := commandRunner(ctx, "launchctl", "bootout", target).CombinedOutput(); err != nil {
-		slog.DebugContext(ctx, "launchctl bootout ignored (likely not loaded)", "err", err, "out", string(out))
-	}
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	if out, err := commandRunner(ctx, "launchctl", "bootstrap", domain, plistPath).CombinedOutput(); err != nil {
-		slog.ErrorContext(ctx, "launchctl bootstrap failed", "err", err, "out", string(out))
-		return fmt.Errorf("install: launchctl bootstrap: %w", err)
+	installCommand := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return commandRunner(ctx, name, args...).CombinedOutput()
+	}
+	if err := bootoutThenBootstrap(ctx, installCommand, "install", target, domain, plistPath); err != nil {
+		return err
 	}
 	slog.InfoContext(ctx, "launchd service installed", "plist", plistPath)
 	return nil
+}
+
+func bootoutThenBootstrap(
+	ctx context.Context,
+	runner serviceCommandRunner,
+	errorPrefix string,
+	target string,
+	domain string,
+	plistPath string,
+) error {
+	if out, err := runner(ctx, "launchctl", "bootout", target); err != nil {
+		slog.DebugContext(ctx, "launchctl bootout ignored (likely not loaded)", "err", err, "out", string(out))
+	}
+	waitForLaunchdUnload(ctx, runner, target)
+	if out, err := runner(ctx, "launchctl", "bootstrap", domain, plistPath); err != nil {
+		slog.ErrorContext(ctx, "launchctl bootstrap failed", "err", err, "out", string(out))
+		return fmt.Errorf("%s: launchctl bootstrap: %w", errorPrefix, err)
+	}
+	return nil
+}
+
+func waitForLaunchdUnload(ctx context.Context, runner serviceCommandRunner, target string) {
+	for pollIndex := range launchdUnloadPollLimit {
+		out, err := runner(ctx, "launchctl", "print", target)
+		if err != nil {
+			slog.DebugContext(ctx, "launchd service unloaded", "target", target, "out", string(out))
+			return
+		}
+		if pollIndex == launchdUnloadPollLimit-1 {
+			slog.WarnContext(ctx, "launchd service still loaded after bootout wait", "target", target, "out", string(out))
+			return
+		}
+		launchdPollSleep(launchdUnloadPollInterval)
+	}
 }
 
 // installSystemd writes the user unit, reloads the daemon, and enables it.
