@@ -780,6 +780,8 @@ func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBin
 		MaxAge:         time.Duration(cfg.MaxAge),
 		MaxBind:        time.Duration(cfg.MaxBind),
 		PickupTimeout:  time.Duration(cfg.PickupTimeout),
+		StallTimeout:   time.Duration(cfg.StallTimeout),
+		StallReap:      cfg.StallReap,
 		RunToken:       runToken,
 		WarmRetryDelay: 0,
 		Now:            time.Now,
