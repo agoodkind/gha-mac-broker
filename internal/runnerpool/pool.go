@@ -128,7 +128,7 @@ type slotState struct {
 	runID           int64
 	jobCancel       context.CancelFunc
 	cpuStalledSince time.Time
-	stallWarnedAt   time.Time
+	reapWarnedAt    time.Time
 	lastErr         error
 }
 
@@ -398,16 +398,11 @@ func (p *Pool) reapBusyWorkers(ctx context.Context) {
 		}
 		active, err := p.prober.HasActiveJob(ctx, candidate.vm, candidate.slotIndex, candidate.slotCount)
 		if err != nil {
-			slog.WarnContext(ctx, "runnerpool active job probe failed", "err", err, "vm", candidate.vm.Name, "slot", candidate.slotIndex)
-			if pastMaxBind {
-				slog.WarnContext(ctx, "runnerpool reaping worker (probe error past max_bind)", "vm", candidate.vm.Name, "run_id", candidate.runID, "job_id", candidate.jobID, "slot", candidate.slotIndex, "bind_age_seconds", int64(bindAge.Seconds()))
-				p.requestBusyRecycle(candidate)
-			}
+			p.handleActiveJobProbeError(ctx, candidate, bindAge, pastMaxBind, err)
 			continue
 		}
 		if !active {
-			slog.WarnContext(ctx, "runnerpool reaping worker (no active job process)", "vm", candidate.vm.Name, "run_id", candidate.runID, "job_id", candidate.jobID, "slot", candidate.slotIndex, "bind_age_seconds", int64(bindAge.Seconds()))
-			p.requestBusyRecycle(candidate)
+			p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, "runnerpool reaping worker (no active job process)")
 			continue
 		}
 		if !pastPickupTimeout {
@@ -425,18 +420,39 @@ func (p *Pool) reapBusyWorkers(ctx context.Context) {
 		if !ok || cpuStalledSince.IsZero() {
 			continue
 		}
-		stalledFor := candidate.now.Sub(cpuStalledSince)
-		if stalledFor < p.options.StallTimeout {
-			continue
-		}
-		if !p.claimSlotStallWarning(candidate) {
-			continue
-		}
-		slog.WarnContext(ctx, "runnerpool worker stalled (no cpu progress)", "vm", candidate.vm.Name, "run_id", candidate.runID, "job_id", candidate.jobID, "slot", candidate.slotIndex, "bind_age_seconds", int64(bindAge.Seconds()), "stalled_for_seconds", int64(stalledFor.Seconds()), "cpu_percent", cpuActivity)
-		if p.options.StallReap {
-			p.requestBusyRecycle(candidate)
-		}
+		p.maybeWarnStalledBusyWorker(ctx, candidate, bindAge, cpuStalledSince, cpuActivity)
 	}
+}
+
+func (p *Pool) handleActiveJobProbeError(ctx context.Context, candidate busyCandidate, bindAge time.Duration, pastMaxBind bool, err error) {
+	slog.WarnContext(ctx, "runnerpool active job probe failed", "err", err, "vm", candidate.vm.Name, "slot", candidate.slotIndex)
+	if !pastMaxBind {
+		return
+	}
+	p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, "runnerpool reaping worker (probe error past max_bind)")
+}
+
+func (p *Pool) warnAndRequestBusyRecycle(ctx context.Context, candidate busyCandidate, bindAge time.Duration, message string) {
+	if !p.claimSlotReapWarning(candidate) {
+		return
+	}
+	slog.WarnContext(ctx, message, "vm", candidate.vm.Name, "run_id", candidate.runID, "job_id", candidate.jobID, "slot", candidate.slotIndex, "bind_age_seconds", int64(bindAge.Seconds()))
+	p.requestBusyRecycle(candidate)
+}
+
+func (p *Pool) maybeWarnStalledBusyWorker(ctx context.Context, candidate busyCandidate, bindAge time.Duration, cpuStalledSince time.Time, cpuActivity float64) {
+	stalledFor := candidate.now.Sub(cpuStalledSince)
+	if stalledFor < p.options.StallTimeout {
+		return
+	}
+	if !p.claimSlotReapWarning(candidate) {
+		return
+	}
+	slog.WarnContext(ctx, "runnerpool worker stalled (no cpu progress)", "vm", candidate.vm.Name, "run_id", candidate.runID, "job_id", candidate.jobID, "slot", candidate.slotIndex, "bind_age_seconds", int64(bindAge.Seconds()), "stalled_for_seconds", int64(stalledFor.Seconds()), "cpu_percent", cpuActivity)
+	if !p.options.StallReap {
+		return
+	}
+	p.requestBusyRecycle(candidate)
 }
 
 func (p *Pool) observeSlotCPU(candidate busyCandidate, cpuActivity float64, now time.Time) (time.Time, bool) {
@@ -469,7 +485,7 @@ func (p *Pool) observeSlotCPU(candidate busyCandidate, cpuActivity float64, now 
 	return slot.cpuStalledSince, true
 }
 
-func (p *Pool) claimSlotStallWarning(candidate busyCandidate) bool {
+func (p *Pool) claimSlotReapWarning(candidate busyCandidate) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if candidate.index < 0 || candidate.index >= len(p.states) {
@@ -488,10 +504,10 @@ func (p *Pool) claimSlotStallWarning(candidate busyCandidate) bool {
 		slot.jobID != candidate.jobID ||
 		slot.runID != candidate.runID ||
 		!slot.boundAt.Equal(candidate.boundAt) ||
-		slot.stallWarnedAt.Equal(candidate.boundAt) {
+		slot.reapWarnedAt.Equal(candidate.boundAt) {
 		return false
 	}
-	slot.stallWarnedAt = candidate.boundAt
+	slot.reapWarnedAt = candidate.boundAt
 	return true
 }
 
@@ -859,7 +875,7 @@ func (p *Pool) waitForSlotJob(ctx context.Context, index int, slotIndex int, vm 
 			slot.runID = job.RunID
 			slot.jobCancel = cancel
 			slot.cpuStalledSince = time.Time{}
-			slot.stallWarnedAt = time.Time{}
+			slot.reapWarnedAt = time.Time{}
 			slot.lastErr = nil
 			p.cond.Broadcast()
 			return job, jobCtx, cancel, true
@@ -899,7 +915,7 @@ func (p *Pool) finishSlotJob(index int, slotIndex int, vm *broker.WarmVM, err er
 	slot.runID = 0
 	slot.jobCancel = nil
 	slot.cpuStalledSince = time.Time{}
-	slot.stallWarnedAt = time.Time{}
+	slot.reapWarnedAt = time.Time{}
 	slot.lastErr = err
 	if !workerBusy(*state) {
 		if state.recycle {
