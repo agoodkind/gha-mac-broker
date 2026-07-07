@@ -186,12 +186,11 @@ func resetSlots(slots []slotState) {
 
 func emptySlotState() slotState {
 	return slotState{
-		boundAt:         time.Time{},
-		busy:            false,
-		jobID:           0,
-		runID:           0,
-		jobCancel:       nil,
-		cpuStalledSince: time.Time{},
-		lastErr:         nil,
+		boundAt:   time.Time{},
+		busy:      false,
+		jobID:     0,
+		runID:     0,
+		jobCancel: nil,
+		lastErr:   nil,
 	}
 }
