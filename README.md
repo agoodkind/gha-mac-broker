@@ -110,10 +110,11 @@ The VM is not torn down between jobs, so `runner_count` VMs run `runner_count` j
 at once and a fan-out drains across them in waves. Each job is a fresh JIT
 registration to its own repository, so one generic VM serves any installed repo.
 
-`GET /capacity` reports `runnerpool.Ready()`: true only when the pool is healthy
-and a worker is free or near-free, so a consumer's `plan-runners` step routes to
-the pool when it can serve and falls back to GitHub-hosted `macos-26` when the pool
-is saturated or down. That failover, plus a stranded-run backstop, lives in the
+`GET /capacity` reports `runnerpool.Ready()`: true only when a worker slot is
+genuinely idle for the next job (`idle > queued`), so a consumer's `plan-runners`
+step routes to the pool only when it can serve immediately and falls back to
+GitHub-hosted `macos-26` when the pool is full or down. The pool never reports the
+optimistic bet that a busy slot will free soon, so a routed job never strands. That failover, plus a stranded-run backstop, lives in the
 consumer's reusable workflow, not in the broker. Idle VMs recycle on `max_idle`,
 `max_age`, a vsock liveness failure, or a stale GitHub runner registration; the
 build cache is a host mount, so recycling never cold-starts the cache. Busy VMs

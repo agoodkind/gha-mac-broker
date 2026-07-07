@@ -686,7 +686,7 @@ func TestVMWithTwoSlotsRunsTwoConcurrentJobs(t *testing.T) {
 	}
 	waitFor(t, func() bool {
 		snapshot := pool.Snapshot()
-		return snapshot.Busy == 2 && snapshot.Idle == 0 && snapshot.Ready
+		return snapshot.Busy == 2 && snapshot.Idle == 0
 	})
 	if maxActive := runner.MaxActive(); maxActive != 2 {
 		t.Fatalf("max active jobs = %d, want 2", maxActive)
@@ -697,6 +697,44 @@ func TestVMWithTwoSlotsRunsTwoConcurrentJobs(t *testing.T) {
 		snapshot := pool.Snapshot()
 		return snapshot.Busy == 1 && snapshot.Idle == 1
 	})
+	runner.Release()
+}
+
+func TestReadyReportsOnlyImmediateIdleCapacity(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newBlockingRunner(2)
+	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, newFakeGitHub(), nil)
+	ctx := startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-a", JobID: 1, RunID: 10}); err != nil {
+		t.Fatalf("Enqueue first job: %v", err)
+	}
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-b", JobID: 2, RunID: 11}); err != nil {
+		t.Fatalf("Enqueue second job: %v", err)
+	}
+
+	waitStarted(t, runner)
+	waitStarted(t, runner)
+	waitFor(t, func() bool {
+		snapshot := pool.Snapshot()
+		return snapshot.Busy == 2 && snapshot.Idle == 0 && snapshot.Queued == 0
+	})
+	snapshot := pool.Snapshot()
+	if snapshot.Ready {
+		t.Fatalf("ready with all slots busy = true, want false: %+v", snapshot)
+	}
+
+	runner.Release()
+	waitFor(t, func() bool {
+		snapshot := pool.Snapshot()
+		return snapshot.Busy == 1 && snapshot.Idle == 1 && snapshot.Queued == 0
+	})
+	snapshot = pool.Snapshot()
+	if !snapshot.Ready {
+		t.Fatalf("ready with one idle slot = false, want true: %+v", snapshot)
+	}
 	runner.Release()
 }
 
