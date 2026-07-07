@@ -136,6 +136,45 @@ func TestInstallLaunchdBootsOutBeforeBootstrap(t *testing.T) {
 			t.Fatalf("poll sleeps = %#v, want none", sleeps)
 		}
 	})
+
+	t.Run("does not sleep when context is canceled", func(t *testing.T) {
+		home := t.TempDir()
+		cfg := sampleConfig()
+		cfg.Home = home
+		cfg.ConfigDir = filepath.Join(home, ".config", "gha-mac-broker")
+		cfg.ConfigPath = filepath.Join(cfg.ConfigDir, "config.toml")
+		cfg.LogPath = filepath.Join(home, "Library", "Logs", "gha-mac-broker.log")
+		recorder := &recordingCommandRunner{
+			calls:                nil,
+			launchctlPrintErrors: []error{nil},
+		}
+		t.Cleanup(replaceCommandRunner(recorder.build))
+		var sleeps []time.Duration
+		t.Cleanup(replaceLaunchdPollSleep(func(duration time.Duration) {
+			sleeps = append(sleeps, duration)
+		}))
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		if err := installLaunchd(ctx, cfg); err != nil {
+			t.Fatalf("installLaunchd: %v", err)
+		}
+
+		plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
+		domain := fmt.Sprintf("gui/%d", os.Getuid())
+		target := domain + "/" + launchdLabel
+		want := []recordedCommand{
+			{name: "launchctl", args: []string{"bootout", target}},
+			{name: "launchctl", args: []string{"print", target}},
+			{name: "launchctl", args: []string{"bootstrap", domain, plistPath}},
+		}
+		if !reflect.DeepEqual(recorder.calls, want) {
+			t.Fatalf("launchctl calls = %#v, want %#v", recorder.calls, want)
+		}
+		if len(sleeps) != 0 {
+			t.Fatalf("poll sleeps = %#v, want none", sleeps)
+		}
+	})
 }
 
 func replaceLaunchdPollSleep(sleep func(time.Duration)) func() {

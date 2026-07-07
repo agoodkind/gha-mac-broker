@@ -46,13 +46,14 @@ func restartLaunchd(ctx context.Context, home string) (bool, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
+		slog.ErrorContext(ctx, "stat launchd plist failed", "err", err, "path", plistPath)
 		return false, fmt.Errorf("restart: stat plist %s: %w", plistPath, err)
 	}
 	target := fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel)
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	if err := bootoutThenBootstrap(ctx, restartCommand, "restart", target, domain, plistPath); err != nil {
-		slog.ErrorContext(ctx, "restart launchd failed", "err", err)
-		return true, err
+	bootstrapErr := bootoutThenBootstrap(ctx, restartCommand, "restart", target, domain, plistPath)
+	if bootstrapErr != nil {
+		return true, bootstrapErr
 	}
 	slog.InfoContext(ctx, "launchd service restarted", "plist", plistPath)
 	return true, nil

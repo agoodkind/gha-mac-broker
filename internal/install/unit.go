@@ -159,6 +159,10 @@ func waitForLaunchdUnload(ctx context.Context, runner serviceCommandRunner, targ
 			slog.WarnContext(ctx, "launchd service still loaded after bootout wait", "target", target, "out", string(out))
 			return
 		}
+		if err := ctx.Err(); err != nil {
+			slog.DebugContext(ctx, "launchd unload wait stopped", "err", err, "target", target)
+			return
+		}
 		launchdPollSleep(launchdUnloadPollInterval)
 	}
 }
