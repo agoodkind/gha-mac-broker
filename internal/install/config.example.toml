@@ -1,6 +1,7 @@
 listen_addr = "[::1]:8080"
 runner_count = 3
 # Concurrent runner slots per warm VM.
+# Reloaded changes resize each VM after it becomes idle.
 jobs_per_vm = 1
 max_idle = "2h"
 max_age = "24h"

@@ -17,8 +17,9 @@ import (
 )
 
 type warmCall struct {
-	Image string
-	ID    string
+	Image     string
+	ID        string
+	SlotCount int
 }
 
 type fakeWarmer struct {
@@ -41,10 +42,10 @@ func newFakeWarmer() *fakeWarmer {
 	}
 }
 
-func (w *fakeWarmer) Warm(_ context.Context, image string, id string) (*broker.WarmVM, error) {
+func (w *fakeWarmer) Warm(_ context.Context, image string, id string, slotCount int) (*broker.WarmVM, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.calls = append(w.calls, warmCall{Image: image, ID: id})
+	w.calls = append(w.calls, warmCall{Image: image, ID: id, SlotCount: slotCount})
 	name := "vm-" + id
 	w.alive[name] = true
 	return &broker.WarmVM{Name: name, Image: image}, nil
@@ -83,6 +84,16 @@ func (w *fakeWarmer) WarmNames() []string {
 		names = append(names, "vm-"+call.ID)
 	}
 	return names
+}
+
+func (w *fakeWarmer) WarmSlotCounts() []int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	slotCounts := make([]int, 0, len(w.calls))
+	for _, call := range w.calls {
+		slotCounts = append(slotCounts, call.SlotCount)
+	}
+	return slotCounts
 }
 
 func (w *fakeWarmer) TornNames() []string {
@@ -736,6 +747,212 @@ func TestReadyReportsOnlyImmediateIdleCapacity(t *testing.T) {
 		t.Fatalf("ready with one idle slot = false, want true: %+v", snapshot)
 	}
 	runner.Release()
+}
+
+func TestWarmWorkerPassesConfiguredSlotCount(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newFakeRunner(1)
+	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, newFakeGitHub(), nil)
+	startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+
+	slotCounts := warmer.WarmSlotCounts()
+	if len(slotCounts) != 1 || slotCounts[0] != 2 {
+		t.Fatalf("initial warm slot counts = %v, want [2]", slotCounts)
+	}
+
+	nextOptions := testOptionsWithSlots(clock, 1, 3)
+	pool.Reconfigure(nextOptions)
+	firstVM := warmer.WarmNames()[0]
+	pool.mu.Lock()
+	pool.states[0].recycle = true
+	pool.cond.Broadcast()
+	pool.mu.Unlock()
+
+	waitFor(t, func() bool {
+		return len(warmer.WarmNames()) == 2
+	})
+	torn := warmer.TornNames()
+	if len(torn) != 1 || torn[0] != firstVM {
+		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
+	}
+	slotCounts = warmer.WarmSlotCounts()
+	if len(slotCounts) != 2 || slotCounts[1] != 3 {
+		t.Fatalf("warm slot counts after reconfigure = %v, want second count 3", slotCounts)
+	}
+}
+
+func TestReconfigureAppliesScalarsAndKeepsRunnerCount(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	pool := New(testOptionsWithSlots(clock, 2, 1), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
+	var logs strings.Builder
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+
+	nextOptions := Options{
+		RunnerCount:    4,
+		JobsPerVM:      3,
+		Image:          "image-b",
+		MaxIdle:        15 * time.Minute,
+		MaxAge:         6 * time.Hour,
+		MaxBind:        7 * time.Minute,
+		PickupTimeout:  90 * time.Second,
+		RunToken:       "",
+		WarmRetryDelay: 25 * time.Millisecond,
+		Now:            nil,
+	}
+	pool.Reconfigure(nextOptions)
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.options.RunnerCount != 2 {
+		t.Fatalf("runner count = %d, want 2", pool.options.RunnerCount)
+	}
+	if pool.options.JobsPerVM != 3 {
+		t.Fatalf("jobs per vm = %d, want 3", pool.options.JobsPerVM)
+	}
+	if pool.options.Image != "image-b" {
+		t.Fatalf("image = %q, want image-b", pool.options.Image)
+	}
+	if pool.options.RunToken != "test" {
+		t.Fatalf("run token = %q, want preserved test", pool.options.RunToken)
+	}
+	if pool.options.Now == nil {
+		t.Fatal("now function = nil, want preserved clock")
+	}
+	if pool.options.MaxIdle != 15*time.Minute {
+		t.Fatalf("max idle = %s, want 15m", pool.options.MaxIdle)
+	}
+	if pool.options.MaxAge != 6*time.Hour {
+		t.Fatalf("max age = %s, want 6h", pool.options.MaxAge)
+	}
+	if pool.options.MaxBind != 7*time.Minute {
+		t.Fatalf("max bind = %s, want 7m", pool.options.MaxBind)
+	}
+	if pool.options.PickupTimeout != 90*time.Second {
+		t.Fatalf("pickup timeout = %s, want 90s", pool.options.PickupTimeout)
+	}
+	if pool.options.WarmRetryDelay != 25*time.Millisecond {
+		t.Fatalf("warm retry delay = %s, want 25ms", pool.options.WarmRetryDelay)
+	}
+	if !strings.Contains(logs.String(), "runner_count change requires restart") {
+		t.Fatalf("logs = %q, want runner_count restart warning", logs.String())
+	}
+	if !strings.Contains(logs.String(), "runnerpool reconfigured") {
+		t.Fatalf("logs = %q, want reconfigured info", logs.String())
+	}
+}
+
+func TestReconfigureBusyWorkerKeepsOldSlotsUntilIdleResize(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newBlockingRunner(2)
+	pool := New(testOptionsWithSlots(clock, 1, 1), warmer, runner, newFakeGitHub(), nil)
+	ctx := startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+	firstVM := warmer.WarmNames()[0]
+
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-a", JobID: 1, RunID: 10}); err != nil {
+		t.Fatalf("Enqueue first job: %v", err)
+	}
+	first := waitStarted(t, runner)
+	if first.SlotCount != 1 {
+		t.Fatalf("first slot count = %d, want 1", first.SlotCount)
+	}
+
+	pool.Reconfigure(testOptionsWithSlots(clock, 1, 2))
+	if err := pool.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile while busy: %v", err)
+	}
+	if torn := warmer.TornNames(); len(torn) != 0 {
+		t.Fatalf("busy worker teardowns = %v, want none", torn)
+	}
+	pool.mu.Lock()
+	busySlotCount := len(pool.states[0].slots)
+	busyRecycle := pool.states[0].recycle
+	pool.mu.Unlock()
+	if busySlotCount != 1 || busyRecycle {
+		t.Fatalf("busy worker slots recycle = %d %v, want 1 false", busySlotCount, busyRecycle)
+	}
+
+	runner.Release()
+	waitFor(t, func() bool {
+		snapshot := pool.Snapshot()
+		return snapshot.Idle == 1 && snapshot.Busy == 0
+	})
+	if err := pool.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile while idle: %v", err)
+	}
+	waitFor(t, func() bool {
+		return len(warmer.WarmNames()) == 2
+	})
+	torn := warmer.TornNames()
+	if len(torn) != 1 || torn[0] != firstVM {
+		t.Fatalf("idle resize teardowns = %v, want [%s]", torn, firstVM)
+	}
+	pool.mu.Lock()
+	resizedSlotCount := len(pool.states[0].slots)
+	pool.mu.Unlock()
+	if resizedSlotCount != 2 {
+		t.Fatalf("resized slot count = %d, want 2", resizedSlotCount)
+	}
+	slotCounts := warmer.WarmSlotCounts()
+	if len(slotCounts) != 2 || slotCounts[1] != 2 {
+		t.Fatalf("warm slot counts = %v, want second count 2", slotCounts)
+	}
+
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-b", JobID: 2, RunID: 11}); err != nil {
+		t.Fatalf("Enqueue second job: %v", err)
+	}
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-c", JobID: 3, RunID: 12}); err != nil {
+		t.Fatalf("Enqueue third job: %v", err)
+	}
+	second := waitStarted(t, runner)
+	third := waitStarted(t, runner)
+	if second.VMName != third.VMName {
+		t.Fatalf("resized jobs used VMs %q and %q, want one VM", second.VMName, third.VMName)
+	}
+	if second.SlotCount != 2 || third.SlotCount != 2 {
+		t.Fatalf("resized slot counts = %d and %d, want 2 and 2", second.SlotCount, third.SlotCount)
+	}
+	runner.Release()
+	runner.Release()
+}
+
+func TestReconfigureShrinksIdleWorkerSlotCount(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newFakeRunner(1)
+	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, newFakeGitHub(), nil)
+	ctx := startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+	firstVM := warmer.WarmNames()[0]
+
+	pool.Reconfigure(testOptionsWithSlots(clock, 1, 1))
+	if err := pool.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	waitFor(t, func() bool {
+		return len(warmer.WarmNames()) == 2
+	})
+	torn := warmer.TornNames()
+	if len(torn) != 1 || torn[0] != firstVM {
+		t.Fatalf("idle shrink teardowns = %v, want [%s]", torn, firstVM)
+	}
+	pool.mu.Lock()
+	slotCount := len(pool.states[0].slots)
+	pool.mu.Unlock()
+	if slotCount != 1 {
+		t.Fatalf("slot count after shrink = %d, want 1", slotCount)
+	}
+	slotCounts := warmer.WarmSlotCounts()
+	if len(slotCounts) != 2 || slotCounts[1] != 1 {
+		t.Fatalf("warm slot counts = %v, want second count 1", slotCounts)
+	}
 }
 
 func TestSlotRunJobPanicFreesSlot(t *testing.T) {

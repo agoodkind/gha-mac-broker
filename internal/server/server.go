@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
@@ -69,18 +70,27 @@ type statusResponse struct {
 // Server handles the /webhook, /capacity, /status, and /healthz endpoints.
 type Server struct {
 	mux           *http.ServeMux
-	secret        []byte
+	mu            sync.RWMutex
+	webhookKey    []byte
 	capacityToken []byte
 	webhookCIDRs  []*net.IPNet
 	cfg           *config.Config
 	pool          pooler
 }
 
+type serverConfig struct {
+	webhookKey    []byte
+	capacityToken []byte
+	webhookCIDRs  []*net.IPNet
+	cfg           *config.Config
+}
+
 // New builds a Server and registers its routes on an internal mux.
-func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler) *Server {
+func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler) *Server {
 	s := &Server{
 		mux:           http.NewServeMux(),
-		secret:        secret,
+		mu:            sync.RWMutex{},
+		webhookKey:    webhookKey,
 		capacityToken: capacityToken,
 		webhookCIDRs:  webhookCIDRs,
 		cfg:           cfg,
@@ -94,6 +104,30 @@ func New(secret []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs [
 		slog.Warn("webhook IP guard disabled: no CIDRs configured")
 	}
 	return s
+}
+
+// Reconfigure swaps the config dependent request state used by live handlers.
+func (s *Server) Reconfigure(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.webhookKey = append([]byte(nil), webhookKey...)
+	s.capacityToken = append([]byte(nil), capacityToken...)
+	s.webhookCIDRs = append([]*net.IPNet(nil), webhookCIDRs...)
+	s.cfg = cfg
+	if len(webhookCIDRs) == 0 {
+		slog.Warn("webhook IP guard disabled: no CIDRs configured")
+	}
+}
+
+func (s *Server) configSnapshot() serverConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return serverConfig{
+		webhookKey:    s.webhookKey,
+		capacityToken: s.capacityToken,
+		webhookCIDRs:  s.webhookCIDRs,
+		cfg:           s.cfg,
+	}
 }
 
 // ServeHTTP implements [http.Handler] by delegating to the internal mux.
@@ -147,7 +181,8 @@ func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byt
 		return nil, false
 	}
 	sig := r.Header.Get("X-Hub-Signature-256")
-	if !verifySignature(s.secret, body, sig) {
+	liveConfig := s.configSnapshot()
+	if !verifySignature(liveConfig.webhookKey, body, sig) {
 		slog.InfoContext(r.Context(), "webhook rejected", "reason", "bad signature")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
@@ -158,12 +193,13 @@ func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byt
 func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload webhookPayload) {
 	ctx := r.Context()
 	repo := payload.Repository.FullName
-	if !s.hasLabel(payload.WorkflowJob.Labels) {
+	liveConfig := s.configSnapshot()
+	if !hasLabel(liveConfig.cfg, payload.WorkflowJob.Labels) {
 		slog.InfoContext(ctx, "webhook ignored", "reason", "no matching label", "repo", repo, "labels", payload.WorkflowJob.Labels)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if _, resolved := s.cfg.ResolveImage("", ""); !resolved {
+	if _, resolved := liveConfig.cfg.ResolveImage("", ""); !resolved {
 		slog.WarnContext(ctx, "no default image configured; ignoring pool job", "repo", repo, "run_id", payload.WorkflowJob.RunID)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -195,11 +231,12 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	macos := r.URL.Query().Get("os")
 	xcode := r.URL.Query().Get("xcode")
 	slog.DebugContext(r.Context(), "capacity request", "repo", repo, "os", macos, "xcode", xcode)
+	liveConfig := s.configSnapshot()
 	// Available only when the requested image resolves to the exact image the
 	// pool is running. The pool warms every VM on cfg.Tart.BaseImage, so a
 	// mappable-but-different tag cannot be served and must route to hosted.
-	tag, ok := s.cfg.ResolveImage(macos, xcode)
-	if !ok || tag != s.cfg.Tart.BaseImage {
+	tag, ok := liveConfig.cfg.ResolveImage(macos, xcode)
+	if !ok || tag != liveConfig.cfg.Tart.BaseImage {
 		writeJSON(w, capacityResponse{Available: false})
 		return
 	}
@@ -227,9 +264,9 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-func (s *Server) hasLabel(jobLabels []string) bool {
+func hasLabel(cfg *config.Config, jobLabels []string) bool {
 	for _, jobLabel := range jobLabels {
-		for _, serverLabel := range s.cfg.Labels {
+		for _, serverLabel := range cfg.Labels {
 			if strings.EqualFold(jobLabel, serverLabel) {
 				return true
 			}
@@ -239,7 +276,8 @@ func (s *Server) hasLabel(jobLabels []string) bool {
 }
 
 func (s *Server) checkBearerToken(w http.ResponseWriter, r *http.Request) bool {
-	if len(s.capacityToken) == 0 {
+	liveConfig := s.configSnapshot()
+	if len(liveConfig.capacityToken) == 0 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
@@ -250,7 +288,7 @@ func (s *Server) checkBearerToken(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	provided := []byte(auth[len(bearerPrefix):])
-	if subtle.ConstantTimeCompare(provided, s.capacityToken) != 1 {
+	if subtle.ConstantTimeCompare(provided, liveConfig.capacityToken) != 1 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
@@ -258,7 +296,8 @@ func (s *Server) checkBearerToken(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (s *Server) checkWebhookIP(w http.ResponseWriter, r *http.Request) bool {
-	if len(s.webhookCIDRs) == 0 {
+	liveConfig := s.configSnapshot()
+	if len(liveConfig.webhookCIDRs) == 0 {
 		return true
 	}
 	ipStr := webhookClientIP(r)
@@ -268,7 +307,7 @@ func (s *Server) checkWebhookIP(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return false
 	}
-	for _, cidr := range s.webhookCIDRs {
+	for _, cidr := range liveConfig.webhookCIDRs {
 		if cidr.Contains(ip) {
 			return true
 		}
