@@ -158,6 +158,8 @@ func (t *Tart) ListVMs(ctx context.Context) ([]VM, error) {
 	}
 	vms := make([]VM, 0, len(entries))
 	for _, e := range entries {
+		// Go struct conversions ignore tags; listEntry and VM intentionally keep
+		// matching field names and types so JSON tags stay isolated to parsing.
 		vms = append(vms, VM(e))
 	}
 	return vms, nil

@@ -83,11 +83,17 @@ type WarmVM struct {
 
 // SlotBinding is the guest-persisted job binding for one VM slot.
 type SlotBinding struct {
-	SlotIndex int       `json:"slot_index"`
-	Repo      string    `json:"repo"`
-	JobID     int64     `json:"job_id"`
-	RunID     int64     `json:"run_id"`
-	BoundAt   time.Time `json:"bound_at"`
+	SlotIndex      int       `json:"slot_index"`
+	Repo           string    `json:"repo"`
+	JobID          int64     `json:"job_id"`
+	RunID          int64     `json:"run_id"`
+	BoundAt        time.Time `json:"bound_at"`
+	ObservedActive bool      `json:"-"`
+}
+
+// HasJobMetadata reports whether a persisted binding names a GitHub job and run.
+func (binding SlotBinding) HasJobMetadata() bool {
+	return binding.JobID > 0 && binding.RunID > 0
 }
 
 // AdoptedVM is a running pool VM discovered during broker startup.
@@ -226,11 +232,12 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 	}
 
 	binding := SlotBinding{
-		SlotIndex: slotIndex,
-		Repo:      repo,
-		JobID:     jobID,
-		RunID:     runID,
-		BoundAt:   boundAt.UTC(),
+		SlotIndex:      slotIndex,
+		Repo:           repo,
+		JobID:          jobID,
+		RunID:          runID,
+		BoundAt:        boundAt.UTC(),
+		ObservedActive: false,
 	}
 	if err := b.writeSlotBinding(ctx, vm.Name, binding); err != nil {
 		return err
@@ -309,6 +316,10 @@ func (b *Binder) readSlotBinding(ctx context.Context, vmName string, slotIndex i
 		err := fmt.Errorf("broker: slot binding index on %s = %d, want %d", vmName, binding.SlotIndex, slotIndex)
 		slog.WarnContext(ctx, "slot binding index mismatch", "err", err, "vm", vmName, "slot", slotIndex)
 		return zero, false, err
+	}
+	if !binding.HasJobMetadata() {
+		slog.WarnContext(ctx, "slot binding metadata incomplete; probing active job", "vm", vmName, "slot", slotIndex, "job_id", binding.JobID, "run_id", binding.RunID)
+		return zero, false, nil
 	}
 	return binding, true, nil
 }
@@ -497,20 +508,47 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 		names = append(names, entry.Name)
 	}
 	sort.Strings(names)
-	if limit >= 0 && len(names) > limit {
-		names = names[:limit]
+	type adoptionCandidate struct {
+		vm    *WarmVM
+		slots []SlotBinding
 	}
-	adopted := make([]AdoptedVM, 0, len(names))
+	busyCandidates := make([]adoptionCandidate, 0, len(names))
+	idleCandidates := make([]adoptionCandidate, 0, len(names))
 	for _, name := range names {
 		vm := &WarmVM{Name: name, Image: image, boot: nil, stopTouch: nil}
 		if err := b.CheckAlive(ctx, vm); err != nil {
 			slog.WarnContext(ctx, "skip running vm adoption after liveness failure", "err", err, "vm", name)
 			continue
 		}
-		vm.stopTouch = b.startTouchLoop(ctx, name)
+		candidate := adoptionCandidate{
+			vm:    vm,
+			slots: b.adoptSlotBindings(ctx, vm, normalizedSlotCount(slotCount)),
+		}
+		if len(candidate.slots) > 0 {
+			busyCandidates = append(busyCandidates, candidate)
+			continue
+		}
+		idleCandidates = append(idleCandidates, candidate)
+	}
+	selected := make([]adoptionCandidate, 0, len(busyCandidates)+len(idleCandidates))
+	addCandidate := func(candidate adoptionCandidate) {
+		if limit >= 0 && len(selected) >= limit {
+			return
+		}
+		selected = append(selected, candidate)
+	}
+	for _, candidate := range busyCandidates {
+		addCandidate(candidate)
+	}
+	for _, candidate := range idleCandidates {
+		addCandidate(candidate)
+	}
+	adopted := make([]AdoptedVM, 0, len(selected))
+	for _, candidate := range selected {
+		candidate.vm.stopTouch = b.startTouchLoop(ctx, candidate.vm.Name)
 		adopted = append(adopted, AdoptedVM{
-			VM:    vm,
-			Slots: b.adoptSlotBindings(ctx, vm, normalizedSlotCount(slotCount)),
+			VM:    candidate.vm,
+			Slots: candidate.slots,
 		})
 	}
 	return adopted, nil
@@ -534,11 +572,12 @@ func (b *Binder) adoptSlotBindings(ctx context.Context, vm *WarmVM, slotCount in
 		}
 		if active {
 			bindings = append(bindings, SlotBinding{
-				SlotIndex: slotIndex,
-				Repo:      "",
-				JobID:     0,
-				RunID:     0,
-				BoundAt:   time.Time{},
+				SlotIndex:      slotIndex,
+				Repo:           "",
+				JobID:          0,
+				RunID:          0,
+				BoundAt:        time.Time{},
+				ObservedActive: true,
 			})
 		}
 	}

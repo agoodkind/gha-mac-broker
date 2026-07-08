@@ -2473,6 +2473,30 @@ func TestStartAdoptsRunningVMsBeforeWarming(t *testing.T) {
 	}
 }
 
+func TestInstallAdoptedWorkersSkipsNilEntriesAndBoundsByInstalledVMs(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	pool := New(testOptions(clock, 2), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
+	adopted := []broker.AdoptedVM{
+		{VM: nil},
+		{VM: &broker.WarmVM{Name: "vm-a", Image: "image-a"}},
+		{VM: &broker.WarmVM{Name: "vm-b", Image: "image-a"}},
+		{VM: &broker.WarmVM{Name: "vm-c", Image: "image-a"}},
+	}
+
+	pool.mu.Lock()
+	pool.installAdoptedWorkersLocked(adopted)
+	pool.mu.Unlock()
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].vm == nil || pool.states[0].vm.Name != "vm-a" {
+		t.Fatalf("state 0 vm = %+v, want vm-a", pool.states[0].vm)
+	}
+	if pool.states[1].vm == nil || pool.states[1].vm.Name != "vm-b" {
+		t.Fatalf("state 1 vm = %+v, want vm-b", pool.states[1].vm)
+	}
+}
+
 func TestStartReAdoptsBusySlotAcrossRestart(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	clock := newMutableClock(now)
@@ -2511,6 +2535,48 @@ func TestStartReAdoptsBusySlotAcrossRestart(t *testing.T) {
 	}
 	if got := len(warmer.WarmNames()); got != 0 {
 		t.Fatalf("warm calls = %d, want 0 while adopted busy vm occupies the slot", got)
+	}
+}
+
+func TestInstallAdoptedWorkersPreservesValidBusyBindingAndIgnoresIncompleteBinding(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	pool := New(testOptionsWithSlots(clock, 1, 2), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
+	boundAt := now.Add(-time.Minute)
+
+	pool.mu.Lock()
+	pool.installAdoptedWorkersLocked([]broker.AdoptedVM{
+		{
+			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+			Slots: []broker.SlotBinding{
+				{
+					SlotIndex: 0,
+					Repo:      "owner/repo",
+					JobID:     1001,
+					RunID:     42,
+					BoundAt:   boundAt,
+				},
+				{
+					SlotIndex: 1,
+					Repo:      "owner/repo",
+					JobID:     0,
+					RunID:     43,
+					BoundAt:   boundAt,
+				},
+			},
+		},
+	})
+	pool.mu.Unlock()
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	slot := pool.states[0].slots[0]
+	if !slot.busy || slot.jobID != 1001 || slot.runID != 42 || !slot.boundAt.Equal(boundAt) {
+		t.Fatalf("slot 0 = %+v, want busy job 1001 run 42 bound at %s", slot, boundAt)
+	}
+	incompleteSlot := pool.states[0].slots[1]
+	if incompleteSlot.busy || incompleteSlot.jobID != 0 || incompleteSlot.runID != 0 {
+		t.Fatalf("slot 1 = %+v, want idle because binding is incomplete", incompleteSlot)
 	}
 }
 

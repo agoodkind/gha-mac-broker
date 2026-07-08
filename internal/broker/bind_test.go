@@ -1,8 +1,14 @@
 package broker
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"goodkind.io/gha-mac-broker/internal/config"
+	"goodkind.io/gha-mac-broker/internal/tart"
 )
 
 func TestActiveJobProbeScriptAvoidsSelfMatch(t *testing.T) {
@@ -131,5 +137,201 @@ func TestSlotCPUActivityCommandTargetsSlotRunnerAndSumsSubtree(t *testing.T) {
 		if strings.Contains(command, disallowed) {
 			t.Fatalf("slot cpu activity command = %q, want no %s", command, disallowed)
 		}
+	}
+}
+
+func TestAdoptPrefersLiveBusyVMWithinLimit(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	binding := `{"slot_index":0,"repo":"owner/repo","job_id":1001,"run_id":42,"bound_at":"2026-07-03T11:59:00Z"}`
+	script := strings.ReplaceAll(`#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1" == "list" ]]; then
+    printf '[{"Name":"pool-a-dead","State":"running"},{"Name":"pool-b-idle","State":"running"},{"Name":"pool-c-busy","State":"running"}]'
+    exit 0
+fi
+
+if [[ "$1" == "exec" ]]; then
+    vm="$2"
+    shift 2
+    joined="$*"
+    if [[ "$vm" == "pool-a-dead" ]]; then
+        exit 1
+    fi
+    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
+        exit 0
+    fi
+    if [[ "$vm" == "pool-c-busy" && "$joined" == *"gha-broker-slot-0.json"* ]]; then
+        cat <<'JSON'
+__BINDING__
+JSON
+        exit 0
+    fi
+    if [[ "$joined" == *"pgrep"* ]]; then
+        printf 'no\n'
+        exit 0
+    fi
+    exit 0
+fi
+
+exit 1
+`, "__BINDING__", binding)
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+
+	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
+	binder := New(cfg, nil, tart.New(bin))
+	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	t.Cleanup(func() {
+		for _, adoptedVM := range adopted {
+			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
+				adoptedVM.VM.stopTouch()
+			}
+		}
+	})
+
+	if len(adopted) != 1 {
+		t.Fatalf("adopted = %+v, want one live busy VM", adopted)
+	}
+	if adopted[0].VM.Name != "pool-c-busy" {
+		t.Fatalf("adopted vm = %q, want pool-c-busy", adopted[0].VM.Name)
+	}
+	if len(adopted[0].Slots) != 1 || adopted[0].Slots[0].RunID != 42 {
+		t.Fatalf("adopted slots = %+v, want run 42 binding", adopted[0].Slots)
+	}
+}
+
+func TestAdoptDoesNotLetIncompleteBindingConsumeLimit(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	incompleteBinding := `{"slot_index":0,"repo":"owner/repo","job_id":0,"run_id":42,"bound_at":"2026-07-03T11:58:00Z"}`
+	busyBinding := `{"slot_index":0,"repo":"owner/repo","job_id":1001,"run_id":43,"bound_at":"2026-07-03T11:59:00Z"}`
+	script := strings.ReplaceAll(strings.ReplaceAll(`#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1" == "list" ]]; then
+    printf '[{"Name":"pool-a-incomplete","State":"running"},{"Name":"pool-b-busy","State":"running"}]'
+    exit 0
+fi
+
+if [[ "$1" == "exec" ]]; then
+    vm="$2"
+    shift 2
+    joined="$*"
+    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
+        exit 0
+    fi
+    if [[ "$vm" == "pool-a-incomplete" && "$joined" == *"gha-broker-slot-0.json"* ]]; then
+        cat <<'JSON'
+__INCOMPLETE_BINDING__
+JSON
+        exit 0
+    fi
+    if [[ "$vm" == "pool-b-busy" && "$joined" == *"gha-broker-slot-0.json"* ]]; then
+        cat <<'JSON'
+__BUSY_BINDING__
+JSON
+        exit 0
+    fi
+    if [[ "$joined" == *"pgrep"* ]]; then
+        printf 'no\n'
+        exit 0
+    fi
+    exit 0
+fi
+
+exit 1
+`, "__INCOMPLETE_BINDING__", incompleteBinding), "__BUSY_BINDING__", busyBinding)
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+
+	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
+	binder := New(cfg, nil, tart.New(bin))
+	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	t.Cleanup(func() {
+		for _, adoptedVM := range adopted {
+			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
+				adoptedVM.VM.stopTouch()
+			}
+		}
+	})
+
+	if len(adopted) != 1 {
+		t.Fatalf("adopted = %+v, want one valid busy VM", adopted)
+	}
+	if adopted[0].VM.Name != "pool-b-busy" {
+		t.Fatalf("adopted vm = %q, want pool-b-busy", adopted[0].VM.Name)
+	}
+}
+
+func TestAdoptFallsBackToActiveProbeForIncompleteBinding(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	binding := `{"slot_index":0,"repo":"owner/repo","job_id":0,"run_id":43,"bound_at":"2026-07-03T11:59:00Z"}`
+	script := strings.ReplaceAll(`#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1" == "list" ]]; then
+    printf '[{"Name":"pool-a-busy","State":"running"}]'
+    exit 0
+fi
+
+if [[ "$1" == "exec" ]]; then
+    shift 2
+    joined="$*"
+    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
+        exit 0
+    fi
+    if [[ "$joined" == *"gha-broker-slot-0.json"* ]]; then
+        cat <<'JSON'
+__BINDING__
+JSON
+        exit 0
+    fi
+    if [[ "$joined" == *"pgrep"* ]]; then
+        printf 'yes\n'
+        exit 0
+    fi
+    exit 0
+fi
+
+exit 1
+`, "__BINDING__", binding)
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+
+	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
+	binder := New(cfg, nil, tart.New(bin))
+	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	t.Cleanup(func() {
+		for _, adoptedVM := range adopted {
+			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
+				adoptedVM.VM.stopTouch()
+			}
+		}
+	})
+
+	if len(adopted) != 1 {
+		t.Fatalf("adopted = %+v, want one live VM", adopted)
+	}
+	if len(adopted[0].Slots) != 1 {
+		t.Fatalf("adopted slots = %+v, want one active fallback slot", adopted[0].Slots)
+	}
+	slot := adopted[0].Slots[0]
+	if !slot.ObservedActive || slot.JobID != 0 || slot.RunID != 0 {
+		t.Fatalf("adopted slot = %+v, want observed-active fallback without stale IDs", slot)
 	}
 }
