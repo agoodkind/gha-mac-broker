@@ -9,12 +9,14 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
+	"goodkind.io/gha-mac-broker/internal/install"
 	"goodkind.io/go-makefile/selfupdate"
 )
 
@@ -76,6 +78,112 @@ func testServeConfig() *config.Config {
 		},
 		Labels: []string{"self-hosted", "macOS"},
 	}
+}
+
+func TestRunInstallDefaultsBinToHomeLocalBin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sourcePath := filepath.Join(t.TempDir(), "gha-mac-broker")
+	if err := os.WriteFile(sourcePath, []byte("broker binary"), 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+	capturedConfig := runInstallWithStubbedInstaller(t, sourcePath, nil)
+
+	wantBinPath := filepath.Join(home, ".local", "bin", "gha-mac-broker")
+	if capturedConfig.BinPath != wantBinPath {
+		t.Fatalf("bin path = %q, want %q", capturedConfig.BinPath, wantBinPath)
+	}
+	copiedBinary, err := os.ReadFile(wantBinPath)
+	if err != nil {
+		t.Fatalf("read copied binary: %v", err)
+	}
+	if string(copiedBinary) != "broker binary" {
+		t.Fatalf("copied binary = %q, want source content", string(copiedBinary))
+	}
+}
+
+func TestRunInstallHonorsExplicitBin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sourcePath := filepath.Join(t.TempDir(), "gha-mac-broker")
+	if err := os.WriteFile(sourcePath, []byte("broker binary"), 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+	explicitBinPath := filepath.Join(t.TempDir(), "custom-broker")
+	capturedConfig := runInstallWithStubbedInstaller(
+		t,
+		sourcePath,
+		[]string{"-bin", explicitBinPath},
+	)
+
+	if capturedConfig.BinPath != explicitBinPath {
+		t.Fatalf("bin path = %q, want explicit %q", capturedConfig.BinPath, explicitBinPath)
+	}
+	if _, err := os.Stat(explicitBinPath); err != nil {
+		t.Fatalf("stat explicit copied binary: %v", err)
+	}
+}
+
+func TestRunInstallHelpDoesNotResolveHome(t *testing.T) {
+	if os.Getenv("GHA_MAC_BROKER_INSTALL_HELP_SUBPROCESS") == "1" {
+		err := runInstall(context.Background(), []string{"-help"})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "runInstall: %v\n", err)
+			os.Exit(2)
+		}
+		return
+	}
+
+	command := exec.Command(os.Args[0], "-test.run=TestRunInstallHelpDoesNotResolveHome")
+	command.Env = append(os.Environ(), "GHA_MAC_BROKER_INSTALL_HELP_SUBPROCESS=1")
+	command.Env = append(command.Env, "HOME=")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install -help exited with %v, output:\n%s", err, string(output))
+	}
+}
+
+func TestCopyBinaryRejectsNonRegularSource(t *testing.T) {
+	sourcePath := t.TempDir()
+	destinationPath := filepath.Join(t.TempDir(), "gha-mac-broker")
+
+	err := copyBinary(context.Background(), sourcePath, destinationPath)
+	if err == nil {
+		t.Fatal("copyBinary returned nil, want non-regular source error")
+	}
+	errorMessage := err.Error()
+	if !strings.Contains(errorMessage, sourcePath) {
+		t.Fatalf("copyBinary error = %q, want source path %q", errorMessage, sourcePath)
+	}
+	if !strings.Contains(errorMessage, "not a regular file") {
+		t.Fatalf("copyBinary error = %q, want not a regular file", errorMessage)
+	}
+}
+
+func runInstallWithStubbedInstaller(t *testing.T, sourcePath string, args []string) install.Config {
+	t.Helper()
+	originalCurrentExecutable := currentExecutable
+	currentExecutable = func() (string, error) {
+		return sourcePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutable = originalCurrentExecutable
+	})
+
+	originalInstallBroker := installBroker
+	var capturedConfig install.Config
+	installBroker = func(_ context.Context, cfg install.Config) error {
+		capturedConfig = cfg
+		return nil
+	}
+	t.Cleanup(func() {
+		installBroker = originalInstallBroker
+	})
+
+	if err := runInstall(context.Background(), args); err != nil {
+		t.Fatalf("runInstall: %v", err)
+	}
+	return capturedConfig
 }
 
 func TestRunStatusUsesCapacityTokenAndListenPort(t *testing.T) {
