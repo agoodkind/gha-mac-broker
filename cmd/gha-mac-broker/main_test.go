@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -120,6 +121,42 @@ func TestRunInstallHonorsExplicitBin(t *testing.T) {
 	}
 	if _, err := os.Stat(explicitBinPath); err != nil {
 		t.Fatalf("stat explicit copied binary: %v", err)
+	}
+}
+
+func TestRunInstallHelpDoesNotResolveHome(t *testing.T) {
+	if os.Getenv("GHA_MAC_BROKER_INSTALL_HELP_SUBPROCESS") == "1" {
+		err := runInstall(context.Background(), []string{"-help"})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "runInstall: %v\n", err)
+			os.Exit(2)
+		}
+		return
+	}
+
+	command := exec.Command(os.Args[0], "-test.run=TestRunInstallHelpDoesNotResolveHome")
+	command.Env = append(os.Environ(), "GHA_MAC_BROKER_INSTALL_HELP_SUBPROCESS=1")
+	command.Env = append(command.Env, "HOME=")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install -help exited with %v, output:\n%s", err, string(output))
+	}
+}
+
+func TestCopyBinaryRejectsNonRegularSource(t *testing.T) {
+	sourcePath := t.TempDir()
+	destinationPath := filepath.Join(t.TempDir(), "gha-mac-broker")
+
+	err := copyBinary(context.Background(), sourcePath, destinationPath)
+	if err == nil {
+		t.Fatal("copyBinary returned nil, want non-regular source error")
+	}
+	errorMessage := err.Error()
+	if !strings.Contains(errorMessage, sourcePath) {
+		t.Fatalf("copyBinary error = %q, want source path %q", errorMessage, sourcePath)
+	}
+	if !strings.Contains(errorMessage, "not a regular file") {
+		t.Fatalf("copyBinary error = %q, want not a regular file", errorMessage)
 	}
 }
 

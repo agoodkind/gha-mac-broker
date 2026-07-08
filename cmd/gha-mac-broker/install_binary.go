@@ -60,6 +60,9 @@ func copyBinary(ctx context.Context, sourcePath string, destinationPath string) 
 		slog.ErrorContext(ctx, "source binary stat failed", "err", err, "source", sourcePath)
 		return fmt.Errorf("install: stat source binary %s: %w", sourcePath, err)
 	}
+	if !sourceInfo.Mode().IsRegular() {
+		return fmt.Errorf("install: source binary %s is not a regular file", sourcePath)
+	}
 	destinationDir := filepath.Dir(destinationPath)
 	if err := os.MkdirAll(destinationDir, 0o755); err != nil {
 		slog.ErrorContext(ctx, "binary destination directory create failed", "err", err, "directory", destinationDir)
