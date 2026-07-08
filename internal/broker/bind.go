@@ -563,10 +563,7 @@ func (b *Binder) adoptSlotBindings(ctx context.Context, vm *WarmVM, slotCount in
 	bindings := make([]SlotBinding, 0, slotCount)
 	for slotIndex := range slotCount {
 		binding, ok, err := b.readSlotBinding(ctx, vm.Name, slotIndex)
-		if err != nil {
-			continue
-		}
-		if ok {
+		if err == nil && ok {
 			bindings = append(bindings, binding)
 			continue
 		}

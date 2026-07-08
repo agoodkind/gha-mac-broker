@@ -417,6 +417,66 @@ exit 1
 	}
 }
 
+func TestAdoptFallsBackToActiveProbeForCorruptBinding(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1" == "list" ]]; then
+    printf '[{"Name":"pool-a-busy","State":"running"}]'
+    exit 0
+fi
+
+if [[ "$1" == "exec" ]]; then
+    shift 2
+    joined="$*"
+    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
+        exit 0
+    fi
+    if [[ "$joined" == *"gha-broker-slot-0.json"* ]]; then
+        printf '{"slot_index":0'
+        exit 0
+    fi
+    if [[ "$joined" == *"pgrep"* ]]; then
+        printf 'yes\n'
+        exit 0
+    fi
+    exit 0
+fi
+
+exit 1
+`
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+
+	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
+	binder := New(cfg, nil, tart.New(bin))
+	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	t.Cleanup(func() {
+		for _, adoptedVM := range adopted {
+			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
+				adoptedVM.VM.stopTouch()
+			}
+		}
+	})
+
+	if len(adopted) != 1 {
+		t.Fatalf("adopted = %+v, want one live VM", adopted)
+	}
+	if len(adopted[0].Slots) != 1 {
+		t.Fatalf("adopted slots = %+v, want one active fallback slot", adopted[0].Slots)
+	}
+	slot := adopted[0].Slots[0]
+	if !slot.ObservedActive || slot.JobID != 0 || slot.RunID != 0 {
+		t.Fatalf("adopted slot = %+v, want observed-active fallback without stale IDs", slot)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
