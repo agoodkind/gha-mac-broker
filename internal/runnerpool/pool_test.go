@@ -935,6 +935,64 @@ func TestReconfigureBusyWorkerKeepsOldSlotsUntilIdleResize(t *testing.T) {
 	runner.Release()
 }
 
+func TestStatusReportsBusyWorkerActualSlotsUntilIdleResize(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newBlockingRunner(2)
+	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, newFakeGitHub(), nil)
+	ctx := startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+	firstVM := warmer.WarmNames()[0]
+
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-a", JobID: 1, RunID: 10}); err != nil {
+		t.Fatalf("Enqueue first job: %v", err)
+	}
+	first := waitStarted(t, runner)
+	if first.SlotCount != 2 {
+		t.Fatalf("first slot count = %d, want 2", first.SlotCount)
+	}
+
+	pool.Reconfigure(testOptionsWithSlots(clock, 1, 1))
+	if err := pool.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile while busy: %v", err)
+	}
+
+	_, workers := pool.Status(context.Background())
+	if len(workers) != 1 {
+		t.Fatalf("workers = %+v, want 1 worker", workers)
+	}
+	if len(workers[0].Slots) != 2 {
+		t.Fatalf("busy worker status slots = %+v, want 2 actual slots", workers[0].Slots)
+	}
+	if torn := warmer.TornNames(); len(torn) != 0 {
+		t.Fatalf("busy worker teardowns = %v, want none", torn)
+	}
+
+	runner.Release()
+	waitFor(t, func() bool {
+		snapshot := pool.Snapshot()
+		return snapshot.Idle == 2 && snapshot.Busy == 0
+	})
+	if err := pool.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile while idle: %v", err)
+	}
+	waitFor(t, func() bool {
+		return len(warmer.WarmNames()) == 2
+	})
+	torn := warmer.TornNames()
+	if len(torn) != 1 || torn[0] != firstVM {
+		t.Fatalf("idle resize teardowns = %v, want [%s]", torn, firstVM)
+	}
+
+	_, workers = pool.Status(context.Background())
+	if len(workers) != 1 {
+		t.Fatalf("workers after resize = %+v, want 1 worker", workers)
+	}
+	if workers[0].Slots != nil {
+		t.Fatalf("resized worker status slots = %+v, want nil single-slot view", workers[0].Slots)
+	}
+}
+
 func TestReconfigureShrinksIdleWorkerSlotCount(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	warmer := newFakeWarmer()

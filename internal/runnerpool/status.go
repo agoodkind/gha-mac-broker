@@ -24,7 +24,7 @@ func (p *Pool) Status(ctx context.Context) (Snapshot, []WorkerView) {
 	views := make([]WorkerView, 0, len(p.states))
 	probeTargets := make([]statusProbeTarget, 0, len(p.states)*p.options.JobsPerVM)
 	for index, state := range p.states {
-		view := workerView(index, state, now, p.options.JobsPerVM)
+		view := workerView(index, state, now)
 		views = append(views, view)
 		if p.prober == nil || state.vm == nil {
 			continue
@@ -65,7 +65,7 @@ func (p *Pool) Status(ctx context.Context) (Snapshot, []WorkerView) {
 	return snapshot, views
 }
 
-func workerView(index int, state workerState, now time.Time, jobsPerVM int) WorkerView {
+func workerView(index int, state workerState, now time.Time) WorkerView {
 	view := WorkerView{
 		Index:          index,
 		VM:             "",
@@ -85,7 +85,7 @@ func workerView(index int, state workerState, now time.Time, jobsPerVM int) Work
 	if len(state.slots) == 0 {
 		return view
 	}
-	if jobsPerVM <= 1 {
+	if len(state.slots) <= 1 {
 		slot := state.slots[0]
 		view.RunID = slot.runID
 		view.BindAgeSeconds = bindAgeSeconds(slot.boundAt, now)
