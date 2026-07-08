@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -726,5 +727,22 @@ func waitForFile(t *testing.T, path string) {
 			t.Fatalf("timed out waiting for %s", path)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestReapBootCommandWaitsForExitedProcess(t *testing.T) {
+	binder := New(nil, nil, nil)
+	ctx := context.Background()
+	cmd := exec.CommandContext(ctx, "true")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start command: %v", err)
+	}
+
+	done := binder.reapBootCommand(context.Background(), "vm-reap", cmd)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("boot command reaper did not finish")
 	}
 }
