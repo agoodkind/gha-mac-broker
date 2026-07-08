@@ -87,7 +87,7 @@ type SlotView struct {
 // Warmer creates, probes, and tears down warm VMs. *broker.Binder satisfies
 // this interface.
 type Warmer interface {
-	Warm(ctx context.Context, image string, id string) (*broker.WarmVM, error)
+	Warm(ctx context.Context, image string, id string, slotCount int) (*broker.WarmVM, error)
 	Teardown(ctx context.Context, vm *broker.WarmVM)
 	CheckAlive(ctx context.Context, vm *broker.WarmVM) error
 	SweepOrphans(ctx context.Context)
@@ -128,6 +128,7 @@ type slotState struct {
 	runID           int64
 	jobCancel       context.CancelFunc
 	cpuStalledSince time.Time
+	stallWarnedAt   time.Time
 	reapWarnedAt    time.Time
 	lastErr         error
 }
@@ -181,6 +182,74 @@ func New(options Options, warmer Warmer, runner Runner, github RunnerLister, pro
 	return pool
 }
 
+// Reconfigure applies live safe pool options without interrupting running jobs.
+func (p *Pool) Reconfigure(newOptions Options) {
+	preserveNow := newOptions.Now == nil
+	preserveRunToken := newOptions.RunToken == ""
+	requestedImage := newOptions.Image
+	newOptions = normalizeOptions(newOptions)
+	requestedRunnerCount := newOptions.RunnerCount
+
+	p.mu.Lock()
+	oldOptions := p.options
+	if preserveNow {
+		newOptions.Now = oldOptions.Now
+	}
+	if preserveRunToken {
+		newOptions.RunToken = oldOptions.RunToken
+	}
+	imageChanged := requestedImage != "" && requestedImage != oldOptions.Image
+	newOptions.Image = oldOptions.Image
+	runnerCountChanged := newOptions.RunnerCount != oldOptions.RunnerCount
+	if runnerCountChanged {
+		newOptions.RunnerCount = oldOptions.RunnerCount
+	}
+	p.options = Options{
+		RunnerCount:    oldOptions.RunnerCount,
+		JobsPerVM:      newOptions.JobsPerVM,
+		Image:          newOptions.Image,
+		MaxIdle:        newOptions.MaxIdle,
+		MaxAge:         newOptions.MaxAge,
+		MaxBind:        newOptions.MaxBind,
+		PickupTimeout:  newOptions.PickupTimeout,
+		StallTimeout:   newOptions.StallTimeout,
+		StallReap:      newOptions.StallReap,
+		RunToken:       newOptions.RunToken,
+		WarmRetryDelay: newOptions.WarmRetryDelay,
+		Now:            newOptions.Now,
+	}
+	p.cond.Broadcast()
+	p.mu.Unlock()
+
+	if runnerCountChanged {
+		slog.Warn(
+			"runnerpool reconfigure: runner_count change requires restart; keeping current",
+			"old_runner_count", oldOptions.RunnerCount,
+			"new_runner_count", requestedRunnerCount,
+		)
+	}
+	if imageChanged {
+		slog.Warn(
+			"runnerpool reconfigure: image change requires restart; keeping current",
+			"old_image", oldOptions.Image,
+			"new_image", requestedImage,
+		)
+	}
+	slog.Info(
+		"runnerpool reconfigured",
+		"old_jobs_per_vm", oldOptions.JobsPerVM,
+		"new_jobs_per_vm", newOptions.JobsPerVM,
+		"old_max_idle", oldOptions.MaxIdle,
+		"new_max_idle", newOptions.MaxIdle,
+		"old_max_age", oldOptions.MaxAge,
+		"new_max_age", newOptions.MaxAge,
+		"old_max_bind", oldOptions.MaxBind,
+		"new_max_bind", newOptions.MaxBind,
+		"old_pickup_timeout", oldOptions.PickupTimeout,
+		"new_pickup_timeout", newOptions.PickupTimeout,
+	)
+}
+
 func normalizeOptions(options Options) Options {
 	if options.RunnerCount <= 0 {
 		options.RunnerCount = defaultRunnerCount
@@ -217,6 +286,12 @@ func newWorkerStates(runnerCount int, jobsPerVM int) []workerState {
 	return states
 }
 
+func (p *Pool) optionsSnapshot() Options {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.options
+}
+
 // Start launches the fixed worker set. Calling Start more than once is a no-op.
 func (p *Pool) Start(ctx context.Context) {
 	p.startOnce.Do(func() {
@@ -235,7 +310,8 @@ func (p *Pool) Start(ctx context.Context) {
 			p.mu.Unlock()
 		})
 
-		for i := range p.options.RunnerCount {
+		options := p.optionsSnapshot()
+		for i := range options.RunnerCount {
 			workerIndex := i
 			p.wg.Go(func() {
 				defer recoverGoroutine(poolCtx, "runnerpool worker")
@@ -378,177 +454,12 @@ func (p *Pool) installedReposForHealth(ctx context.Context, candidates []idleCan
 	return repos, false
 }
 
-type busyCandidate struct {
-	index     int
-	slotIndex int
-	slotCount int
-	vm        *broker.WarmVM
-	boundAt   time.Time
-	jobID     int64
-	runID     int64
-	now       time.Time
-}
-
-func (p *Pool) reapBusyWorkers(ctx context.Context) {
-	candidates := p.busyCandidates()
-	for _, candidate := range candidates {
-		bindAge := candidate.now.Sub(candidate.boundAt)
-		pastMaxBind := p.options.MaxBind > 0 && bindAge >= p.options.MaxBind
-		pastPickupTimeout := p.options.PickupTimeout > 0 && bindAge >= p.options.PickupTimeout
-		if !pastMaxBind && !pastPickupTimeout {
-			continue
-		}
-		if p.prober == nil {
-			continue
-		}
-		active, err := p.prober.HasActiveJob(ctx, candidate.vm, candidate.slotIndex, candidate.slotCount)
-		if err != nil {
-			p.handleActiveJobProbeError(ctx, candidate, bindAge, pastMaxBind, err)
-			continue
-		}
-		if !active {
-			p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, "runnerpool reaping worker (no active job process)")
-			continue
-		}
-		if !pastPickupTimeout {
-			continue
-		}
-		cpuActivity, err := p.prober.SlotCPUActivity(ctx, candidate.vm, candidate.slotIndex, candidate.slotCount)
-		if err != nil {
-			slog.WarnContext(ctx, "runnerpool slot cpu activity probe failed", "err", err, "vm", candidate.vm.Name, "slot", candidate.slotIndex)
-			continue
-		}
-		if cpuActivity < 0 {
-			continue
-		}
-		cpuStalledSince, ok := p.observeSlotCPU(candidate, cpuActivity, candidate.now)
-		if !ok || cpuStalledSince.IsZero() {
-			continue
-		}
-		p.maybeWarnStalledBusyWorker(ctx, candidate, bindAge, cpuStalledSince, cpuActivity)
-	}
-}
-
-func (p *Pool) handleActiveJobProbeError(ctx context.Context, candidate busyCandidate, bindAge time.Duration, pastMaxBind bool, err error) {
-	slog.WarnContext(ctx, "runnerpool active job probe failed", "err", err, "vm", candidate.vm.Name, "slot", candidate.slotIndex)
-	if !pastMaxBind {
-		return
-	}
-	p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, "runnerpool reaping worker (probe error past max_bind)")
-}
-
-func (p *Pool) warnAndRequestBusyRecycle(ctx context.Context, candidate busyCandidate, bindAge time.Duration, message string) {
-	if !p.claimSlotReapWarning(candidate) {
-		return
-	}
-	slog.WarnContext(ctx, message, "vm", candidate.vm.Name, "run_id", candidate.runID, "job_id", candidate.jobID, "slot", candidate.slotIndex, "bind_age_seconds", int64(bindAge.Seconds()))
-	p.requestBusyRecycle(candidate)
-}
-
-func (p *Pool) maybeWarnStalledBusyWorker(ctx context.Context, candidate busyCandidate, bindAge time.Duration, cpuStalledSince time.Time, cpuActivity float64) {
-	stalledFor := candidate.now.Sub(cpuStalledSince)
-	if stalledFor < p.options.StallTimeout {
-		return
-	}
-	if !p.claimSlotReapWarning(candidate) {
-		return
-	}
-	slog.WarnContext(ctx, "runnerpool worker stalled (no cpu progress)", "vm", candidate.vm.Name, "run_id", candidate.runID, "job_id", candidate.jobID, "slot", candidate.slotIndex, "bind_age_seconds", int64(bindAge.Seconds()), "stalled_for_seconds", int64(stalledFor.Seconds()), "cpu_percent", cpuActivity)
-	if !p.options.StallReap {
-		return
-	}
-	p.requestBusyRecycle(candidate)
-}
-
-func (p *Pool) observeSlotCPU(candidate busyCandidate, cpuActivity float64, now time.Time) (time.Time, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if candidate.index < 0 || candidate.index >= len(p.states) {
-		return time.Time{}, false
-	}
-	state := &p.states[candidate.index]
-	if state.vm == nil ||
-		state.vm.Name != candidate.vm.Name ||
-		candidate.slotIndex < 0 ||
-		candidate.slotIndex >= len(state.slots) {
-		return time.Time{}, false
-	}
-	slot := &state.slots[candidate.slotIndex]
-	if !slot.busy ||
-		slot.jobID != candidate.jobID ||
-		slot.runID != candidate.runID ||
-		!slot.boundAt.Equal(candidate.boundAt) {
-		return time.Time{}, false
-	}
-	if cpuActivity >= stallCPUThresholdPercent {
-		slot.cpuStalledSince = time.Time{}
-		return slot.cpuStalledSince, true
-	}
-	if slot.cpuStalledSince.IsZero() {
-		slot.cpuStalledSince = now
-	}
-	return slot.cpuStalledSince, true
-}
-
-func (p *Pool) claimSlotReapWarning(candidate busyCandidate) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if candidate.index < 0 || candidate.index >= len(p.states) {
-		return false
-	}
-	state := &p.states[candidate.index]
-	if state.vm == nil ||
-		state.vm.Name != candidate.vm.Name ||
-		state.recycle ||
-		candidate.slotIndex < 0 ||
-		candidate.slotIndex >= len(state.slots) {
-		return false
-	}
-	slot := &state.slots[candidate.slotIndex]
-	if !slot.busy ||
-		slot.jobID != candidate.jobID ||
-		slot.runID != candidate.runID ||
-		!slot.boundAt.Equal(candidate.boundAt) ||
-		slot.reapWarnedAt.Equal(candidate.boundAt) {
-		return false
-	}
-	slot.reapWarnedAt = candidate.boundAt
-	return true
-}
-
-func (p *Pool) busyCandidates() []busyCandidate {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := p.options.Now()
-	candidates := make([]busyCandidate, 0, len(p.states)*p.options.JobsPerVM)
-	for index, state := range p.states {
-		if state.vm == nil {
-			continue
-		}
-		for slotIndex, slot := range state.slots {
-			if !slot.busy || slot.boundAt.IsZero() {
-				continue
-			}
-			candidates = append(candidates, busyCandidate{
-				index:     index,
-				slotIndex: slotIndex,
-				slotCount: len(state.slots),
-				vm:        state.vm,
-				boundAt:   slot.boundAt,
-				jobID:     slot.jobID,
-				runID:     slot.runID,
-				now:       now,
-			})
-		}
-	}
-	return candidates
-}
-
 type idleCandidate struct {
 	index     int
 	vm        *broker.WarmVM
 	bornAt    time.Time
 	idleSince time.Time
+	slotCount int
 	now       time.Time
 }
 
@@ -566,6 +477,7 @@ func (p *Pool) idleCandidates() []idleCandidate {
 			vm:        state.vm,
 			bornAt:    state.bornAt,
 			idleSince: state.idleSince,
+			slotCount: len(state.slots),
 			now:       now,
 		})
 	}
@@ -573,19 +485,30 @@ func (p *Pool) idleCandidates() []idleCandidate {
 }
 
 func (p *Pool) shouldRecycle(ctx context.Context, candidate idleCandidate, repos []string, skipRegistrationCheck bool) (bool, error) {
-	if p.options.MaxIdle > 0 && !candidate.idleSince.IsZero() && candidate.now.Sub(candidate.idleSince) >= p.options.MaxIdle {
+	options := p.optionsSnapshot()
+	if candidate.slotCount != options.JobsPerVM {
+		slog.InfoContext(
+			ctx,
+			"runnerpool idle vm slot count mismatch; recycling",
+			"vm", candidate.vm.Name,
+			"old_jobs_per_vm", candidate.slotCount,
+			"new_jobs_per_vm", options.JobsPerVM,
+		)
 		return true, nil
 	}
-	if p.options.MaxAge > 0 && !candidate.bornAt.IsZero() && candidate.now.Sub(candidate.bornAt) >= p.options.MaxAge {
+	if options.MaxIdle > 0 && !candidate.idleSince.IsZero() && candidate.now.Sub(candidate.idleSince) >= options.MaxIdle {
 		return true, nil
 	}
-	if err := p.checkHealth(ctx, candidate.vm, repos, skipRegistrationCheck); err != nil {
+	if options.MaxAge > 0 && !candidate.bornAt.IsZero() && candidate.now.Sub(candidate.bornAt) >= options.MaxAge {
+		return true, nil
+	}
+	if err := p.checkHealth(ctx, candidate.vm, candidate.slotCount, repos, skipRegistrationCheck); err != nil {
 		return true, err
 	}
 	return false, nil
 }
 
-func (p *Pool) checkHealth(ctx context.Context, vm *broker.WarmVM, repos []string, skipRegistrationCheck bool) error {
+func (p *Pool) checkHealth(ctx context.Context, vm *broker.WarmVM, slotCount int, repos []string, skipRegistrationCheck bool) error {
 	if err := p.warmer.CheckAlive(ctx, vm); err != nil {
 		slog.WarnContext(ctx, "runnerpool alive check failed", "err", err, "vm", vm.Name)
 		return fmt.Errorf("runnerpool: check alive %s: %w", vm.Name, err)
@@ -600,7 +523,7 @@ func (p *Pool) checkHealth(ctx context.Context, vm *broker.WarmVM, repos []strin
 			return fmt.Errorf("runnerpool: list runners %s: %w", repo, err)
 		}
 		for _, runner := range runners {
-			if runnerNameBelongsToVM(vm.Name, runner.Name, p.options.JobsPerVM) {
+			if runnerNameBelongsToVM(vm.Name, runner.Name, slotCount) {
 				slog.WarnContext(ctx, "runnerpool idle vm still registered", "repo", repo, "vm", vm.Name)
 				return fmt.Errorf("runnerpool: idle vm %s still registered in %s", vm.Name, repo)
 			}
@@ -709,12 +632,12 @@ func (p *Pool) Shutdown(ctx context.Context) {
 
 func (p *Pool) workerLoop(ctx context.Context, index int) {
 	for {
-		vm, ok := p.warmWorker(ctx, index)
+		vm, slotCount, ok := p.warmWorker(ctx, index)
 		if !ok {
 			p.clearWorker(index)
 			return
 		}
-		p.activateWorker(index, vm, p.options.Now())
+		p.activateWorker(index, vm, slotCount)
 		recycle, ok := p.runWorkerSlots(ctx, index, vm)
 		p.teardownVM(context.WithoutCancel(ctx), vm)
 		p.clearWorker(index)
@@ -727,7 +650,8 @@ func (p *Pool) workerLoop(ctx context.Context, index int) {
 func (p *Pool) runWorkerSlots(ctx context.Context, index int, vm *broker.WarmVM) (bool, bool) {
 	slotCtx, cancelSlots := context.WithCancel(ctx)
 	var slotWG sync.WaitGroup
-	for slotIndex := range p.options.JobsPerVM {
+	slotCount := p.workerSlotCount(index, vm)
+	for slotIndex := range slotCount {
 		slot := slotIndex
 		slotWG.Go(func() {
 			defer recoverGoroutine(slotCtx, "runnerpool slot")
@@ -741,6 +665,19 @@ func (p *Pool) runWorkerSlots(ctx context.Context, index int, vm *broker.WarmVM)
 	p.mu.Unlock()
 	slotWG.Wait()
 	return recycle, ok
+}
+
+func (p *Pool) workerSlotCount(index int, vm *broker.WarmVM) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if index < 0 || index >= len(p.states) {
+		return 0
+	}
+	state := p.states[index]
+	if state.vm == nil || state.vm.Name != vm.Name {
+		return 0
+	}
+	return len(state.slots)
 }
 
 func (p *Pool) waitForWorkerRecycleOrShutdown(ctx context.Context, index int, vm *broker.WarmVM) (bool, bool) {
@@ -769,7 +706,7 @@ func (p *Pool) waitForWorkerRecycleOrShutdown(ctx context.Context, index int, vm
 
 func (p *Pool) slotLoop(ctx context.Context, index int, slotIndex int, vm *broker.WarmVM) {
 	for {
-		job, jobCtx, cancel, ok := p.waitForSlotJob(ctx, index, slotIndex, vm)
+		job, jobCtx, cancel, slotCount, ok := p.waitForSlotJob(ctx, index, slotIndex, vm)
 		if !ok {
 			return
 		}
@@ -781,7 +718,7 @@ func (p *Pool) slotLoop(ctx context.Context, index int, slotIndex int, vm *broke
 				cancel()
 				p.finishSlotJob(index, slotIndex, vm, err)
 			}()
-			return p.runner.RunJob(jobCtx, vm, job.Repo, runnerNameForSlot(vm.Name, slotIndex, p.options.JobsPerVM), slotIndex, p.options.JobsPerVM)
+			return p.runner.RunJob(jobCtx, vm, job.Repo, runnerNameForSlot(vm.Name, slotIndex, slotCount), slotIndex, slotCount)
 		}()
 		if err != nil {
 			slog.WarnContext(ctx, "runnerpool job failed", "err", err, "repo", job.Repo, "job_id", job.JobID, "run_id", job.RunID, "vm", vm.Name, "slot", slotIndex)
@@ -789,27 +726,34 @@ func (p *Pool) slotLoop(ctx context.Context, index int, slotIndex int, vm *broke
 	}
 }
 
-func (p *Pool) warmWorker(ctx context.Context, index int) (*broker.WarmVM, bool) {
+func (p *Pool) warmWorker(ctx context.Context, index int) (*broker.WarmVM, int, bool) {
 	for {
 		p.markWarming(index)
 		id := p.nextID()
-		vm, err := p.warmer.Warm(ctx, p.options.Image, id)
+		image, slotCount, warmRetryDelay := p.warmRequestOptions()
+		vm, err := p.warmer.Warm(ctx, image, id, slotCount)
 		if err == nil {
 			if vm.Image == "" {
-				vm.Image = p.options.Image
+				vm.Image = image
 			}
-			return vm, true
+			return vm, slotCount, true
 		}
 		p.markWarmError(index, err)
 		slog.WarnContext(ctx, "runnerpool warm failed", "err", err, "worker", index, "id", id)
-		timer := time.NewTimer(p.options.WarmRetryDelay)
+		timer := time.NewTimer(warmRetryDelay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, false
+			return nil, 0, false
 		case <-timer.C:
 		}
 	}
+}
+
+func (p *Pool) warmRequestOptions() (string, int, time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.options.Image, p.options.JobsPerVM, p.options.WarmRetryDelay
 }
 
 func (p *Pool) markWarming(index int) {
@@ -837,33 +781,34 @@ func (p *Pool) markWarmError(index int, err error) {
 	p.cond.Broadcast()
 }
 
-func (p *Pool) activateWorker(index int, vm *broker.WarmVM, bornAt time.Time) {
+func (p *Pool) activateWorker(index int, vm *broker.WarmVM, slotCount int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	now := p.options.Now()
 	state := &p.states[index]
 	state.vm = vm
-	state.bornAt = bornAt
-	state.idleSince = p.options.Now()
+	state.bornAt = now
+	state.idleSince = now
 	state.warming = false
 	state.recycle = false
 	state.lastErr = nil
-	p.resetWorkerSlotsLocked(state)
+	p.resetWorkerSlotsToLocked(state, slotCount)
 	p.cond.Broadcast()
 }
 
-func (p *Pool) waitForSlotJob(ctx context.Context, index int, slotIndex int, vm *broker.WarmVM) (Job, context.Context, context.CancelFunc, bool) {
+func (p *Pool) waitForSlotJob(ctx context.Context, index int, slotIndex int, vm *broker.WarmVM) (Job, context.Context, context.CancelFunc, int, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for {
 		if p.shuttingDown || ctx.Err() != nil {
-			return emptyJob(), nil, nil, false
+			return emptyJob(), nil, nil, 0, false
 		}
 		state := &p.states[index]
 		if state.vm == nil || state.vm.Name != vm.Name || state.recycle {
-			return emptyJob(), nil, nil, false
+			return emptyJob(), nil, nil, 0, false
 		}
 		if slotIndex < 0 || slotIndex >= len(state.slots) {
-			return emptyJob(), nil, nil, false
+			return emptyJob(), nil, nil, 0, false
 		}
 		slot := &state.slots[slotIndex]
 		if slot.busy {
@@ -880,10 +825,12 @@ func (p *Pool) waitForSlotJob(ctx context.Context, index int, slotIndex int, vm 
 			slot.runID = job.RunID
 			slot.jobCancel = cancel
 			slot.cpuStalledSince = time.Time{}
+			slot.stallWarnedAt = time.Time{}
 			slot.reapWarnedAt = time.Time{}
 			slot.lastErr = nil
+			slotCount := len(state.slots)
 			p.cond.Broadcast()
-			return job, jobCtx, cancel, true
+			return job, jobCtx, cancel, slotCount, true
 		}
 		p.cond.Wait()
 	}
@@ -920,6 +867,7 @@ func (p *Pool) finishSlotJob(index int, slotIndex int, vm *broker.WarmVM, err er
 	slot.runID = 0
 	slot.jobCancel = nil
 	slot.cpuStalledSince = time.Time{}
+	slot.stallWarnedAt = time.Time{}
 	slot.reapWarnedAt = time.Time{}
 	slot.lastErr = err
 	if !workerBusy(*state) {
@@ -948,8 +896,15 @@ func (p *Pool) clearWorker(index int) {
 }
 
 func (p *Pool) resetWorkerSlotsLocked(state *workerState) {
-	if len(state.slots) != p.options.JobsPerVM {
-		state.slots = make([]slotState, p.options.JobsPerVM)
+	p.resetWorkerSlotsToLocked(state, p.options.JobsPerVM)
+}
+
+func (p *Pool) resetWorkerSlotsToLocked(state *workerState, slotCount int) {
+	if slotCount <= 0 {
+		slotCount = defaultJobsPerVM
+	}
+	if len(state.slots) != slotCount {
+		state.slots = make([]slotState, slotCount)
 		return
 	}
 	resetSlots(state.slots)
@@ -990,7 +945,10 @@ func (p *Pool) teardownVM(ctx context.Context, vm *broker.WarmVM) {
 
 func (p *Pool) nextID() string {
 	next := p.counter.Add(1)
-	return fmt.Sprintf("%s-%d", p.options.RunToken, next)
+	p.mu.Lock()
+	runToken := p.options.RunToken
+	p.mu.Unlock()
+	return fmt.Sprintf("%s-%d", runToken, next)
 }
 
 func recoverGoroutine(ctx context.Context, label string) {

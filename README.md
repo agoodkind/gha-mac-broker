@@ -54,13 +54,21 @@ when `XDG_CONFIG_HOME` is set, otherwise `~/.config/gha-mac-broker/config.toml`;
 override it with `-config`. Secrets are referenced by absolute file path (no
 tilde expansion), never inlined.
 
+While `serve` is running, the broker watches that config file and reloads valid
+changes after the file mtime is stable across two polls. Pool timing knobs apply
+without a restart. A `jobs_per_vm` change updates the target slot count, and
+each warm VM keeps its current slots while busy, then recycles and returns with
+the new slot count once it is idle. Running jobs are not cancelled. A
+`runner_count` change still requires a process restart.
+
 | Field | Meaning |
 | --- | --- |
 | `app.app_id` | GitHub App ID |
 | `app.private_key_path` | PEM private key on disk |
 | `app.webhook_secret_path` | file holding the webhook HMAC secret |
 | `app.capacity_token_path` | file holding the bearer token required on `GET /status` and `gha-mac-broker status` |
-| `runner_count` | number of persistent warm VMs the pool keeps booted (default 3) |
+| `runner_count` | number of persistent warm VMs the pool keeps booted (default 3, restart required for changes) |
+| `jobs_per_vm` | runner slots per warm VM, resized as VMs go idle after a reload |
 | `max_idle` | recycle an idle VM after this long (hygiene; the cache is a host mount, so this is free) |
 | `max_age` | recycle a VM once it has run this long |
 | `max_bind` | probe a busy worker after this long and recycle it only when active work is not confirmed |

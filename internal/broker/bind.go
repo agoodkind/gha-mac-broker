@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"goodkind.io/gha-mac-broker/internal/config"
@@ -77,23 +78,39 @@ type WarmVM struct {
 
 // Binder performs JIT runner binds against a warm VM substrate over vsock.
 type Binder struct {
-	cfg *config.Config
-	gh  *ghapp.Client
-	vm  *tart.Tart
+	cfgMu sync.RWMutex
+	cfg   *config.Config
+	gh    *ghapp.Client
+	vm    *tart.Tart
 }
 
 // New builds a Binder from its collaborators.
 func New(cfg *config.Config, gh *ghapp.Client, vm *tart.Tart) *Binder {
-	return &Binder{cfg: cfg, gh: gh, vm: vm}
+	return &Binder{cfgMu: sync.RWMutex{}, cfg: cfg, gh: gh, vm: vm}
+}
+
+// Reconfigure swaps the config used by future broker operations.
+func (b *Binder) Reconfigure(cfg *config.Config) {
+	b.cfgMu.Lock()
+	defer b.cfgMu.Unlock()
+	b.cfg = cfg
+}
+
+func (b *Binder) configSnapshot() *config.Config {
+	b.cfgMu.RLock()
+	defer b.cfgMu.RUnlock()
+	return b.cfg
 }
 
 // Warm clones the golden image to a prefixed name derived from id, boots the VM,
 // waits until its vsock channel answers, and starts the liveness touch loop. On
 // any failure, Warm tears down the partial VM before returning; the caller owns
 // teardown only on success.
-func (b *Binder) Warm(ctx context.Context, image, id string) (*WarmVM, error) {
-	vmName := b.cfg.Tart.VMNamePrefix + "-" + id
-	slog.InfoContext(ctx, "warming vm", "vm", vmName, "image", image)
+func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount int) (*WarmVM, error) {
+	slotCount = normalizeSlotCount(slotCount)
+	cfg := b.configSnapshot()
+	vmName := cfg.Tart.VMNamePrefix + "-" + id
+	slog.InfoContext(ctx, "warming vm", "vm", vmName, "image", image, "slot_count", slotCount)
 
 	goldenName, err := golden.New(b.vm).EnsureGolden(ctx, golden.EnsureOptions{
 		Image:         image,
@@ -118,7 +135,7 @@ func (b *Binder) Warm(ctx context.Context, image, id string) (*WarmVM, error) {
 		return nil, fmt.Errorf("broker: clone %s: %w", vmName, err)
 	}
 
-	bootCmd := b.bootCommand(ctx, vmName)
+	bootCmd := b.bootCommand(ctx, cfg, vmName)
 	if err := bootCmd.Start(); err != nil {
 		slog.ErrorContext(ctx, "vm boot failed", "err", err, "vm", vmName)
 		b.teardown(ctx, vmName)
@@ -131,7 +148,7 @@ func (b *Binder) Warm(ctx context.Context, image, id string) (*WarmVM, error) {
 		return nil, err
 	}
 
-	if err := b.cloneRunnerSlots(ctx, vmName); err != nil {
+	if err := b.cloneRunnerSlots(ctx, vmName, slotCount); err != nil {
 		_ = bootCmd.Process.Kill()
 		b.teardown(ctx, vmName)
 		return nil, err
@@ -152,8 +169,8 @@ func (b *Binder) Warm(ctx context.Context, image, id string) (*WarmVM, error) {
 	return &WarmVM{Name: vmName, Image: image, boot: bootCmd, stopTouch: stopTouch}, nil
 }
 
-func (b *Binder) cloneRunnerSlots(ctx context.Context, vmName string) error {
-	remote := cloneRunnerSlotsCommand(normalizedJobsPerVM(b.cfg))
+func (b *Binder) cloneRunnerSlots(ctx context.Context, vmName string, slotCount int) error {
+	remote := cloneRunnerSlotsCommand(normalizeSlotCount(slotCount))
 	if remote == "" {
 		return nil
 	}
@@ -382,7 +399,8 @@ func (b *Binder) SweepOrphans(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	prefix := b.cfg.Tart.VMNamePrefix + "-"
+	cfg := b.configSnapshot()
+	prefix := cfg.Tart.VMNamePrefix + "-"
 	swept := 0
 	for _, name := range names {
 		if !strings.HasPrefix(name, prefix) {
@@ -403,12 +421,13 @@ func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
 	if _, _, ok := strings.Cut(repo, "/"); !ok {
 		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
 	}
-	vm, err := b.Warm(ctx, b.cfg.Tart.BaseImage, id)
+	cfg := b.configSnapshot()
+	jobsPerVM := normalizedJobsPerVM(cfg)
+	vm, err := b.Warm(ctx, cfg.Tart.BaseImage, id, jobsPerVM)
 	if err != nil {
 		return err
 	}
 	defer b.Teardown(ctx, vm)
-	jobsPerVM := normalizedJobsPerVM(b.cfg)
 	return b.RunJob(ctx, vm, repo, vm.Name, 0, jobsPerVM)
 }
 
@@ -419,23 +438,30 @@ func normalizedJobsPerVM(cfg *config.Config) int {
 	return cfg.JobsPerVM
 }
 
+func normalizeSlotCount(slotCount int) int {
+	if slotCount < 1 {
+		return 1
+	}
+	return slotCount
+}
+
 // bootCommand builds the headless boot command with the cache dir mounted.
-func (b *Binder) bootCommand(ctx context.Context, vmName string) *exec.Cmd {
+func (b *Binder) bootCommand(ctx context.Context, cfg *config.Config, vmName string) *exec.Cmd {
 	var dirs []tart.DirMount
-	if b.cfg.Tart.CacheDir != "" {
+	if cfg.Tart.CacheDir != "" {
 		// tart --dir requires the host path to exist, so create it before the
 		// mount. MkdirAll is idempotent and cheap on the warm path.
-		if err := os.MkdirAll(b.cfg.Tart.CacheDir, 0o700); err != nil {
-			slog.WarnContext(ctx, "create cache dir failed; booting without cache mount", "err", err, "dir", b.cfg.Tart.CacheDir)
+		if err := os.MkdirAll(cfg.Tart.CacheDir, 0o700); err != nil {
+			slog.WarnContext(ctx, "create cache dir failed; booting without cache mount", "err", err, "dir", cfg.Tart.CacheDir)
 		} else {
 			// Chmod after MkdirAll: MkdirAll applies 0700 only to dirs it
 			// creates, so tighten an existing looser dir too. The build cache
 			// can hold proprietary source and artifacts, so keep it private to
 			// the owner on a multi-user host.
-			if err := os.Chmod(b.cfg.Tart.CacheDir, 0o700); err != nil {
-				slog.WarnContext(ctx, "chmod cache dir failed; continuing with existing perms", "err", err, "dir", b.cfg.Tart.CacheDir)
+			if err := os.Chmod(cfg.Tart.CacheDir, 0o700); err != nil {
+				slog.WarnContext(ctx, "chmod cache dir failed; continuing with existing perms", "err", err, "dir", cfg.Tart.CacheDir)
 			}
-			dirs = []tart.DirMount{{Name: "cache", Path: b.cfg.Tart.CacheDir}}
+			dirs = []tart.DirMount{{Name: "cache", Path: cfg.Tart.CacheDir}}
 		}
 	}
 	return b.vm.BootCommand(ctx, vmName, tart.BootOptions{NoGraphics: true, Dirs: dirs})
@@ -443,6 +469,7 @@ func (b *Binder) bootCommand(ctx context.Context, vmName string) *exec.Cmd {
 
 // generateJIT mints the repo-scoped JIT config for one job.
 func (b *Binder) generateJIT(ctx context.Context, owner, repoName, runnerName string) (*ghapp.JITConfig, error) {
+	cfg := b.configSnapshot()
 	installationID, err := b.gh.InstallationID(ctx, owner, repoName)
 	if err != nil {
 		slog.ErrorContext(ctx, "installation lookup failed", "err", err, "repo", owner+"/"+repoName)
@@ -453,7 +480,7 @@ func (b *Binder) generateJIT(ctx context.Context, owner, repoName, runnerName st
 		slog.ErrorContext(ctx, "installation token failed", "err", err, "repo", owner+"/"+repoName)
 		return nil, fmt.Errorf("broker: installation token: %w", err)
 	}
-	jit, err := b.gh.GenerateJITConfig(ctx, token, owner, repoName, runnerName, b.cfg.Labels)
+	jit, err := b.gh.GenerateJITConfig(ctx, token, owner, repoName, runnerName, cfg.Labels)
 	if err != nil {
 		slog.ErrorContext(ctx, "generate jitconfig failed", "err", err, "repo", owner+"/"+repoName)
 		return nil, fmt.Errorf("broker: generate jitconfig: %w", err)

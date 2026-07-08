@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
@@ -27,6 +29,31 @@ type testPool struct {
 	cancelled  []int64
 	snapshot   runnerpool.Snapshot
 	workers    []runnerpool.WorkerView
+}
+
+type blockingWebhookBody struct {
+	body        []byte
+	readStarted chan struct{}
+	release     chan struct{}
+	once        sync.Once
+	offset      int
+}
+
+func (b *blockingWebhookBody) Read(p []byte) (int, error) {
+	b.once.Do(func() {
+		close(b.readStarted)
+		<-b.release
+	})
+	if b.offset >= len(b.body) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.body[b.offset:])
+	b.offset += n
+	return n, nil
+}
+
+func (b *blockingWebhookBody) Close() error {
+	return nil
 }
 
 func (p *testPool) Enqueue(_ context.Context, job runnerpool.Job) error {
@@ -324,6 +351,58 @@ func TestWebhookQueuedWithUnresolvedDefaultImageReturns204(t *testing.T) {
 	}
 	if got := len(pool.Jobs()); got != 0 {
 		t.Fatalf("enqueued jobs = %d, want 0", got)
+	}
+}
+
+func TestWebhookUsesSingleConfigSnapshotDuringRequest(t *testing.T) {
+	pool := &testPool{}
+	allowed := []*net.IPNet{mustParseCIDR(t, "192.30.252.0/22")}
+	srv := New(testSecret, newTestConfig(), nil, allowed, pool)
+	body := webhookBodyWithJobID("queued", "owner/repo", []string{"self-hosted"}, 7, 1007)
+	blockingBody := &blockingWebhookBody{
+		body:        body,
+		readStarted: make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webhook", nil)
+	req.Body = blockingBody
+	req.Header.Set("X-Hub-Signature-256", signBody(body))
+	req.Header.Set("CF-Connecting-IP", "192.30.252.1")
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.ServeHTTP(w, req)
+	}()
+
+	select {
+	case <-blockingBody.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("webhook body read did not start")
+	}
+
+	reloadedConfig := newTestConfig()
+	reloadedConfig.Labels = []string{"other-label"}
+	srv.Reconfigure([]byte("rotated-secret"), reloadedConfig, nil, []*net.IPNet{mustParseCIDR(t, "10.0.0.0/8")})
+	close(blockingBody.release)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("webhook request did not finish")
+	}
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", w.Code)
+	}
+	jobs := pool.Jobs()
+	if len(jobs) != 1 {
+		t.Fatalf("enqueued jobs = %+v, want one", jobs)
+	}
+	want := runnerpool.Job{Repo: "owner/repo", JobID: 1007, RunID: 7}
+	if jobs[0] != want {
+		t.Fatalf("enqueued job = %+v, want %+v", jobs[0], want)
 	}
 }
 

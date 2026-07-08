@@ -676,6 +676,8 @@ func runServe(ctx context.Context, args []string) error {
 		*configPath = config.DefaultConfigPath()
 	}
 
+	initialConfigModTime := configInitialModTime(ctx, *configPath)
+
 	cfg, gh, err := loadDeps(ctx, *configPath)
 	if err != nil {
 		return err
@@ -712,6 +714,13 @@ func runServe(ctx context.Context, args []string) error {
 	defer stop()
 
 	startServeLoops(ctx, stop, cfg, gh, binder, p)
+	startConfigReloadWatcher(ctx, configReloadWatcherOptions{
+		path:           *configPath,
+		initialModTime: initialConfigModTime,
+		apply: func(reloadCtx context.Context, reloadedConfig *config.Config) error {
+			return applyReloadedConfig(reloadCtx, reloadedConfig, binder, p, srv)
+		},
+	})
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -772,7 +781,11 @@ func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBin
 	if err != nil {
 		return nil, err
 	}
-	return runnerpool.New(runnerpool.Options{
+	return runnerpool.New(runnerPoolOptionsFromConfig(cfg, runToken, time.Now), binder, binder, github, binder), nil
+}
+
+func runnerPoolOptionsFromConfig(cfg *config.Config, runToken string, now func() time.Time) runnerpool.Options {
+	return runnerpool.Options{
 		RunnerCount:    cfg.RunnerCount,
 		JobsPerVM:      cfg.JobsPerVM,
 		Image:          cfg.Tart.BaseImage,
@@ -784,8 +797,56 @@ func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBin
 		StallReap:      cfg.StallReap,
 		RunToken:       runToken,
 		WarmRetryDelay: 0,
-		Now:            time.Now,
-	}, binder, binder, github, binder), nil
+		Now:            now,
+	}
+}
+
+func configInitialModTime(ctx context.Context, path string) time.Time {
+	info, err := os.Stat(path)
+	if err != nil {
+		slog.WarnContext(ctx, "config watch initial stat failed; watcher will initialize on first poll", "err", err, "path", path)
+		return time.Time{}
+	}
+	return info.ModTime()
+}
+
+func applyReloadedConfig(ctx context.Context, cfg *config.Config, binder *broker.Binder, p *runnerpool.Pool, srv *server.Server) error {
+	secret, err := cfg.ReadWebhookSecret()
+	if err != nil {
+		slog.ErrorContext(ctx, "config reload read webhook secret failed", "err", err)
+		return fmt.Errorf("read webhook secret: %w", err)
+	}
+	capacityToken, err := cfg.ReadCapacityToken()
+	if err != nil {
+		slog.ErrorContext(ctx, "config reload read capacity token failed", "err", err)
+		return fmt.Errorf("read capacity token: %w", err)
+	}
+	webhookCIDRs, err := cfg.ReadWebhookCIDRs()
+	if err != nil {
+		slog.ErrorContext(ctx, "config reload read webhook CIDRs failed", "err", err)
+		return fmt.Errorf("read webhook CIDRs: %w", err)
+	}
+	binder.Reconfigure(cfg)
+	p.Reconfigure(runnerPoolOptionsFromConfig(cfg, "", nil))
+	srv.Reconfigure(secret, cfg, capacityToken, webhookCIDRs)
+	appliedRunnerCount := p.Snapshot().RunnerCount
+	if cfg.RunnerCount != appliedRunnerCount {
+		slog.InfoContext(
+			ctx,
+			"config reload applied",
+			"runner_count",
+			appliedRunnerCount,
+			"requested_runner_count",
+			cfg.RunnerCount,
+			"runner_count_note",
+			"restart required",
+			"jobs_per_vm",
+			cfg.JobsPerVM,
+		)
+		return nil
+	}
+	slog.InfoContext(ctx, "config reload applied", "runner_count", appliedRunnerCount, "jobs_per_vm", cfg.JobsPerVM)
+	return nil
 }
 
 func newRunToken(ctx context.Context) (string, error) {
