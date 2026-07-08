@@ -358,7 +358,7 @@ func printUpdateCheckResult(stdout io.Writer, result selfupdate.CheckResult) {
 func runInstall(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	configPath := fs.String("config", config.DefaultConfigPath(), "path to broker config TOML")
-	binPath := fs.String("bin", "", "path to the installed broker binary")
+	binPath := fs.String("bin", "", "path to the installed broker binary (default $HOME/.local/bin/gha-mac-broker)")
 	if err := fs.Parse(args); err != nil {
 		slog.ErrorContext(ctx, "install flag parse failed", "err", err)
 		return fmt.Errorf("install flags: %w", err)
