@@ -939,7 +939,8 @@ func TestStatusReportsBusyWorkerActualSlotsUntilIdleResize(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	warmer := newFakeWarmer()
 	runner := newBlockingRunner(2)
-	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, newFakeGitHub(), nil)
+	prober := newFakeActiveJobProber(map[string]bool{})
+	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, newFakeGitHub(), prober)
 	ctx := startTestPool(t, pool)
 	waitFor(t, pool.Ready)
 	firstVM := warmer.WarmNames()[0]
@@ -951,6 +952,7 @@ func TestStatusReportsBusyWorkerActualSlotsUntilIdleResize(t *testing.T) {
 	if first.SlotCount != 2 {
 		t.Fatalf("first slot count = %d, want 2", first.SlotCount)
 	}
+	prober.SetActive(firstVM, first.SlotIndex, first.SlotCount, true)
 
 	pool.Reconfigure(testOptionsWithSlots(clock, 1, 1))
 	if err := pool.Reconcile(ctx); err != nil {
@@ -963,6 +965,15 @@ func TestStatusReportsBusyWorkerActualSlotsUntilIdleResize(t *testing.T) {
 	}
 	if len(workers[0].Slots) != 2 {
 		t.Fatalf("busy worker status slots = %+v, want 2 actual slots", workers[0].Slots)
+	}
+	activeSlot := workers[0].Slots[first.SlotIndex]
+	if activeSlot.ActiveJob == nil || !*activeSlot.ActiveJob {
+		t.Fatalf("busy worker active job = %v, want true", activeSlot.ActiveJob)
+	}
+	calls := prober.Calls()
+	expectedCall := probeKey(firstVM, first.SlotIndex, first.SlotCount)
+	if len(calls) != 1 || calls[0] != expectedCall {
+		t.Fatalf("prober calls = %v, want [%s]", calls, expectedCall)
 	}
 	if torn := warmer.TornNames(); len(torn) != 0 {
 		t.Fatalf("busy worker teardowns = %v, want none", torn)
