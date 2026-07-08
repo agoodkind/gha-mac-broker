@@ -77,18 +77,25 @@ func (p *Pool) warnAndRequestBusyRecycle(ctx context.Context, candidate busyCand
 }
 
 func (p *Pool) maybeWarnStalledBusyWorker(ctx context.Context, candidate busyCandidate, bindAge time.Duration, cpuStalledSince time.Time, cpuActivity float64) {
+	stallTimeout, stallReap := p.stallReapOptionsSnapshot()
 	stalledFor := candidate.now.Sub(cpuStalledSince)
-	if stalledFor < p.options.StallTimeout {
+	if stalledFor < stallTimeout {
 		return
 	}
 	if !p.claimSlotStallWarning(candidate) {
 		return
 	}
 	slog.WarnContext(ctx, "runnerpool worker stalled (no cpu progress)", "vm", candidate.vm.Name, "run_id", candidate.runID, "job_id", candidate.jobID, "slot", candidate.slotIndex, "bind_age_seconds", int64(bindAge.Seconds()), "stalled_for_seconds", int64(stalledFor.Seconds()), "cpu_percent", cpuActivity)
-	if !p.options.StallReap {
+	if !stallReap {
 		return
 	}
 	p.requestBusyRecycle(candidate)
+}
+
+func (p *Pool) stallReapOptionsSnapshot() (time.Duration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.options.StallTimeout, p.options.StallReap
 }
 
 func (p *Pool) observeSlotCPU(candidate busyCandidate, cpuActivity float64, now time.Time) (time.Time, bool) {

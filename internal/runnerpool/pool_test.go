@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sort"
 	"strings"
@@ -783,7 +784,7 @@ func TestWarmWorkerPassesConfiguredSlotCount(t *testing.T) {
 	}
 }
 
-func TestReconfigureAppliesScalarsAndKeepsRunnerCount(t *testing.T) {
+func TestReconfigureAppliesScalarsAndKeepsRunnerCountAndImage(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	pool := New(testOptionsWithSlots(clock, 2, 1), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
 	var logs strings.Builder
@@ -801,6 +802,8 @@ func TestReconfigureAppliesScalarsAndKeepsRunnerCount(t *testing.T) {
 		MaxAge:         6 * time.Hour,
 		MaxBind:        7 * time.Minute,
 		PickupTimeout:  90 * time.Second,
+		StallTimeout:   4 * time.Minute,
+		StallReap:      true,
 		RunToken:       "",
 		WarmRetryDelay: 25 * time.Millisecond,
 		Now:            nil,
@@ -815,8 +818,8 @@ func TestReconfigureAppliesScalarsAndKeepsRunnerCount(t *testing.T) {
 	if pool.options.JobsPerVM != 3 {
 		t.Fatalf("jobs per vm = %d, want 3", pool.options.JobsPerVM)
 	}
-	if pool.options.Image != "image-b" {
-		t.Fatalf("image = %q, want image-b", pool.options.Image)
+	if pool.options.Image != "image-a" {
+		t.Fatalf("image = %q, want preserved image-a", pool.options.Image)
 	}
 	if pool.options.RunToken != "test" {
 		t.Fatalf("run token = %q, want preserved test", pool.options.RunToken)
@@ -836,11 +839,20 @@ func TestReconfigureAppliesScalarsAndKeepsRunnerCount(t *testing.T) {
 	if pool.options.PickupTimeout != 90*time.Second {
 		t.Fatalf("pickup timeout = %s, want 90s", pool.options.PickupTimeout)
 	}
+	if pool.options.StallTimeout != 4*time.Minute {
+		t.Fatalf("stall timeout = %s, want 4m", pool.options.StallTimeout)
+	}
+	if !pool.options.StallReap {
+		t.Fatal("stall reap = false, want true")
+	}
 	if pool.options.WarmRetryDelay != 25*time.Millisecond {
 		t.Fatalf("warm retry delay = %s, want 25ms", pool.options.WarmRetryDelay)
 	}
 	if !strings.Contains(logs.String(), "runner_count change requires restart") {
 		t.Fatalf("logs = %q, want runner_count restart warning", logs.String())
+	}
+	if !strings.Contains(logs.String(), "image change requires restart") {
+		t.Fatalf("logs = %q, want image restart warning", logs.String())
 	}
 	if !strings.Contains(logs.String(), "runnerpool reconfigured") {
 		t.Fatalf("logs = %q, want reconfigured info", logs.String())
@@ -1615,6 +1627,89 @@ func TestReconcileLogsStalledBusyWorkerWhenStallReapDisabled(t *testing.T) {
 	if !strings.Contains(logs.String(), "runnerpool worker stalled (no cpu progress)") {
 		t.Fatalf("logs = %q, want stalled worker warning", logs.String())
 	}
+}
+
+func TestMaybeWarnStalledBusyWorkerSnapshotsOptionsDuringReconfigure(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Nanosecond
+	options.StallTimeout = time.Nanosecond
+	options.StallReap = true
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
+
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+
+	boundAt := now.Add(-time.Minute)
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), boundAt, 1001, 42, nil)
+	pool.states[0].slots[0].cpuStalledSince = now.Add(-time.Minute)
+	pool.mu.Unlock()
+
+	const iterationCount = 500
+	start := make(chan struct{})
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(2)
+
+	go func() {
+		defer waitGroup.Done()
+		<-start
+		for i := range iterationCount {
+			nextOptions := options
+			if i%2 == 0 {
+				nextOptions.StallTimeout = time.Nanosecond
+				nextOptions.StallReap = true
+			} else {
+				nextOptions.StallTimeout = time.Hour
+				nextOptions.StallReap = false
+			}
+			pool.Reconfigure(nextOptions)
+		}
+	}()
+
+	go func() {
+		defer waitGroup.Done()
+		<-start
+		for i := range iterationCount {
+			currentBoundAt := boundAt.Add(time.Duration(i) * time.Nanosecond)
+			currentJobID := int64(1001 + i)
+			currentRunID := int64(42 + i)
+
+			pool.mu.Lock()
+			pool.states[0].recycle = false
+			pool.states[0].slots[0] = slotState{
+				boundAt:         currentBoundAt,
+				busy:            true,
+				jobID:           currentJobID,
+				runID:           currentRunID,
+				jobCancel:       nil,
+				cpuStalledSince: now.Add(-time.Minute),
+				stallWarnedAt:   time.Time{},
+				reapWarnedAt:    time.Time{},
+				lastErr:         nil,
+			}
+			pool.mu.Unlock()
+
+			candidate := busyCandidate{
+				index:     0,
+				slotIndex: 0,
+				slotCount: 1,
+				vm:        &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+				boundAt:   currentBoundAt,
+				jobID:     currentJobID,
+				runID:     currentRunID,
+				now:       now,
+			}
+			pool.maybeWarnStalledBusyWorker(context.Background(), candidate, time.Minute, now.Add(-time.Minute), 0)
+		}
+	}()
+
+	close(start)
+	waitGroup.Wait()
 }
 
 func TestReconcileKeepsProgressingBusyWorkerPastStallTimeout(t *testing.T) {

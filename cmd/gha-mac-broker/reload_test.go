@@ -90,6 +90,42 @@ func TestConfigReloadWatcherKeepsCurrentConfigAfterInvalidReload(t *testing.T) {
 	}
 }
 
+func TestConfigReloadWatcherDropsPendingReloadWithoutApplyCallback(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	writeReloadConfig(t, configPath, 1)
+	initialModTime := time.Date(2026, 7, 7, 11, 0, 0, 0, time.UTC)
+	setReloadConfigModTime(t, configPath, initialModTime)
+
+	loadCount := 0
+	watcher := newConfigReloadWatcher(configReloadWatcherOptions{
+		path:           configPath,
+		initialModTime: initialModTime,
+		load: func(path string) (*config.Config, error) {
+			loadCount++
+			return config.Load(path)
+		},
+		apply: nil,
+	})
+
+	changedModTime := initialModTime.Add(time.Minute)
+	writeReloadConfig(t, configPath, 2)
+	setReloadConfigModTime(t, configPath, changedModTime)
+	watcher.poll(context.Background())
+	watcher.poll(context.Background())
+	watcher.poll(context.Background())
+
+	if loadCount != 1 {
+		t.Fatalf("load count = %d, want 1", loadCount)
+	}
+	if !watcher.appliedModTime.Equal(changedModTime) {
+		t.Fatalf("applied mod time = %v, want %v", watcher.appliedModTime, changedModTime)
+	}
+	if watcher.hasPending {
+		t.Fatal("has pending = true, want false")
+	}
+}
+
 func writeReloadConfig(t *testing.T, path string, jobsPerVM int) {
 	t.Helper()
 	body := fmt.Sprintf(`

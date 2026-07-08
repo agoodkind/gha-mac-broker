@@ -116,6 +116,9 @@ func (w *configReloadWatcher) poll(ctx context.Context) {
 	}
 	if w.apply == nil {
 		w.log.ErrorContext(ctx, "config reload failed; keeping current config", "err", "missing apply callback", "path", w.path)
+		w.appliedModTime = modTime
+		w.pendingModTime = time.Time{}
+		w.hasPending = false
 		return
 	}
 	if err := w.apply(ctx, cfg); err != nil {

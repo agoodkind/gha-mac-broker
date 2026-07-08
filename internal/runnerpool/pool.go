@@ -186,7 +186,7 @@ func New(options Options, warmer Warmer, runner Runner, github RunnerLister, pro
 func (p *Pool) Reconfigure(newOptions Options) {
 	preserveNow := newOptions.Now == nil
 	preserveRunToken := newOptions.RunToken == ""
-	preserveImage := newOptions.Image == ""
+	requestedImage := newOptions.Image
 	newOptions = normalizeOptions(newOptions)
 	requestedRunnerCount := newOptions.RunnerCount
 
@@ -198,9 +198,8 @@ func (p *Pool) Reconfigure(newOptions Options) {
 	if preserveRunToken {
 		newOptions.RunToken = oldOptions.RunToken
 	}
-	if preserveImage {
-		newOptions.Image = oldOptions.Image
-	}
+	imageChanged := requestedImage != "" && requestedImage != oldOptions.Image
+	newOptions.Image = oldOptions.Image
 	runnerCountChanged := newOptions.RunnerCount != oldOptions.RunnerCount
 	if runnerCountChanged {
 		newOptions.RunnerCount = oldOptions.RunnerCount
@@ -227,6 +226,13 @@ func (p *Pool) Reconfigure(newOptions Options) {
 			"runnerpool reconfigure: runner_count change requires restart; keeping current",
 			"old_runner_count", oldOptions.RunnerCount,
 			"new_runner_count", requestedRunnerCount,
+		)
+	}
+	if imageChanged {
+		slog.Warn(
+			"runnerpool reconfigure: image change requires restart; keeping current",
+			"old_image", oldOptions.Image,
+			"new_image", requestedImage,
 		)
 	}
 	slog.Info(
