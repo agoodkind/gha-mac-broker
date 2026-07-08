@@ -23,12 +23,21 @@ type warmCall struct {
 	SlotCount int
 }
 
+type adoptCall struct {
+	Image     string
+	SlotCount int
+	Limit     int
+}
+
 type fakeWarmer struct {
 	mu       sync.Mutex
 	calls    []warmCall
 	torn     []string
 	alive    map[string]bool
 	checkErr map[string]error
+	adopted  []broker.AdoptedVM
+	adopts   []adoptCall
+	adoptErr error
 	swept    int
 }
 
@@ -39,6 +48,9 @@ func newFakeWarmer() *fakeWarmer {
 		torn:     nil,
 		alive:    make(map[string]bool),
 		checkErr: make(map[string]error),
+		adopted:  nil,
+		adopts:   nil,
+		adoptErr: nil,
 		swept:    0,
 	}
 }
@@ -69,6 +81,25 @@ func (w *fakeWarmer) CheckAlive(_ context.Context, vm *broker.WarmVM) error {
 		return nil
 	}
 	return errors.New("vm is dead")
+}
+
+func (w *fakeWarmer) Adopt(_ context.Context, image string, slotCount int, limit int) ([]broker.AdoptedVM, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.adopts = append(w.adopts, adoptCall{Image: image, SlotCount: slotCount, Limit: limit})
+	if w.adoptErr != nil {
+		return nil, w.adoptErr
+	}
+	adopted := append([]broker.AdoptedVM(nil), w.adopted...)
+	if limit >= 0 && len(adopted) > limit {
+		adopted = adopted[:limit]
+	}
+	for _, adoptedVM := range adopted {
+		if adoptedVM.VM != nil {
+			w.alive[adoptedVM.VM.Name] = true
+		}
+	}
+	return adopted, nil
 }
 
 func (w *fakeWarmer) SweepOrphans(_ context.Context) {
@@ -109,6 +140,18 @@ func (w *fakeWarmer) SetCheckError(vmName string, err error) {
 	w.checkErr[vmName] = err
 }
 
+func (w *fakeWarmer) SetAdopted(adopted []broker.AdoptedVM) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.adopted = append([]broker.AdoptedVM(nil), adopted...)
+}
+
+func (w *fakeWarmer) AdoptCalls() []adoptCall {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]adoptCall(nil), w.adopts...)
+}
+
 type runCall struct {
 	Repo       string
 	RunnerName string
@@ -147,7 +190,7 @@ func newBlockingRunner(buffer int) *fakeRunner {
 	return runner
 }
 
-func (r *fakeRunner) RunJob(ctx context.Context, vm *broker.WarmVM, repo string, runnerName string, slotIndex int, slotCount int) error {
+func (r *fakeRunner) RunJob(ctx context.Context, vm *broker.WarmVM, repo string, runnerName string, slotIndex int, slotCount int, _ int64, _ int64, _ time.Time) error {
 	call := runCall{
 		Repo:       repo,
 		RunnerName: runnerName,
@@ -2393,7 +2436,238 @@ func TestReconcileSkipsRegistrationLeakCheckWhenInstalledRepoListingFails(t *tes
 	}
 }
 
-func TestShutdownTearsDownAllWorkerVMs(t *testing.T) {
+func TestStartAdoptsRunningVMsBeforeWarming(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	warmer.SetAdopted([]broker.AdoptedVM{
+		{
+			VM:    &broker.WarmVM{Name: "vm-adopted", Image: "image-a"},
+			Slots: nil,
+		},
+	})
+	runner := newFakeRunner(1)
+	pool := New(testOptions(clock, 2), warmer, runner, newFakeGitHub(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool.Start(ctx)
+	waitFor(t, func() bool {
+		return len(warmer.WarmNames()) == 1
+	})
+
+	adoptCalls := warmer.AdoptCalls()
+	if len(adoptCalls) != 1 {
+		t.Fatalf("adopt calls = %v, want one call", adoptCalls)
+	}
+	if adoptCalls[0].Image != "image-a" || adoptCalls[0].SlotCount != 1 || adoptCalls[0].Limit != 2 {
+		t.Fatalf("adopt call = %+v, want image-a slotCount 1 limit 2", adoptCalls[0])
+	}
+	if got := len(warmer.WarmNames()); got != 1 {
+		t.Fatalf("warm calls = %d, want 1 replacement for the unadopted slot", got)
+	}
+	_, workers := pool.Status(context.Background())
+	if len(workers) != 2 {
+		t.Fatalf("workers = %+v, want 2", workers)
+	}
+	if workers[0].VM != "vm-adopted" {
+		t.Fatalf("first worker vm = %q, want vm-adopted", workers[0].VM)
+	}
+}
+
+func TestInstallAdoptedWorkersSkipsNilEntriesAndBoundsByInstalledVMs(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	pool := New(testOptions(clock, 2), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
+	adopted := []broker.AdoptedVM{
+		{VM: nil},
+		{VM: &broker.WarmVM{Name: "vm-a", Image: "image-a"}},
+		{VM: &broker.WarmVM{Name: "vm-b", Image: "image-a"}},
+		{VM: &broker.WarmVM{Name: "vm-c", Image: "image-a"}},
+	}
+
+	pool.mu.Lock()
+	pool.installAdoptedWorkersLocked(adopted)
+	pool.mu.Unlock()
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].vm == nil || pool.states[0].vm.Name != "vm-a" {
+		t.Fatalf("state 0 vm = %+v, want vm-a", pool.states[0].vm)
+	}
+	if pool.states[1].vm == nil || pool.states[1].vm.Name != "vm-b" {
+		t.Fatalf("state 1 vm = %+v, want vm-b", pool.states[1].vm)
+	}
+}
+
+func TestStartReAdoptsBusySlotAcrossRestart(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	warmer := newFakeWarmer()
+	warmer.SetAdopted([]broker.AdoptedVM{
+		{
+			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+			Slots: []broker.SlotBinding{
+				{
+					SlotIndex: 0,
+					Repo:      "owner/repo",
+					JobID:     1001,
+					RunID:     42,
+					BoundAt:   now.Add(-time.Minute),
+				},
+			},
+		},
+	})
+	runner := newFakeRunner(1)
+	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool.Start(ctx)
+	waitFor(t, func() bool {
+		snapshot := pool.Snapshot()
+		return snapshot.Busy == 1 && snapshot.Idle == 0 && snapshot.Queued == 0
+	})
+
+	_, workers := pool.Status(context.Background())
+	if len(workers) != 1 {
+		t.Fatalf("workers = %+v, want 1", workers)
+	}
+	worker := workers[0]
+	if worker.VM != "vm-busy" || worker.Phase != "busy" || worker.RunID != 42 {
+		t.Fatalf("worker = %+v, want adopted busy vm with run 42", worker)
+	}
+	if got := len(warmer.WarmNames()); got != 0 {
+		t.Fatalf("warm calls = %d, want 0 while adopted busy vm occupies the slot", got)
+	}
+}
+
+func TestInstallAdoptedWorkersPreservesValidBusyBindingAndIgnoresIncompleteBinding(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	pool := New(testOptionsWithSlots(clock, 1, 2), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
+	boundAt := now.Add(-time.Minute)
+
+	pool.mu.Lock()
+	pool.installAdoptedWorkersLocked([]broker.AdoptedVM{
+		{
+			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+			Slots: []broker.SlotBinding{
+				{
+					SlotIndex: 0,
+					Repo:      "owner/repo",
+					JobID:     1001,
+					RunID:     42,
+					BoundAt:   boundAt,
+				},
+				{
+					SlotIndex: 1,
+					Repo:      "owner/repo",
+					JobID:     0,
+					RunID:     43,
+					BoundAt:   boundAt,
+				},
+			},
+		},
+	})
+	pool.mu.Unlock()
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	slot := pool.states[0].slots[0]
+	if !slot.busy || slot.jobID != 1001 || slot.runID != 42 || !slot.boundAt.Equal(boundAt) {
+		t.Fatalf("slot 0 = %+v, want busy job 1001 run 42 bound at %s", slot, boundAt)
+	}
+	incompleteSlot := pool.states[0].slots[1]
+	if incompleteSlot.busy || incompleteSlot.jobID != 0 || incompleteSlot.runID != 0 {
+		t.Fatalf("slot 1 = %+v, want idle because binding is incomplete", incompleteSlot)
+	}
+}
+
+func TestReconcileKeepsAdoptedBusySlotWithActiveJob(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	warmer := newFakeWarmer()
+	runner := newFakeRunner(1)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
+	pool := New(options, warmer, runner, newFakeGitHub(), prober)
+	pool.mu.Lock()
+	pool.started = true
+	pool.states[0] = workerState{
+		vm:        &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+		bornAt:    now.Add(-time.Hour),
+		idleSince: time.Time{},
+		warming:   false,
+		recycle:   false,
+		slots: []slotState{
+			{
+				boundAt: now.Add(-2 * time.Minute),
+				busy:    true,
+				jobID:   1001,
+				runID:   42,
+				adopted: true,
+			},
+		},
+	}
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if torn := warmer.TornNames(); len(torn) != 0 {
+		t.Fatalf("torn VMs = %v, want none while active job is running", torn)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if !pool.states[0].slots[0].busy {
+		t.Fatal("adopted slot busy = false, want true while active job is running")
+	}
+	if pool.states[0].recycle {
+		t.Fatal("adopted worker recycle = true, want false while active job is running")
+	}
+}
+
+func TestReconcileRecyclesAdoptedBusySlotAfterActiveJobStops(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	warmer := newFakeWarmer()
+	runner := newFakeRunner(1)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
+	warmer.SetAdopted([]broker.AdoptedVM{
+		{
+			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+			Slots: []broker.SlotBinding{
+				{
+					SlotIndex: 0,
+					Repo:      "owner/repo",
+					JobID:     1001,
+					RunID:     42,
+					BoundAt:   now.Add(-2 * time.Minute),
+				},
+			},
+		},
+	})
+	pool := New(options, warmer, runner, newFakeGitHub(), prober)
+	ctx := startTestPool(t, pool)
+	waitFor(t, func() bool {
+		snapshot := pool.Snapshot()
+		return snapshot.Busy == 1 && snapshot.Idle == 0
+	})
+
+	if err := pool.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	waitFor(t, func() bool {
+		return len(warmer.WarmNames()) == 1
+	})
+	torn := warmer.TornNames()
+	if len(torn) != 1 || torn[0] != "vm-busy" {
+		t.Fatalf("torn VMs = %v, want [vm-busy]", torn)
+	}
+}
+
+func TestShutdownReleasesWorkerVMsWithoutTeardown(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	warmer := newFakeWarmer()
 	runner := newFakeRunner(1)
@@ -2408,10 +2682,7 @@ func TestShutdownTearsDownAllWorkerVMs(t *testing.T) {
 	pool.Shutdown(shutdownCtx)
 
 	torn := warmer.TornNames()
-	sort.Strings(torn)
-	want := warmer.WarmNames()
-	sort.Strings(want)
-	if fmt.Sprint(torn) != fmt.Sprint(want) {
-		t.Fatalf("torn VMs = %v, want %v", torn, want)
+	if len(torn) != 0 {
+		t.Fatalf("torn VMs = %v, want none on control-plane shutdown", torn)
 	}
 }

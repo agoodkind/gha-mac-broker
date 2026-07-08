@@ -194,6 +194,7 @@ func emptySlotState() slotState {
 		cpuStalledSince: time.Time{},
 		stallWarnedAt:   time.Time{},
 		reapWarnedAt:    time.Time{},
+		adopted:         false,
 		lastErr:         nil,
 	}
 }

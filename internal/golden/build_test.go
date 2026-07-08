@@ -237,3 +237,13 @@ func TestInstallWatchdogWritesBothAssets(t *testing.T) {
 		}
 	}
 }
+
+func TestWatchdogDoesNotShutdownGuestOnStaleHeartbeat(t *testing.T) {
+	script := string(watchdogScript)
+	if strings.Contains(script, "/sbin/shutdown") {
+		t.Fatalf("watchdog script contains guest shutdown command:\n%s", script)
+	}
+	if !strings.Contains(script, "heartbeat stale") {
+		t.Fatalf("watchdog script = %q, want stale heartbeat diagnostic", script)
+	}
+}

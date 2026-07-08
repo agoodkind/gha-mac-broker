@@ -727,7 +727,7 @@ func runServe(ctx context.Context, args []string) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	startServeLoops(ctx, stop, cfg, gh, binder, p)
+	startServeLoops(ctx, stop, cfg, gh, p)
 	startConfigReloadWatcher(ctx, configReloadWatcherOptions{
 		path:           *configPath,
 		initialModTime: initialConfigModTime,
@@ -784,10 +784,6 @@ type runnerPoolBinder interface {
 	runnerpool.Warmer
 	runnerpool.Runner
 	runnerpool.ActiveJobProber
-}
-
-type orphanSweeper interface {
-	SweepOrphans(ctx context.Context)
 }
 
 func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBinder, github runnerpool.RunnerLister) (*runnerpool.Pool, error) {
@@ -872,10 +868,9 @@ func newRunToken(ctx context.Context) (string, error) {
 	return time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:]), nil
 }
 
-func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, sweeper orphanSweeper, p *runnerpool.Pool) {
+func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, p *runnerpool.Pool) {
 	startUpdateSchedulerInBackground(ctx, stop, slog.Default())
 	deleteStaleRunners(ctx, cfg, cleaner)
-	sweeper.SweepOrphans(ctx)
 	p.Start(ctx)
 	p.StartReconcile(ctx, 0)
 }

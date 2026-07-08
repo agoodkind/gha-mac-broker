@@ -273,7 +273,7 @@ func (b *Builder) cloneAndBoot(ctx context.Context, source, name string, insecur
 		slog.ErrorContext(ctx, "clone failed", "err", err, "vm", name, "source", source)
 		return nil, fmt.Errorf("golden: clone %s from %s: %w", name, source, err)
 	}
-	boot := b.vm.BootCommand(ctx, name, tart.BootOptions{NoGraphics: true, Dirs: nil})
+	boot := b.vm.BootCommand(ctx, name, tart.BootOptions{Dirs: nil, Detach: false, NoGraphics: true})
 	if err := boot.Start(); err != nil {
 		slog.ErrorContext(ctx, "boot failed", "err", err, "vm", name)
 		b.teardown(ctx, name)

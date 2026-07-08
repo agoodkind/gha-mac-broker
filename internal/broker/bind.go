@@ -9,11 +9,14 @@ package broker
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,8 +39,11 @@ const readinessInterval = 2 * time.Second
 const touchInterval = 10 * time.Second
 
 // heartbeatFile is the guest path the broker touches on a timer; the baked guest
-// watchdog self-terminates the VM when this file goes stale.
+// watchdog logs when this file goes stale.
 const heartbeatFile = "/tmp/gha-broker.alive"
+
+// slotBindingFilePrefix is the guest-side prefix for per-slot job metadata.
+const slotBindingFilePrefix = "/tmp/gha-broker-slot-"
 
 // runnerHome is where the golden image keeps the GitHub Actions runner.
 const runnerHome = "~/actions-runner"
@@ -74,6 +80,27 @@ type WarmVM struct {
 	boot  *exec.Cmd
 	// stopTouch ends the per-VM liveness touch loop on teardown.
 	stopTouch context.CancelFunc
+}
+
+// SlotBinding is the guest-persisted job binding for one VM slot.
+type SlotBinding struct {
+	SlotIndex      int       `json:"slot_index"`
+	Repo           string    `json:"repo"`
+	JobID          int64     `json:"job_id"`
+	RunID          int64     `json:"run_id"`
+	BoundAt        time.Time `json:"bound_at"`
+	ObservedActive bool      `json:"-"`
+}
+
+// HasJobMetadata reports whether a persisted binding names a GitHub job and run.
+func (binding SlotBinding) HasJobMetadata() bool {
+	return binding.JobID > 0 && binding.RunID > 0
+}
+
+// AdoptedVM is a running pool VM discovered during broker startup.
+type AdoptedVM struct {
+	VM    *WarmVM
+	Slots []SlotBinding
 }
 
 // Binder performs JIT runner binds against a warm VM substrate over vsock.
@@ -141,6 +168,7 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 		b.teardown(ctx, vmName)
 		return nil, fmt.Errorf("broker: boot %s: %w", vmName, err)
 	}
+	b.reapBootCommand(context.WithoutCancel(ctx), vmName, bootCmd)
 
 	if err := b.waitForReady(ctx, vmName); err != nil {
 		_ = bootCmd.Process.Kill()
@@ -154,8 +182,24 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 		return nil, err
 	}
 
-	// The touch loop outlives this call (the VM stays in the pool), so it runs
-	// on a context detached from ctx and is stopped explicitly in Teardown.
+	stopTouch := b.startTouchLoop(ctx, vmName)
+	return &WarmVM{Name: vmName, Image: image, boot: bootCmd, stopTouch: stopTouch}, nil
+}
+
+func (b *Binder) reapBootCommand(ctx context.Context, vmName string, bootCmd *exec.Cmd) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(ctx, "vm boot reaper panic recovered", "err", fmt.Errorf("panic: %v", r), "vm", vmName)
+			}
+		}()
+		if err := bootCmd.Wait(); err != nil {
+			slog.DebugContext(ctx, "vm boot process exited", "err", err, "vm", vmName)
+		}
+	}()
+}
+
+func (b *Binder) startTouchLoop(ctx context.Context, vmName string) context.CancelFunc {
 	touchCtx, stopTouch := context.WithCancel(context.WithoutCancel(ctx))
 	go func() {
 		defer func() {
@@ -165,8 +209,7 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 		}()
 		b.touchLoop(touchCtx, vmName)
 	}()
-
-	return &WarmVM{Name: vmName, Image: image, boot: bootCmd, stopTouch: stopTouch}, nil
+	return stopTouch
 }
 
 func (b *Binder) cloneRunnerSlots(ctx context.Context, vmName string, slotCount int) error {
@@ -183,11 +226,30 @@ func (b *Binder) cloneRunnerSlots(ctx context.Context, vmName string, slotCount 
 
 // RunJob mints a JIT config and runs one ephemeral GitHub Actions job on the
 // warm VM over vsock. runnerName is the runner registration name.
-func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName string, slotIndex int, slotCount int) error {
+func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName string, slotIndex int, slotCount int, jobID int64, runID int64, boundAt time.Time) (err error) {
 	owner, repoName, ok := strings.Cut(repo, "/")
 	if !ok {
 		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
 	}
+
+	binding := SlotBinding{
+		SlotIndex:      slotIndex,
+		Repo:           repo,
+		JobID:          jobID,
+		RunID:          runID,
+		BoundAt:        boundAt.UTC(),
+		ObservedActive: false,
+	}
+	if err := b.writeSlotBinding(ctx, vm.Name, binding); err != nil {
+		return err
+	}
+	jobCompleted := false
+	defer func() {
+		if runJobInterruptedByCancellation(ctx, err, jobCompleted) {
+			return
+		}
+		b.clearSlotBinding(context.WithoutCancel(ctx), vm.Name, slotIndex)
+	}()
 
 	jit, err := b.generateJIT(ctx, owner, repoName, runnerName)
 	if err != nil {
@@ -203,6 +265,7 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 			slog.ErrorContext(ctx, "job run failed", "err", err, "vm", vm.Name, "slot", slotIndex)
 			return fmt.Errorf("broker: run job on %s: %w", vm.Name, err)
 		}
+		jobCompleted = true
 		slog.InfoContext(ctx, "job complete", "repo", repo, "vm", vm.Name, "slot", slotIndex)
 		return nil
 	}
@@ -215,8 +278,73 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 		slog.ErrorContext(ctx, "job run failed", "err", err, "vm", vm.Name, "slot", slotIndex)
 		return fmt.Errorf("broker: run job on %s: %w", vm.Name, err)
 	}
+	jobCompleted = true
 	slog.InfoContext(ctx, "job complete", "repo", repo, "vm", vm.Name, "slot", slotIndex)
 	return nil
+}
+
+func runJobInterruptedByCancellation(ctx context.Context, err error, jobCompleted bool) bool {
+	if jobCompleted {
+		return false
+	}
+	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return true
+	}
+	return ctx.Err() != nil
+}
+
+func (b *Binder) writeSlotBinding(ctx context.Context, vmName string, binding SlotBinding) error {
+	data, err := json.Marshal(binding)
+	if err != nil {
+		return fmt.Errorf("broker: marshal slot binding: %w", err)
+	}
+	path := slotBindingPath(binding.SlotIndex)
+	remote := fmt.Sprintf("cat > %s <<'EOF'\n%s\nEOF\n", shellQuote(path), string(data))
+	if _, err := b.vm.Exec(ctx, vmName, "bash", "-lc", remote); err != nil {
+		slog.WarnContext(ctx, "slot binding write failed", "err", err, "vm", vmName, "slot", binding.SlotIndex)
+		return fmt.Errorf("broker: write slot binding on %s slot %d: %w", vmName, binding.SlotIndex, err)
+	}
+	return nil
+}
+
+func (b *Binder) clearSlotBinding(ctx context.Context, vmName string, slotIndex int) {
+	if _, err := b.vm.Exec(ctx, vmName, "rm", "-f", slotBindingPath(slotIndex)); err != nil {
+		slog.DebugContext(ctx, "slot binding clear failed", "err", err, "vm", vmName, "slot", slotIndex)
+	}
+}
+
+func (b *Binder) readSlotBinding(ctx context.Context, vmName string, slotIndex int) (SlotBinding, bool, error) {
+	var zero SlotBinding
+	path := shellQuote(slotBindingPath(slotIndex))
+	remote := fmt.Sprintf("if [[ -f %s ]]; then cat %s; fi", path, path)
+	out, err := b.vm.Exec(ctx, vmName, "bash", "-lc", remote)
+	if err != nil {
+		slog.WarnContext(ctx, "slot binding read failed", "err", err, "vm", vmName, "slot", slotIndex)
+		return zero, false, fmt.Errorf("broker: read slot binding on %s slot %d: %w", vmName, slotIndex, err)
+	}
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return zero, false, nil
+	}
+	var binding SlotBinding
+	if err := json.Unmarshal([]byte(trimmed), &binding); err != nil {
+		slog.WarnContext(ctx, "slot binding parse failed", "err", err, "vm", vmName, "slot", slotIndex)
+		return zero, false, fmt.Errorf("broker: parse slot binding on %s slot %d: %w", vmName, slotIndex, err)
+	}
+	if binding.SlotIndex != slotIndex {
+		err := fmt.Errorf("broker: slot binding index on %s = %d, want %d", vmName, binding.SlotIndex, slotIndex)
+		slog.WarnContext(ctx, "slot binding index mismatch", "err", err, "vm", vmName, "slot", slotIndex)
+		return zero, false, err
+	}
+	if !binding.HasJobMetadata() {
+		slog.WarnContext(ctx, "slot binding metadata incomplete; probing active job", "vm", vmName, "slot", slotIndex, "job_id", binding.JobID, "run_id", binding.RunID)
+		return zero, false, nil
+	}
+	return binding, true, nil
+}
+
+func slotBindingPath(slotIndex int) string {
+	return fmt.Sprintf("%s%d.json", slotBindingFilePrefix, slotIndex)
 }
 
 func runJobRemoteCommand(encodedJITConfig string, slotIndex int, slotCount int) string {
@@ -377,6 +505,112 @@ func (b *Binder) List(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
+// Adopt discovers already-running pool VMs and returns the subset this broker
+// should manage. It starts heartbeat refreshes for adopted VMs but does not
+// clone, delete, or rewrite runner-slot directories.
+func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit int) ([]AdoptedVM, error) {
+	entries, err := b.vm.ListVMs(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "list tart vms failed", "err", err)
+		return nil, fmt.Errorf("broker: list tart vms for adoption: %w", err)
+	}
+	cfg := b.configSnapshot()
+	prefix := cfg.Tart.VMNamePrefix + "-"
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name, prefix) {
+			continue
+		}
+		if !strings.EqualFold(entry.State, "running") {
+			continue
+		}
+		names = append(names, entry.Name)
+	}
+	sort.Strings(names)
+	type adoptionCandidate struct {
+		vm    *WarmVM
+		slots []SlotBinding
+	}
+	busyCandidates := make([]adoptionCandidate, 0, len(names))
+	idleCandidates := make([]adoptionCandidate, 0, len(names))
+	for _, name := range names {
+		vm := &WarmVM{Name: name, Image: image, boot: nil, stopTouch: nil}
+		if err := b.CheckAlive(ctx, vm); err != nil {
+			slog.WarnContext(ctx, "skip running vm adoption after liveness failure", "err", err, "vm", name)
+			continue
+		}
+		candidate := adoptionCandidate{
+			vm:    vm,
+			slots: b.adoptSlotBindings(ctx, vm, normalizedSlotCount(slotCount)),
+		}
+		if len(candidate.slots) > 0 {
+			busyCandidates = append(busyCandidates, candidate)
+			continue
+		}
+		idleCandidates = append(idleCandidates, candidate)
+	}
+	selected := make([]adoptionCandidate, 0, len(busyCandidates)+len(idleCandidates))
+	addCandidate := func(candidate adoptionCandidate) bool {
+		if limit >= 0 && len(selected) >= limit {
+			return false
+		}
+		selected = append(selected, candidate)
+		return true
+	}
+	for _, candidate := range busyCandidates {
+		addCandidate(candidate)
+	}
+	for _, candidate := range idleCandidates {
+		if addCandidate(candidate) {
+			continue
+		}
+		b.teardown(context.WithoutCancel(ctx), candidate.vm.Name)
+	}
+	adopted := make([]AdoptedVM, 0, len(selected))
+	for _, candidate := range selected {
+		candidate.vm.stopTouch = b.startTouchLoop(ctx, candidate.vm.Name)
+		adopted = append(adopted, AdoptedVM{
+			VM:    candidate.vm,
+			Slots: candidate.slots,
+		})
+	}
+	return adopted, nil
+}
+
+func (b *Binder) adoptSlotBindings(ctx context.Context, vm *WarmVM, slotCount int) []SlotBinding {
+	bindings := make([]SlotBinding, 0, slotCount)
+	for slotIndex := range slotCount {
+		binding, ok, err := b.readSlotBinding(ctx, vm.Name, slotIndex)
+		if err == nil && ok {
+			bindings = append(bindings, binding)
+			continue
+		}
+		active, err := b.HasActiveJob(ctx, vm, slotIndex, slotCount)
+		if err != nil {
+			slog.DebugContext(ctx, "active job probe failed during adoption", "err", err, "vm", vm.Name, "slot", slotIndex)
+			continue
+		}
+		if active {
+			bindings = append(bindings, SlotBinding{
+				SlotIndex:      slotIndex,
+				Repo:           "",
+				JobID:          0,
+				RunID:          0,
+				BoundAt:        time.Time{},
+				ObservedActive: true,
+			})
+		}
+	}
+	return bindings
+}
+
+func normalizedSlotCount(slotCount int) int {
+	if slotCount < 1 {
+		return 1
+	}
+	return slotCount
+}
+
 // DeleteGolden removes the derived golden for image from disk.
 func (b *Binder) DeleteGolden(ctx context.Context, image string) error {
 	goldenName := golden.NameForImage(image)
@@ -387,13 +621,10 @@ func (b *Binder) DeleteGolden(ctx context.Context, image string) error {
 	return nil
 }
 
-// SweepOrphans stops and deletes any leftover pool VMs from a previous broker
-// process. On a fresh start the pool owns no VMs, so every VM whose name carries
-// the pool prefix is an orphan (for example after a hard restart that skipped
-// graceful shutdown) and is torn down before the pool fills. The golden image is
-// named separately and never matches the prefix. Best effort: a list failure
-// aborts the sweep (its cause is logged by List), and teardown failures are
-// logged, not returned.
+// SweepOrphans stops and deletes leftover pool VMs. Startup no longer calls it:
+// the pool adopts live VMs instead so broker restarts do not kill jobs. This is
+// retained as a manual cleanup primitive for callers that explicitly want VM
+// teardown.
 func (b *Binder) SweepOrphans(ctx context.Context) {
 	names, err := b.vm.List(ctx)
 	if err != nil {
@@ -428,7 +659,7 @@ func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
 		return err
 	}
 	defer b.Teardown(ctx, vm)
-	return b.RunJob(ctx, vm, repo, vm.Name, 0, jobsPerVM)
+	return b.RunJob(ctx, vm, repo, vm.Name, 0, jobsPerVM, 0, 0, time.Time{})
 }
 
 func normalizedJobsPerVM(cfg *config.Config) int {
@@ -464,7 +695,7 @@ func (b *Binder) bootCommand(ctx context.Context, cfg *config.Config, vmName str
 			dirs = []tart.DirMount{{Name: "cache", Path: cfg.Tart.CacheDir}}
 		}
 	}
-	return b.vm.BootCommand(ctx, vmName, tart.BootOptions{NoGraphics: true, Dirs: dirs})
+	return b.vm.BootCommand(ctx, vmName, tart.BootOptions{NoGraphics: true, Detach: true, Dirs: dirs})
 }
 
 // generateJIT mints the repo-scoped JIT config for one job.
@@ -509,8 +740,8 @@ func (b *Binder) waitForReady(ctx context.Context, vmName string) error {
 }
 
 // touchLoop refreshes the guest liveness file over vsock on a timer until the
-// context is cancelled (at teardown). If the broker dies, touches stop, the file
-// goes stale, and the guest watchdog self-terminates the VM.
+// context is cancelled. If the broker dies, touches stop and the guest watchdog
+// logs the stale heartbeat without powering off the VM.
 func (b *Binder) touchLoop(ctx context.Context, vmName string) {
 	ticker := time.NewTicker(touchInterval)
 	defer ticker.Stop()
