@@ -15,6 +15,7 @@ import (
 
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
+	"goodkind.io/gha-mac-broker/internal/install"
 	"goodkind.io/go-makefile/selfupdate"
 )
 
@@ -76,6 +77,76 @@ func testServeConfig() *config.Config {
 		},
 		Labels: []string{"self-hosted", "macOS"},
 	}
+}
+
+func TestRunInstallDefaultsBinToHomeLocalBin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sourcePath := filepath.Join(t.TempDir(), "gha-mac-broker")
+	if err := os.WriteFile(sourcePath, []byte("broker binary"), 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+	capturedConfig := runInstallWithStubbedInstaller(t, sourcePath, nil)
+
+	wantBinPath := filepath.Join(home, ".local", "bin", "gha-mac-broker")
+	if capturedConfig.BinPath != wantBinPath {
+		t.Fatalf("bin path = %q, want %q", capturedConfig.BinPath, wantBinPath)
+	}
+	copiedBinary, err := os.ReadFile(wantBinPath)
+	if err != nil {
+		t.Fatalf("read copied binary: %v", err)
+	}
+	if string(copiedBinary) != "broker binary" {
+		t.Fatalf("copied binary = %q, want source content", string(copiedBinary))
+	}
+}
+
+func TestRunInstallHonorsExplicitBin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sourcePath := filepath.Join(t.TempDir(), "gha-mac-broker")
+	if err := os.WriteFile(sourcePath, []byte("broker binary"), 0o755); err != nil {
+		t.Fatalf("write source binary: %v", err)
+	}
+	explicitBinPath := filepath.Join(t.TempDir(), "custom-broker")
+	capturedConfig := runInstallWithStubbedInstaller(
+		t,
+		sourcePath,
+		[]string{"-bin", explicitBinPath},
+	)
+
+	if capturedConfig.BinPath != explicitBinPath {
+		t.Fatalf("bin path = %q, want explicit %q", capturedConfig.BinPath, explicitBinPath)
+	}
+	if _, err := os.Stat(explicitBinPath); err != nil {
+		t.Fatalf("stat explicit copied binary: %v", err)
+	}
+}
+
+func runInstallWithStubbedInstaller(t *testing.T, sourcePath string, args []string) install.Config {
+	t.Helper()
+	originalCurrentExecutable := currentExecutable
+	currentExecutable = func() (string, error) {
+		return sourcePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutable = originalCurrentExecutable
+	})
+
+	originalInstallBroker := installBroker
+	var capturedConfig install.Config
+	installBroker = func(_ context.Context, cfg install.Config) error {
+		capturedConfig = cfg
+		return nil
+	}
+	t.Cleanup(func() {
+		installBroker = originalInstallBroker
+	})
+
+	if err := runInstall(context.Background(), args); err != nil {
+		t.Fatalf("runInstall: %v", err)
+	}
+	return capturedConfig
 }
 
 func TestRunStatusUsesCapacityTokenAndListenPort(t *testing.T) {

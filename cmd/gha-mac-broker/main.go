@@ -64,6 +64,8 @@ const (
 	commandInstall     commandName = "install"
 	commandUninstall   commandName = "uninstall"
 	commandUpdate      commandName = "update"
+
+	brokerBinaryName = "gha-mac-broker"
 )
 
 type updateCommandName string
@@ -90,6 +92,8 @@ var (
 	checkUpdate            = selfupdate.Check
 	applyUpdate            = selfupdate.Apply
 	loadUpdateState        = selfupdate.LoadState
+	currentExecutable      = os.Executable
+	installBroker          = install.Install
 	restartManagedService  = install.Restart
 	runSelfUpdateScheduler = selfupdate.RunScheduler
 	statusHTTPClient       = &http.Client{Timeout: httpTimeout}
@@ -354,12 +358,11 @@ func printUpdateCheckResult(stdout io.Writer, result selfupdate.CheckResult) {
 func runInstall(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	configPath := fs.String("config", config.DefaultConfigPath(), "path to broker config TOML")
-	exe, err := os.Executable()
+	defaultBinPath, err := defaultInstallBinPath(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, "resolve executable failed", "err", err)
-		return fmt.Errorf("install: resolve executable: %w", err)
+		return err
 	}
-	binPath := fs.String("bin", exe, "path to the installed broker binary")
+	binPath := fs.String("bin", defaultBinPath, "path to the installed broker binary")
 	if err := fs.Parse(args); err != nil {
 		slog.ErrorContext(ctx, "install flag parse failed", "err", err)
 		return fmt.Errorf("install flags: %w", err)
@@ -368,7 +371,15 @@ func runInstall(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := install.Install(ctx, cfg); err != nil {
+	exe, err := currentExecutable()
+	if err != nil {
+		slog.ErrorContext(ctx, "resolve executable failed", "err", err)
+		return fmt.Errorf("install: resolve executable: %w", err)
+	}
+	if err := installRunningBinary(ctx, exe, cfg.BinPath); err != nil {
+		return err
+	}
+	if err := installBroker(ctx, cfg); err != nil {
 		return fmt.Errorf("run install: %w", err)
 	}
 	return nil
@@ -382,7 +393,7 @@ func runUninstall(ctx context.Context, args []string) error {
 		slog.ErrorContext(ctx, "uninstall flag parse failed", "err", err)
 		return fmt.Errorf("uninstall flags: %w", err)
 	}
-	exe, err := os.Executable()
+	exe, err := currentExecutable()
 	if err != nil {
 		slog.ErrorContext(ctx, "resolve executable failed", "err", err)
 		return fmt.Errorf("uninstall: resolve executable: %w", err)
