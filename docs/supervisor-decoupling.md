@@ -15,12 +15,14 @@ startup sweep that powers off an existing VM.
 
 ## macOS Process Boundary
 
-The safe core uses a detached `tart run` process group for warm VMs. The broker
-starts each warm VM with `SysProcAttr.Setpgid = true` and builds that command
-without a cancellation hook tied to the broker request context. That gives the
-VM runner its own process group, so `launchctl bootout` of
-`io.goodkind.gha-mac-broker` does not signal the VM through the broker job's
-process group.
+The safe core runs warm VMs in a detached `tart run` session. The broker starts
+each warm VM with `SysProcAttr.Setsid = true` and builds that command without a
+cancellation hook tied to the broker request context. `Setsid` creates a new
+session and a new process group for the VM runner. The session break is the
+important boundary: a new process group alone would isolate group-directed
+signals, but the new session removes the VM runner from the broker job's
+launchd session, so `launchctl bootout` of `io.goodkind.gha-mac-broker` cannot
+signal the VM through the broker.
 
 The broker still keeps the `exec.Cmd` while it is alive so explicit recycle and
 teardown paths can stop a VM. It also starts a goroutine that waits on the
@@ -57,7 +59,7 @@ inside the guest.
 
 ## Implemented Core
 
-- Detached warm VM `tart run` process groups for broker-spawned VMs.
+- Detached warm VM `tart run` sessions for broker-spawned VMs.
 - Reaper goroutines for warm VM boot commands.
 - Startup adoption of running pool VMs through Tart list plus vsock liveness.
 - Per-slot guest binding files for job id, run id, repo, and bound time.

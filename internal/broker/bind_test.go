@@ -2,12 +2,20 @@ package broker
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"goodkind.io/gha-mac-broker/internal/config"
+	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/tart"
 )
 
@@ -137,6 +145,79 @@ func TestSlotCPUActivityCommandTargetsSlotRunnerAndSumsSubtree(t *testing.T) {
 		if strings.Contains(command, disallowed) {
 			t.Fatalf("slot cpu activity command = %q, want no %s", command, disallowed)
 		}
+	}
+}
+
+func TestRunJobClearsSlotBindingAfterJobCompletion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	bindingFile := filepath.Join(dir, "binding.json")
+	runStartedFile := filepath.Join(dir, "run-started")
+	writeRunJobFakeTart(t, bin, bindingFile, runStartedFile, "complete")
+
+	cfg := &config.Config{Labels: []string{"self-hosted"}}
+	binder := New(cfg, newRunJobTestGitHubClient(t), tart.New(bin))
+	err := binder.RunJob(
+		context.Background(),
+		&WarmVM{Name: "warm-vm-1"},
+		"owner/repo",
+		"runner-1",
+		0,
+		1,
+		1001,
+		42,
+		time.Date(2026, 7, 3, 11, 59, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("RunJob: %v", err)
+	}
+	if _, err := os.Stat(bindingFile); !os.IsNotExist(err) {
+		t.Fatalf("binding file stat err = %v, want removed binding file", err)
+	}
+}
+
+func TestRunJobKeepsSlotBindingWhenContextCanceled(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	bindingFile := filepath.Join(dir, "binding.json")
+	runStartedFile := filepath.Join(dir, "run-started")
+	writeRunJobFakeTart(t, bin, bindingFile, runStartedFile, "block")
+
+	cfg := &config.Config{Labels: []string{"self-hosted"}}
+	binder := New(cfg, newRunJobTestGitHubClient(t), tart.New(bin))
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- binder.RunJob(
+			ctx,
+			&WarmVM{Name: "warm-vm-1"},
+			"owner/repo",
+			"runner-1",
+			0,
+			1,
+			1001,
+			42,
+			time.Date(2026, 7, 3, 11, 59, 0, 0, time.UTC),
+		)
+	}()
+
+	waitForFile(t, runStartedFile)
+	cancel()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("RunJob error = nil, want canceled exec error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunJob did not return after context cancellation")
+	}
+	if ctx.Err() != context.Canceled {
+		t.Fatalf("context err = %v, want context.Canceled", ctx.Err())
+	}
+	if _, err := os.Stat(bindingFile); err != nil {
+		t.Fatalf("binding file stat err = %v, want binding file left for adoption", err)
 	}
 }
 
@@ -333,5 +414,119 @@ exit 1
 	slot := adopted[0].Slots[0]
 	if !slot.ObservedActive || slot.JobID != 0 || slot.RunID != 0 {
 		t.Fatalf("adopted slot = %+v, want observed-active fallback without stale IDs", slot)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func writeRunJobFakeTart(t *testing.T, bin string, bindingFile string, runStartedFile string, runMode string) {
+	t.Helper()
+	t.Setenv("FAKE_TART_BINDING_FILE", bindingFile)
+	t.Setenv("FAKE_TART_RUN_STARTED_FILE", runStartedFile)
+	t.Setenv("FAKE_TART_RUN_MODE", runMode)
+	t.Setenv("FAKE_TART_BLOCK_FIFO", filepath.Join(filepath.Dir(bindingFile), "block-fifo"))
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+
+binding_file="${FAKE_TART_BINDING_FILE:?}"
+run_started_file="${FAKE_TART_RUN_STARTED_FILE:?}"
+run_mode="${FAKE_TART_RUN_MODE:?}"
+block_fifo="${FAKE_TART_BLOCK_FIFO:?}"
+
+if [[ "$1" == "exec" ]]; then
+	shift 2
+	joined="$*"
+	if [[ "$joined" == *"cat >"* && "$joined" == *"gha-broker-slot-0.json"* ]]; then
+		printf '%s\n' "$joined" > "$binding_file"
+		exit 0
+	fi
+    if [[ "$joined" == "rm -f /tmp/gha-broker-slot-0.json" ]]; then
+        rm -f "$binding_file"
+        exit 0
+    fi
+    if [[ "$joined" == *"./run.sh --jitconfig"* ]]; then
+        if [[ ! -f "$binding_file" ]]; then
+            printf 'missing binding\n' >&2
+            exit 3
+		fi
+		printf 'started\n' > "$run_started_file"
+		if [[ "$run_mode" == "block" ]]; then
+			mkfifo "$block_fifo"
+			read -r _ < "$block_fifo"
+		fi
+		exit 0
+	fi
+    exit 0
+fi
+
+exit 1
+`
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+}
+
+func newRunJobTestGitHubClient(t *testing.T) *ghapp.Client {
+	t.Helper()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/installation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":999}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/999/access_tokens":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"token":"ghs_installationtoken"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/actions/runners/generate-jitconfig":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"encoded_jit_config":"encoded-jit","runner":{"id":7,"name":"runner-1"}}`))
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	})
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, r)
+			return recorder.Result(), nil
+		}),
+	}
+	client, err := ghapp.New("12345", testPrivateKeyPEM(t), ghapp.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return client
+}
+
+func testPrivateKeyPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	der := x509.MarshalPKCS1PrivateKey(key)
+	block := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: der}
+	return pem.EncodeToMemory(block)
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := os.Stat(path)
+		if err == nil {
+			return
+		}
+		if !os.IsNotExist(err) {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

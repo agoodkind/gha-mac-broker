@@ -242,7 +242,12 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 	if err := b.writeSlotBinding(ctx, vm.Name, binding); err != nil {
 		return err
 	}
-	defer b.clearSlotBinding(context.WithoutCancel(ctx), vm.Name, slotIndex)
+	defer func() {
+		if ctx.Err() != nil {
+			return
+		}
+		b.clearSlotBinding(context.WithoutCancel(ctx), vm.Name, slotIndex)
+	}()
 
 	jit, err := b.generateJIT(ctx, owner, repoName, runnerName)
 	if err != nil {
