@@ -32,6 +32,8 @@ func (p *Pool) installAdoptedWorkersLocked(adopted []broker.AdoptedVM) {
 		state := &p.states[stateIndex]
 		stateIndex++
 		state.vm = adoptedVM.VM
+		// Tart does not expose VM creation time here, so adopted workers age
+		// from adoption time and still participate in MaxAge recycling.
 		state.bornAt = now
 		state.idleSince = now
 		state.warming = false

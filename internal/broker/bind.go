@@ -10,6 +10,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -225,7 +226,7 @@ func (b *Binder) cloneRunnerSlots(ctx context.Context, vmName string, slotCount 
 
 // RunJob mints a JIT config and runs one ephemeral GitHub Actions job on the
 // warm VM over vsock. runnerName is the runner registration name.
-func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName string, slotIndex int, slotCount int, jobID int64, runID int64, boundAt time.Time) error {
+func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName string, slotIndex int, slotCount int, jobID int64, runID int64, boundAt time.Time) (err error) {
 	owner, repoName, ok := strings.Cut(repo, "/")
 	if !ok {
 		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
@@ -242,8 +243,9 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 	if err := b.writeSlotBinding(ctx, vm.Name, binding); err != nil {
 		return err
 	}
+	jobCompleted := false
 	defer func() {
-		if ctx.Err() != nil {
+		if runJobInterruptedByCancellation(ctx, err, jobCompleted) {
 			return
 		}
 		b.clearSlotBinding(context.WithoutCancel(ctx), vm.Name, slotIndex)
@@ -263,6 +265,7 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 			slog.ErrorContext(ctx, "job run failed", "err", err, "vm", vm.Name, "slot", slotIndex)
 			return fmt.Errorf("broker: run job on %s: %w", vm.Name, err)
 		}
+		jobCompleted = true
 		slog.InfoContext(ctx, "job complete", "repo", repo, "vm", vm.Name, "slot", slotIndex)
 		return nil
 	}
@@ -275,8 +278,19 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 		slog.ErrorContext(ctx, "job run failed", "err", err, "vm", vm.Name, "slot", slotIndex)
 		return fmt.Errorf("broker: run job on %s: %w", vm.Name, err)
 	}
+	jobCompleted = true
 	slog.InfoContext(ctx, "job complete", "repo", repo, "vm", vm.Name, "slot", slotIndex)
 	return nil
+}
+
+func runJobInterruptedByCancellation(ctx context.Context, err error, jobCompleted bool) bool {
+	if jobCompleted {
+		return false
+	}
+	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return true
+	}
+	return ctx.Err() != nil
 }
 
 func (b *Binder) writeSlotBinding(ctx context.Context, vmName string, binding SlotBinding) error {
@@ -536,17 +550,21 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 		idleCandidates = append(idleCandidates, candidate)
 	}
 	selected := make([]adoptionCandidate, 0, len(busyCandidates)+len(idleCandidates))
-	addCandidate := func(candidate adoptionCandidate) {
+	addCandidate := func(candidate adoptionCandidate) bool {
 		if limit >= 0 && len(selected) >= limit {
-			return
+			return false
 		}
 		selected = append(selected, candidate)
+		return true
 	}
 	for _, candidate := range busyCandidates {
 		addCandidate(candidate)
 	}
 	for _, candidate := range idleCandidates {
-		addCandidate(candidate)
+		if addCandidate(candidate) {
+			continue
+		}
+		b.teardown(context.WithoutCancel(ctx), candidate.vm.Name)
 	}
 	adopted := make([]AdoptedVM, 0, len(selected))
 	for _, candidate := range selected {

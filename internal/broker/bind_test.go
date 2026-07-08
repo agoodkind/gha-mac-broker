@@ -172,6 +172,39 @@ func TestRunJobClearsSlotBindingAfterJobCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunJob: %v", err)
 	}
+	if _, err := os.Stat(runStartedFile); err != nil {
+		t.Fatalf("run started file stat err = %v, want completed guest run", err)
+	}
+	if _, err := os.Stat(bindingFile); !os.IsNotExist(err) {
+		t.Fatalf("binding file stat err = %v, want removed binding file", err)
+	}
+}
+
+func TestRunJobClearsSlotBindingAfterJobCompletionWithCanceledContext(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	bindingFile := filepath.Join(dir, "binding.json")
+	runStartedFile := filepath.Join(dir, "run-started")
+	writeRunJobFakeTart(t, bin, bindingFile, runStartedFile, "complete")
+
+	cfg := &config.Config{Labels: []string{"self-hosted"}}
+	binder := New(cfg, newRunJobTestGitHubClient(t), tart.New(bin))
+	ctx := contextErrAfterFile{Context: context.Background(), path: runStartedFile}
+	err := binder.RunJob(
+		ctx,
+		&WarmVM{Name: "warm-vm-1"},
+		"owner/repo",
+		"runner-1",
+		0,
+		1,
+		1001,
+		42,
+		time.Date(2026, 7, 3, 11, 59, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("RunJob: %v", err)
+	}
 	if _, err := os.Stat(bindingFile); !os.IsNotExist(err) {
 		t.Fatalf("binding file stat err = %v, want removed binding file", err)
 	}
@@ -204,6 +237,9 @@ func TestRunJobKeepsSlotBindingWhenContextCanceled(t *testing.T) {
 	}()
 
 	waitForFile(t, runStartedFile)
+	if _, err := os.Stat(bindingFile); err != nil {
+		t.Fatalf("binding file stat err = %v, want binding file before cancellation", err)
+	}
 	cancel()
 	select {
 	case err := <-errCh:
@@ -219,6 +255,18 @@ func TestRunJobKeepsSlotBindingWhenContextCanceled(t *testing.T) {
 	if _, err := os.Stat(bindingFile); err != nil {
 		t.Fatalf("binding file stat err = %v, want binding file left for adoption", err)
 	}
+}
+
+type contextErrAfterFile struct {
+	context.Context
+	path string
+}
+
+func (ctx contextErrAfterFile) Err() error {
+	if _, err := os.Stat(ctx.path); err == nil {
+		return context.Canceled
+	}
+	return ctx.Context.Err()
 }
 
 func TestAdoptPrefersLiveBusyVMWithinLimit(t *testing.T) {
@@ -474,6 +522,96 @@ exit 1
 	slot := adopted[0].Slots[0]
 	if !slot.ObservedActive || slot.JobID != 0 || slot.RunID != 0 {
 		t.Fatalf("adopted slot = %+v, want observed-active fallback without stale IDs", slot)
+	}
+}
+
+func TestAdoptTearsDownIdleExcessAndKeepsBusyExcess(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	callsFile := filepath.Join(dir, "calls")
+	selectedBinding := `{"slot_index":0,"repo":"owner/repo","job_id":1001,"run_id":42,"bound_at":"2026-07-03T11:59:00Z"}`
+	excessBinding := `{"slot_index":0,"repo":"owner/repo","job_id":1002,"run_id":43,"bound_at":"2026-07-03T12:00:00Z"}`
+	script := strings.NewReplacer(
+		"__CALLS_FILE__", callsFile,
+		"__SELECTED_BINDING__", selectedBinding,
+		"__EXCESS_BINDING__", excessBinding,
+	).Replace(`#!/usr/bin/env bash
+set -euo pipefail
+
+calls_file="__CALLS_FILE__"
+
+if [[ "$1" == "list" ]]; then
+    printf '[{"Name":"pool-a-busy-selected","State":"running"},{"Name":"pool-b-busy-excess","State":"running"},{"Name":"pool-c-idle-excess","State":"running"}]'
+    exit 0
+fi
+
+if [[ "$1" == "exec" ]]; then
+    vm="$2"
+    shift 2
+    joined="$*"
+    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
+        exit 0
+    fi
+    if [[ "$vm" == "pool-a-busy-selected" && "$joined" == *"gha-broker-slot-0.json"* ]]; then
+        cat <<'JSON'
+__SELECTED_BINDING__
+JSON
+        exit 0
+    fi
+    if [[ "$vm" == "pool-b-busy-excess" && "$joined" == *"gha-broker-slot-0.json"* ]]; then
+        cat <<'JSON'
+__EXCESS_BINDING__
+JSON
+        exit 0
+    fi
+    if [[ "$joined" == *"pgrep"* ]]; then
+        printf 'no\n'
+        exit 0
+    fi
+    exit 0
+fi
+
+if [[ "$1" == "stop" || "$1" == "delete" ]]; then
+    printf '%s %s\n' "$1" "$2" >> "$calls_file"
+    exit 0
+fi
+
+exit 1
+`)
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+
+	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
+	binder := New(cfg, nil, tart.New(bin))
+	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	t.Cleanup(func() {
+		for _, adoptedVM := range adopted {
+			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
+				adoptedVM.VM.stopTouch()
+			}
+		}
+	})
+
+	if len(adopted) != 1 {
+		t.Fatalf("adopted = %+v, want one selected busy VM", adopted)
+	}
+	if adopted[0].VM.Name != "pool-a-busy-selected" {
+		t.Fatalf("adopted vm = %q, want pool-a-busy-selected", adopted[0].VM.Name)
+	}
+	callsData, err := os.ReadFile(callsFile)
+	if err != nil {
+		t.Fatalf("read calls file: %v", err)
+	}
+	calls := string(callsData)
+	if !strings.Contains(calls, "stop pool-c-idle-excess") || !strings.Contains(calls, "delete pool-c-idle-excess") {
+		t.Fatalf("calls = %q, want idle excess stopped and deleted", calls)
+	}
+	if strings.Contains(calls, "pool-b-busy-excess") {
+		t.Fatalf("calls = %q, want busy excess left running", calls)
 	}
 }
 
