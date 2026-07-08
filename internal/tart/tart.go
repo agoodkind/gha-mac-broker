@@ -53,7 +53,7 @@ func detachedCommand(ctx context.Context, bin string, args ...string) *exec.Cmd 
 	slog.DebugContext(ctx, "tart detached command built", "bin", bin, "args", strings.Join(args, " "))
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), bin, args...)
 	cmd.Cancel = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	return cmd
 }
 
