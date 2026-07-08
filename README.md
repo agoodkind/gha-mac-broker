@@ -26,6 +26,11 @@ reusable workflow, not in the broker.
 curl -fsSL https://raw.githubusercontent.com/agoodkind/gha-mac-broker/main/install.sh | bash
 ```
 
+Published releases ship as signed release tarballs. The thin installer routes to
+go-makefile's hosted installer, which verifies the release binary, installs it,
+then runs `gha-mac-broker install` to scaffold the config, build the golden image,
+install the user service, and restart it.
+
 Host prerequisites are Tart and skopeo; on macOS install them with
 `brew install cirruslabs/cli/tart skopeo`. swift-mk is only needed if you keep
 the default maintenance command, and the maintenance timer is macOS-only, so it
@@ -34,6 +39,15 @@ is not required on Linux. To install swift-mk by hand:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/agoodkind/swift-makefile/main/install.sh | bash
 ```
+
+`gha-mac-broker install` renders the service unit with the `-bin` path. The flag
+defaults to the path of the executable running the install command. When the
+installer launches a temporary copy, pass `-bin ~/.local/bin/gha-mac-broker` so
+launchd points at the durable installed binary rather than the temporary file.
+
+The service owns every warm VM as a `tart run` child process. Restarting it kills
+running VMs, so a zero-kill deploy restarts only when no `tart exec ... run.sh`
+job is active.
 
 ## Build
 
