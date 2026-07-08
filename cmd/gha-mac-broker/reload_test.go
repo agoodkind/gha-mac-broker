@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -126,6 +127,41 @@ func TestConfigReloadWatcherDropsPendingReloadWithoutApplyCallback(t *testing.T)
 	}
 }
 
+func TestConfigReloadWatcherPanicRecoveryUsesInjectedLogger(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	writeReloadConfig(t, configPath, 1)
+	initialModTime := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	setReloadConfigModTime(t, configPath, initialModTime)
+
+	changedModTime := initialModTime.Add(time.Minute)
+	writeReloadConfig(t, configPath, 2)
+	setReloadConfigModTime(t, configPath, changedModTime)
+
+	records := make(chan slog.Record, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startConfigReloadWatcher(ctx, configReloadWatcherOptions{
+		path:           configPath,
+		initialModTime: initialModTime,
+		interval:       time.Millisecond,
+		load:           config.Load,
+		apply: func(_ context.Context, _ *config.Config) error {
+			panic("reload apply failed")
+		},
+		log: slog.New(reloadTestLogHandler{records: records}),
+	})
+
+	select {
+	case record := <-records:
+		if record.Message != "config reload watcher panic recovered" {
+			t.Fatalf("log message = %q, want config reload watcher panic recovered", record.Message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for injected logger record")
+	}
+}
+
 func writeReloadConfig(t *testing.T, path string, jobsPerVM int) {
 	t.Helper()
 	body := fmt.Sprintf(`
@@ -153,4 +189,25 @@ func setReloadConfigModTime(t *testing.T, path string, modTime time.Time) {
 	if err := os.Chtimes(path, modTime, modTime); err != nil {
 		t.Fatalf("set config mtime: %v", err)
 	}
+}
+
+type reloadTestLogHandler struct {
+	records chan slog.Record
+}
+
+func (handler reloadTestLogHandler) Enabled(_ context.Context, _ slog.Level) bool {
+	return true
+}
+
+func (handler reloadTestLogHandler) Handle(_ context.Context, record slog.Record) error {
+	handler.records <- record
+	return nil
+}
+
+func (handler reloadTestLogHandler) WithAttrs(_ []slog.Attr) slog.Handler {
+	return handler
+}
+
+func (handler reloadTestLogHandler) WithGroup(_ string) slog.Handler {
+	return handler
 }

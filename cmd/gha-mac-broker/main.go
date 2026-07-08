@@ -829,7 +829,23 @@ func applyReloadedConfig(ctx context.Context, cfg *config.Config, binder *broker
 	binder.Reconfigure(cfg)
 	p.Reconfigure(runnerPoolOptionsFromConfig(cfg, "", nil))
 	srv.Reconfigure(secret, cfg, capacityToken, webhookCIDRs)
-	slog.InfoContext(ctx, "config reload applied", "runner_count", cfg.RunnerCount, "jobs_per_vm", cfg.JobsPerVM)
+	appliedRunnerCount := p.Snapshot().RunnerCount
+	if cfg.RunnerCount != appliedRunnerCount {
+		slog.InfoContext(
+			ctx,
+			"config reload applied",
+			"runner_count",
+			appliedRunnerCount,
+			"requested_runner_count",
+			cfg.RunnerCount,
+			"runner_count_note",
+			"restart required",
+			"jobs_per_vm",
+			cfg.JobsPerVM,
+		)
+		return nil
+	}
+	slog.InfoContext(ctx, "config reload applied", "runner_count", appliedRunnerCount, "jobs_per_vm", cfg.JobsPerVM)
 	return nil
 }
 

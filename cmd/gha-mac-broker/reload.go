@@ -43,7 +43,7 @@ func startConfigReloadWatcher(ctx context.Context, options configReloadWatcherOp
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				slog.ErrorContext(ctx, "config reload watcher panic recovered", "err", fmt.Errorf("panic: %v", recovered))
+				watcher.log.ErrorContext(ctx, "config reload watcher panic recovered", "err", fmt.Errorf("panic: %v", recovered))
 			}
 		}()
 		ticker := time.NewTicker(interval)
