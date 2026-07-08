@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # gha-broker guest watchdog. launchd runs this on a short interval inside each
 # pool VM. While the broker owns the VM it touches HEARTBEAT_FILE over the
-# tart-exec vsock channel; if the broker dies the file goes stale and this VM
-# self-terminates, so a dead broker never leaves a live orphan.
+# tart-exec vsock channel. A stale file is diagnostic only; the host-side
+# supervisor/control-plane reconcile owns VM cleanup so a broker restart cannot
+# power off a running job from inside the guest.
 
 set -euo pipefail
 
@@ -20,5 +21,5 @@ mtime="$(stat -f %m "$HEARTBEAT_FILE")"
 age=$(( now - mtime ))
 
 if (( age > STALE_AFTER_SECONDS )); then
-    /sbin/shutdown -h now
+    printf 'gha-broker heartbeat stale: age=%s stale_after=%s\n' "$age" "$STALE_AFTER_SECONDS"
 fi

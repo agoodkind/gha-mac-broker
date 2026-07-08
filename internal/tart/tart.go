@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"syscall"
 )
 
 const maxTeeTailBytes = 64 * 1024
@@ -46,6 +47,14 @@ func New(bin string) *Tart {
 func command(ctx context.Context, bin string, args ...string) *exec.Cmd {
 	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", strings.Join(args, " "))
 	return exec.CommandContext(ctx, bin, args...)
+}
+
+func detachedCommand(ctx context.Context, bin string, args ...string) *exec.Cmd {
+	slog.DebugContext(ctx, "tart detached command built", "bin", bin, "args", strings.Join(args, " "))
+	cmd := exec.CommandContext(context.WithoutCancel(ctx), bin, args...)
+	cmd.Cancel = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return cmd
 }
 
 func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error) {
@@ -111,14 +120,33 @@ func execRunnerTee(ctx context.Context, bin string, sink io.Writer, args ...stri
 }
 
 // listEntry is the subset of one `tart list --format json` record the broker
-// reads. Other columns (source, disk, state) are ignored.
+// reads. Other columns such as source and disk are ignored.
 type listEntry struct {
-	Name string `json:"Name"`
+	Name  string `json:"Name"`
+	State string `json:"State"`
 }
 
-// List returns the names of every VM tart knows about. The orphan sweep uses it
-// to find stale pool clones left by a previous broker process.
+// VM is one entry from `tart list --format json`.
+type VM struct {
+	Name  string
+	State string
+}
+
+// List returns the names of every VM tart knows about.
 func (t *Tart) List(ctx context.Context) ([]string, error) {
+	entries, err := t.ListVMs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name)
+	}
+	return names, nil
+}
+
+// ListVMs returns the VM names and states visible to tart.
+func (t *Tart) ListVMs(ctx context.Context) ([]VM, error) {
 	out, err := t.run(ctx, t.bin, "list", "--format", "json")
 	if err != nil {
 		return nil, err
@@ -128,11 +156,11 @@ func (t *Tart) List(ctx context.Context) ([]string, error) {
 		slog.ErrorContext(ctx, "tart list parse failed", "err", err)
 		return nil, fmt.Errorf("tart: parse list output: %w", err)
 	}
-	names := make([]string, 0, len(entries))
+	vms := make([]VM, 0, len(entries))
 	for _, e := range entries {
-		names = append(names, e.Name)
+		vms = append(vms, VM(e))
 	}
-	return names, nil
+	return vms, nil
 }
 
 // Clone makes a copy-on-write clone of source under name.
@@ -178,6 +206,10 @@ type BootOptions struct {
 	// Dirs are host directories shared into the VM as `--dir name:path`.
 	// The cache directory is mounted this way so it survives VM deletion.
 	Dirs []DirMount
+	// Detach starts tart in a new process group and ignores caller context
+	// cancellation. The broker uses this for warm VMs so launchd bootout of the
+	// broker job does not signal the VM's `tart run` process.
+	Detach bool
 	// NoGraphics runs the VM headless.
 	NoGraphics bool
 }
@@ -200,5 +232,12 @@ func (t *Tart) BootCommand(ctx context.Context, name string, opts BootOptions) *
 	for _, d := range opts.Dirs {
 		args = append(args, "--dir", d.Name+":"+d.Path)
 	}
-	return command(ctx, t.bin, args...)
+	commandCtx := ctx
+	if opts.Detach {
+		commandCtx = context.WithoutCancel(ctx)
+	}
+	if opts.Detach {
+		return detachedCommand(commandCtx, t.bin, args...)
+	}
+	return command(commandCtx, t.bin, args...)
 }

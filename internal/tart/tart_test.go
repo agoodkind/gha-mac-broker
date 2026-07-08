@@ -193,3 +193,24 @@ func TestBootCommandArgs(t *testing.T) {
 		}
 	}
 }
+
+func TestBootCommandDetachUsesOwnProcessGroup(t *testing.T) {
+	tt := New("tart")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cmd := tt.BootCommand(ctx, "warm-1", BootOptions{
+		NoGraphics: true,
+		Detach:     true,
+	})
+
+	if cmd.SysProcAttr == nil {
+		t.Fatal("boot command SysProcAttr = nil, want detached process attributes")
+	}
+	if !cmd.SysProcAttr.Setpgid {
+		t.Fatal("boot command Setpgid = false, want true")
+	}
+	if cmd.Cancel != nil {
+		t.Fatal("boot command has context cancel hook, want detached command independent of caller cancellation")
+	}
+}
