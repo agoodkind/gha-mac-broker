@@ -42,8 +42,8 @@ func New(bin string) *Tart {
 	return &Tart{bin: bin, run: execRunner, runTee: execRunnerTee}
 }
 
-// command builds an [exec.Cmd] for the tart binary. Centralizing construction
-// keeps the single audited exec call site in one place.
+// command builds a context-bound [exec.Cmd] for tart execs. detachedCommand is
+// the deliberately detached path for warm VMs that outlive broker cancellation.
 func command(ctx context.Context, bin string, args ...string) *exec.Cmd {
 	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", strings.Join(args, " "))
 	return exec.CommandContext(ctx, bin, args...)
@@ -51,8 +51,8 @@ func command(ctx context.Context, bin string, args ...string) *exec.Cmd {
 
 func detachedCommand(ctx context.Context, bin string, args ...string) *exec.Cmd {
 	slog.DebugContext(ctx, "tart detached command built", "bin", bin, "args", strings.Join(args, " "))
+	// Detached tart runs must survive broker context cancellation.
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), bin, args...)
-	cmd.Cancel = nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	return cmd
 }

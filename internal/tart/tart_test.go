@@ -195,7 +195,13 @@ func TestBootCommandArgs(t *testing.T) {
 }
 
 func TestBootCommandDetachCreatesOwnSession(t *testing.T) {
-	tt := New("tart")
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	script := "#!/usr/bin/env bash\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tart: %v", err)
+	}
+	tt := New(bin)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -213,7 +219,7 @@ func TestBootCommandDetachCreatesOwnSession(t *testing.T) {
 	if cmd.SysProcAttr.Setpgid {
 		t.Fatal("boot command Setpgid = true, want false because Setsid already creates a process group")
 	}
-	if cmd.Cancel != nil {
-		t.Fatal("boot command has context cancel hook, want detached command independent of caller cancellation")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("detached command from canceled broker context failed: %v", err)
 	}
 }
