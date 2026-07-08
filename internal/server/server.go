@@ -142,11 +142,12 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.checkWebhookIP(w, r) {
+	liveConfig := s.configSnapshot()
+	if !s.checkWebhookIP(w, r, liveConfig) {
 		return
 	}
 	slog.InfoContext(r.Context(), "webhook received")
-	body, ok := s.readVerifiedBody(w, r)
+	body, ok := s.readVerifiedBody(w, r, liveConfig)
 	if !ok {
 		return
 	}
@@ -158,7 +159,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	switch payload.Action {
 	case webhookActionQueued:
-		s.dispatchJob(w, r, payload)
+		s.dispatchJob(w, r, payload, liveConfig)
 	case webhookActionInProgress:
 		slog.DebugContext(r.Context(), "workflow job in progress", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "runner", payload.WorkflowJob.RunnerName, "runner_id", payload.WorkflowJob.RunnerID)
 		w.WriteHeader(http.StatusNoContent)
@@ -173,7 +174,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request, liveConfig serverConfig) ([]byte, bool) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
 	if err != nil {
 		slog.WarnContext(r.Context(), "webhook body read error", "err", err)
@@ -181,7 +182,6 @@ func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byt
 		return nil, false
 	}
 	sig := r.Header.Get("X-Hub-Signature-256")
-	liveConfig := s.configSnapshot()
 	if !verifySignature(liveConfig.webhookKey, body, sig) {
 		slog.InfoContext(r.Context(), "webhook rejected", "reason", "bad signature")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -190,10 +190,9 @@ func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) ([]byt
 	return body, true
 }
 
-func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload webhookPayload) {
+func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload webhookPayload, liveConfig serverConfig) {
 	ctx := r.Context()
 	repo := payload.Repository.FullName
-	liveConfig := s.configSnapshot()
 	if !hasLabel(liveConfig.cfg, payload.WorkflowJob.Labels) {
 		slog.InfoContext(ctx, "webhook ignored", "reason", "no matching label", "repo", repo, "labels", payload.WorkflowJob.Labels)
 		w.WriteHeader(http.StatusNoContent)
@@ -295,8 +294,7 @@ func (s *Server) checkBearerToken(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-func (s *Server) checkWebhookIP(w http.ResponseWriter, r *http.Request) bool {
-	liveConfig := s.configSnapshot()
+func (s *Server) checkWebhookIP(w http.ResponseWriter, r *http.Request, liveConfig serverConfig) bool {
 	if len(liveConfig.webhookCIDRs) == 0 {
 		return true
 	}
