@@ -81,6 +81,27 @@ func TestCloneRunnerSlotsCommandSkipsSingleSlot(t *testing.T) {
 	}
 }
 
+func TestCloneRunnerSlotsCommandRefreshesHomebrewBeforeCloningSlots(t *testing.T) {
+	command := cloneRunnerSlotsCommand(3)
+	for _, fragment := range []string{
+		`brew_boot_refresh_marker="/tmp/swift-mk-brew-boot-refreshed"`,
+		`rm -f "$brew_boot_refresh_marker"`,
+		`if command -v brew >/dev/null 2>&1; then`,
+		`brew update --quiet`,
+		`grep -Eiq "already locked|another active homebrew|another .* process is already running"`,
+		`: > "$brew_boot_refresh_marker"`,
+	} {
+		if !strings.Contains(command, fragment) {
+			t.Fatalf("clone command = %q, want fragment %q", command, fragment)
+		}
+	}
+	refreshIndex := strings.Index(command, `rm -f "$brew_boot_refresh_marker"`)
+	slotLoopIndex := strings.Index(command, `while [[ "$slot_index" -lt "$slot_count" ]]`)
+	if refreshIndex < 0 || slotLoopIndex < 0 || refreshIndex > slotLoopIndex {
+		t.Fatalf("clone command = %q, want Homebrew refresh before slot loop", command)
+	}
+}
+
 func TestCloneRunnerSlotsCommandCopiesGoldenRunnerToSlotDirs(t *testing.T) {
 	command := cloneRunnerSlotsCommand(3)
 	for _, fragment := range []string{

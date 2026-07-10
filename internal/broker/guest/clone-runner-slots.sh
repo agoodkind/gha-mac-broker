@@ -1,7 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck disable=SC1083
 slot_count={{SLOT_COUNT}}
+
+brew_boot_refresh_marker="/tmp/swift-mk-brew-boot-refreshed"
+rm -f "$brew_boot_refresh_marker"
+
+refresh_homebrew_index() {
+    local attempt_count=1
+    local brew_output=""
+    local max_attempts=3
+
+    while [[ "$attempt_count" -le "$max_attempts" ]]; do
+        if brew_output="$(brew update --quiet 2>&1)"; then
+            : > "$brew_boot_refresh_marker"
+            return 0
+        fi
+
+        if ! printf '%s\n' "$brew_output" | grep -Eiq "already locked|another active homebrew|another .* process is already running"; then
+            return 0
+        fi
+
+        if [[ "$attempt_count" -eq "$max_attempts" ]]; then
+            return 0
+        fi
+
+        sleep 5
+        attempt_count=$((attempt_count + 1))
+    done
+}
+
+if command -v brew >/dev/null 2>&1; then
+    refresh_homebrew_index || true
+fi
+
 slot_index=0
 
 # Warm by-presence caches seeded into each slot's isolated $HOME via APFS clone,
