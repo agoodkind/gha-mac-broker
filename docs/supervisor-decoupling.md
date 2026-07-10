@@ -69,7 +69,6 @@ inside the guest.
 
 ## Follow-On Supervisor Work
 
-- Reconcile running pool VMs during startup instead of leaving them unmanaged.
 - Move VM lifecycle calls behind a long-lived launchd supervisor service.
 - Expose a local supervisor API for boot, adopt, recycle, and status.
 - Store durable slot state in the supervisor instead of only in guest binding

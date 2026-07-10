@@ -234,8 +234,12 @@ func (t *Tart) BootCommand(ctx context.Context, name string, opts BootOptions) *
 	for _, d := range opts.Dirs {
 		args = append(args, "--dir", d.Name+":"+d.Path)
 	}
+	commandCtx := ctx
 	if opts.Detach {
-		return detachedCommand(ctx, t.bin, args...)
+		commandCtx = context.WithoutCancel(ctx)
 	}
-	return command(ctx, t.bin, args...)
+	if opts.Detach {
+		return detachedCommand(commandCtx, t.bin, args...)
+	}
+	return command(commandCtx, t.bin, args...)
 }

@@ -544,7 +544,7 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 		}
 		candidate := adoptionCandidate{
 			vm:    vm,
-			slots: b.adoptSlotBindings(ctx, vm, normalizedSlotCount(slotCount)),
+			slots: b.adoptSlotBindings(ctx, vm, normalizeSlotCount(slotCount)),
 		}
 		if len(candidate.slots) > 0 {
 			busyCandidates = append(busyCandidates, candidate)
@@ -584,34 +584,37 @@ func (b *Binder) adoptSlotBindings(ctx context.Context, vm *WarmVM, slotCount in
 	bindings := make([]SlotBinding, 0, slotCount)
 	for slotIndex := range slotCount {
 		binding, ok, err := b.readSlotBinding(ctx, vm.Name, slotIndex)
-		if err == nil && ok {
+		if err != nil {
+			slog.DebugContext(ctx, "slot binding unavailable during adoption; treating slot as busy", "err", err, "vm", vm.Name, "slot", slotIndex)
+			bindings = append(bindings, busyFallbackSlotBinding(slotIndex))
+			continue
+		}
+		if ok {
 			bindings = append(bindings, binding)
 			continue
 		}
 		active, err := b.HasActiveJob(ctx, vm, slotIndex, slotCount)
 		if err != nil {
-			slog.DebugContext(ctx, "active job probe failed during adoption", "err", err, "vm", vm.Name, "slot", slotIndex)
+			slog.DebugContext(ctx, "active job probe failed during adoption; treating slot as busy", "err", err, "vm", vm.Name, "slot", slotIndex)
+			bindings = append(bindings, busyFallbackSlotBinding(slotIndex))
 			continue
 		}
 		if active {
-			bindings = append(bindings, SlotBinding{
-				SlotIndex:      slotIndex,
-				Repo:           "",
-				JobID:          0,
-				RunID:          0,
-				BoundAt:        time.Time{},
-				ObservedActive: true,
-			})
+			bindings = append(bindings, busyFallbackSlotBinding(slotIndex))
 		}
 	}
 	return bindings
 }
 
-func normalizedSlotCount(slotCount int) int {
-	if slotCount < 1 {
-		return 1
+func busyFallbackSlotBinding(slotIndex int) SlotBinding {
+	return SlotBinding{
+		SlotIndex:      slotIndex,
+		Repo:           "",
+		JobID:          0,
+		RunID:          0,
+		BoundAt:        time.Time{},
+		ObservedActive: true,
 	}
-	return slotCount
 }
 
 // DeleteGolden removes the derived golden for image from disk.
