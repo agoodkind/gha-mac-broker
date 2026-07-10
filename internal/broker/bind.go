@@ -186,8 +186,10 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 	return &WarmVM{Name: vmName, Image: image, boot: bootCmd, stopTouch: stopTouch}, nil
 }
 
-func (b *Binder) reapBootCommand(ctx context.Context, vmName string, bootCmd *exec.Cmd) {
+func (b *Binder) reapBootCommand(ctx context.Context, vmName string, bootCmd *exec.Cmd) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		defer func() {
 			if r := recover(); r != nil {
 				slog.ErrorContext(ctx, "vm boot reaper panic recovered", "err", fmt.Errorf("panic: %v", r), "vm", vmName)
@@ -197,6 +199,7 @@ func (b *Binder) reapBootCommand(ctx context.Context, vmName string, bootCmd *ex
 			slog.DebugContext(ctx, "vm boot process exited", "err", err, "vm", vmName)
 		}
 	}()
+	return done
 }
 
 func (b *Binder) startTouchLoop(ctx context.Context, vmName string) context.CancelFunc {
