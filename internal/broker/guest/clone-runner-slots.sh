@@ -5,7 +5,21 @@ set -euo pipefail
 slot_count={{SLOT_COUNT}}
 
 brew_boot_refresh_marker="/tmp/swift-mk-brew-boot-refreshed"
+# Clear any stale marker or pre-planted symlink at the predictable path. This
+# runs at VM prep before any job registers, so no untrusted process is racing.
 rm -f "$brew_boot_refresh_marker"
+
+write_boot_refresh_marker() {
+    # The marker must live at a fixed VM-wide path because the later per-job brew
+    # step reads it from an isolated per-slot $HOME. Refuse to follow a symlink
+    # at that path so a race cannot redirect the write to an arbitrary file, and
+    # propagate a write failure so a failed marker leaves jobs to refresh
+    # themselves.
+    if [[ -L "$brew_boot_refresh_marker" ]]; then
+        return 1
+    fi
+    : > "$brew_boot_refresh_marker"
+}
 
 refresh_homebrew_index() {
     local attempt_count=1
@@ -14,7 +28,7 @@ refresh_homebrew_index() {
 
     while [[ "$attempt_count" -le "$max_attempts" ]]; do
         if brew_output="$(brew update --quiet 2>&1)"; then
-            : > "$brew_boot_refresh_marker"
+            write_boot_refresh_marker || return 1
             return 0
         fi
 
