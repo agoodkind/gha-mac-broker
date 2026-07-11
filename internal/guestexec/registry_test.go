@@ -248,8 +248,142 @@ func TestCompletedExecutionExpiresAfterRetention(t *testing.T) {
 	}
 }
 
+func TestHighOutputExecutionCapsRetainedLogBytesAndStillStreamsTerminal(t *testing.T) {
+	registry := newTestRegistry()
+	executionID := "high-output"
+	// Emit well over maxRetainedLogBytes, then a distinctive marker, so the oldest
+	// LogChunk data must be evicted while the later marker and terminal survive.
+	producedChunks := (maxRetainedLogBytes / outputReadBufferSize) + 64
+	script := fmt.Sprintf(
+		"dd if=/dev/zero bs=%d count=%d 2>/dev/null; echo DONE_MARKER",
+		outputReadBufferSize,
+		producedChunks,
+	)
+	_, err := registry.Start(ExecSpec{
+		ExecutionID: executionID,
+		Slot:        11,
+		Command:     "/bin/sh",
+		Args:        []string{"-c", script},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	events, unsubscribe, err := registry.Subscribe(executionID, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer unsubscribe()
+	collected := collectThroughTerminal(t, events)
+
+	assertContiguousSequences(t, collected, 1)
+	if !containsLog(collected, "DONE_MARKER") {
+		t.Fatal("streamed events do not contain the post-output marker")
+	}
+	if terminalResult(t, collected).ExitCode != 0 {
+		t.Fatalf("terminal result = %+v, want exit code 0", terminalResult(t, collected))
+	}
+
+	retained := retainedLogBytesOf(t, registry, executionID)
+	if retained > maxRetainedLogBytes {
+		t.Fatalf("retained log bytes = %d, want <= %d", retained, maxRetainedLogBytes)
+	}
+	if retained <= 0 {
+		t.Fatalf("retained log bytes = %d, want the newest chunks kept", retained)
+	}
+}
+
+// TestEnforceLogByteCapResumesCursorEvictsOldestAndKeepsLaterSequences appends
+// many LogChunk events one at a time, so enforceLogByteCapLocked runs once per
+// append and must resume from its forward cursor instead of rescanning from
+// zero. It proves retained bytes stay under the cap, the oldest chunk data is
+// evicted while a later distinctive marker and the terminal result survive with
+// their data intact, sequences stay contiguous, and the cursor never leaves a
+// live LogChunk behind it.
+func TestEnforceLogByteCapResumesCursorEvictsOldestAndKeepsLaterSequences(t *testing.T) {
+	execState := &execution{
+		phase:   "running",
+		running: true,
+		notify:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+
+	chunkData := make([]byte, outputReadBufferSize)
+	for index := range chunkData {
+		chunkData[index] = 'a'
+	}
+	overCapChunks := (maxRetainedLogBytes / outputReadBufferSize) + 8
+	for range overCapChunks {
+		payload := make([]byte, outputReadBufferSize)
+		copy(payload, chunkData)
+		execState.appendEventLocked(LogChunk{Stream: StreamStdout, Data: payload})
+	}
+
+	marker := []byte("LATER_MARKER")
+	execState.appendEventLocked(LogChunk{Stream: StreamStdout, Data: marker})
+	execState.appendEventLocked(TerminalResult{ExitCode: 0})
+
+	if execState.retainedLogBytes > maxRetainedLogBytes {
+		t.Fatalf("retained log bytes = %d, want <= %d", execState.retainedLogBytes, maxRetainedLogBytes)
+	}
+	if execState.retainedLogBytes <= 0 {
+		t.Fatalf("retained log bytes = %d, want the newest chunks kept", execState.retainedLogBytes)
+	}
+
+	// The oldest chunk must be evicted (data zeroed), proving the cap fired.
+	firstChunk, ok := execState.events[0].Payload.(LogChunk)
+	if !ok {
+		t.Fatalf("events[0] payload = %T, want LogChunk", execState.events[0].Payload)
+	}
+	if len(firstChunk.Data) != 0 {
+		t.Fatalf("oldest chunk retained %d bytes, want it evicted to 0", len(firstChunk.Data))
+	}
+
+	// The later marker and the terminal result must survive as distinct later
+	// sequences with their payloads intact.
+	markerEvent := execState.events[overCapChunks]
+	markerChunk, ok := markerEvent.Payload.(LogChunk)
+	if !ok || string(markerChunk.Data) != "LATER_MARKER" {
+		t.Fatalf("later marker payload = %+v, want LogChunk carrying LATER_MARKER", markerEvent.Payload)
+	}
+	terminalEvent := execState.events[overCapChunks+1]
+	if _, ok := terminalEvent.Payload.(TerminalResult); !ok {
+		t.Fatalf("terminal payload = %T, want TerminalResult", terminalEvent.Payload)
+	}
+
+	// Sequences stay contiguous from 1 across every retained event.
+	for index := range execState.events {
+		wantSequence := uint64(index + 1)
+		if execState.events[index].Sequence != wantSequence {
+			t.Fatalf("events[%d].Sequence = %d, want %d", index, execState.events[index].Sequence, wantSequence)
+		}
+	}
+
+	// Forward-cursor invariant: nothing before the cursor is a live LogChunk, so
+	// the cursor never has to revisit an already-passed entry.
+	for index := 0; index < execState.logCapCursor; index++ {
+		chunk, isChunk := execState.events[index].Payload.(LogChunk)
+		if isChunk && len(chunk.Data) != 0 {
+			t.Fatalf("events[%d] before cursor still holds %d live bytes", index, len(chunk.Data))
+		}
+	}
+}
+
 func newTestRegistry() *Registry {
 	return New(Options{Retention: time.Minute, HeartbeatInterval: 20 * time.Millisecond})
+}
+
+func retainedLogBytesOf(t *testing.T, registry *Registry, executionID string) int {
+	t.Helper()
+	registry.mu.Lock()
+	execState, found := registry.executions[executionID]
+	registry.mu.Unlock()
+	if !found {
+		t.Fatalf("execution %q is not retained", executionID)
+	}
+	execState.mu.Lock()
+	defer execState.mu.Unlock()
+	return execState.retainedLogBytes
 }
 
 func waitForLog(t *testing.T, events <-chan Event, substring string) Event {

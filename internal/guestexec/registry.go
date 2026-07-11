@@ -18,6 +18,9 @@ const (
 	defaultHeartbeatInterval = 10 * time.Second
 	outputReadBufferSize     = 32 * 1024
 	maximumProcessExitCode   = 1<<31 - 1
+	// maxRetainedLogBytes caps the total LogChunk data an execution retains, so a
+	// high-output job cannot hold unbounded memory across the retention window.
+	maxRetainedLogBytes = 4 * 1024 * 1024
 )
 
 var (
@@ -41,19 +44,21 @@ type Registry struct {
 }
 
 type execution struct {
-	mu        sync.Mutex
-	id        string
-	slot      uint32
-	meta      JobMeta
-	command   *exec.Cmd
-	processID int
-	phase     string
-	running   bool
-	reaped    bool
-	cancelled bool
-	events    []Event
-	notify    chan struct{}
-	done      chan struct{}
+	mu               sync.Mutex
+	id               string
+	slot             uint32
+	meta             JobMeta
+	command          *exec.Cmd
+	processID        int
+	phase            string
+	running          bool
+	reaped           bool
+	cancelled        bool
+	events           []Event
+	retainedLogBytes int
+	logCapCursor     int
+	notify           chan struct{}
+	done             chan struct{}
 }
 
 // New returns an empty process registry.
@@ -154,19 +159,21 @@ func (r *Registry) Start(spec ExecSpec) (Outcome, error) {
 	_ = stderrWriter.Close()
 
 	execState := &execution{
-		mu:        sync.Mutex{},
-		id:        spec.ExecutionID,
-		slot:      spec.Slot,
-		meta:      spec.Meta,
-		command:   command,
-		processID: command.Process.Pid,
-		phase:     "running",
-		running:   true,
-		reaped:    false,
-		cancelled: false,
-		events:    nil,
-		notify:    make(chan struct{}),
-		done:      make(chan struct{}),
+		mu:               sync.Mutex{},
+		id:               spec.ExecutionID,
+		slot:             spec.Slot,
+		meta:             spec.Meta,
+		command:          command,
+		processID:        command.Process.Pid,
+		phase:            "running",
+		running:          true,
+		reaped:           false,
+		cancelled:        false,
+		events:           nil,
+		retainedLogBytes: 0,
+		logCapCursor:     0,
+		notify:           make(chan struct{}),
+		done:             make(chan struct{}),
 	}
 	execState.appendEvent(PhaseChange{Phase: "running"})
 	r.executions[spec.ExecutionID] = execState
@@ -328,8 +335,42 @@ func (e *execution) appendHeartbeat(now time.Time) {
 func (e *execution) appendEventLocked(payload EventPayload) {
 	sequence := uint64(len(e.events) + 1)
 	e.events = append(e.events, Event{Sequence: sequence, Payload: payload})
+	if chunk, ok := payload.(LogChunk); ok {
+		e.retainedLogBytes += len(chunk.Data)
+		e.enforceLogByteCapLocked()
+	}
 	close(e.notify)
 	e.notify = make(chan struct{})
+}
+
+// enforceLogByteCapLocked truncates the data of the oldest retained LogChunk
+// events until the total retained log bytes fall back under the cap. It keeps
+// every Event in place, so Sequence numbers stay contiguous and replay from a
+// cursor still resolves each sequence to its slot, and it never touches
+// PhaseChange, Heartbeat, or TerminalResult events. Each captured chunk is at
+// most outputReadBufferSize, well under the cap, so evicting whole oldest chunks
+// always reaches the target without splitting the newest chunk.
+//
+// The scan resumes from logCapCursor rather than rescanning e.events from zero
+// on every append, so it stays O(1) amortized and does not hold e.mu across an
+// O(n) walk that would stall the capture goroutines draining the pipes. A
+// forward-only cursor is correct because events are only appended (never
+// removed) and a LogChunk payload is only ever zeroed (never un-zeroed), so no
+// entry before the cursor can require eviction again: every entry the cursor
+// passed was either a non-LogChunk event or a LogChunk this method already
+// zeroed, and the early return leaves the cursor on the oldest live chunk.
+func (e *execution) enforceLogByteCapLocked() {
+	for ; e.logCapCursor < len(e.events); e.logCapCursor++ {
+		if e.retainedLogBytes <= maxRetainedLogBytes {
+			return
+		}
+		chunk, ok := e.events[e.logCapCursor].Payload.(LogChunk)
+		if !ok || len(chunk.Data) == 0 {
+			continue
+		}
+		e.retainedLogBytes -= len(chunk.Data)
+		e.events[e.logCapCursor].Payload = LogChunk{Stream: chunk.Stream, Data: nil}
+	}
 }
 
 func mergedEnvironment(overrides map[string]string) []string {
