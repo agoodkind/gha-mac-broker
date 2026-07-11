@@ -1,0 +1,3 @@
+internal/guestexec/process_unix.go:10:6: unreachable func: configureProcessGroup
+internal/guestexec/types.go:23:18: unreachable func: Outcome.String
+internal/guestexec/wait_supported.go:18:6: unreachable func: waitUntilExited
