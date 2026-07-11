@@ -308,19 +308,23 @@ func (w *worker) handOff(ctx context.Context, snapshot *guestexec.Snapshot) (int
 // It reuses the exact reload flow, so an agent update never disturbs a running
 // job and never reimplements the swap.
 func (w *worker) triggerAgentUpdate(newBinaryPath string) error {
+	// Hold reloadMu across the pending-path record and the SIGHUP so two
+	// concurrent UpdateAgent RPCs cannot overwrite each other's pendingExecutable
+	// and have a coalesced SIGHUP hand off only one requested version.
 	w.reloadMu.Lock()
+	defer w.reloadMu.Unlock()
 	if w.replaced {
-		w.reloadMu.Unlock()
 		w.log.Warn("guest worker update reload refused; already replaced", "path", newBinaryPath)
 		return fmt.Errorf("guestworker: worker already replaced; update reload not permitted")
 	}
+	if w.pendingExecutable != "" && w.pendingExecutable != newBinaryPath {
+		w.log.Warn("guest worker update reload refused; another update already pending",
+			"pending", w.pendingExecutable, "path", newBinaryPath)
+		return fmt.Errorf("guestworker: update reload already pending for %q", w.pendingExecutable)
+	}
 	w.pendingExecutable = newBinaryPath
-	w.reloadMu.Unlock()
-
 	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
-		w.reloadMu.Lock()
 		w.pendingExecutable = ""
-		w.reloadMu.Unlock()
 		w.log.Warn("guest worker update reload signal failed", "path", newBinaryPath, "err", err)
 		return fmt.Errorf("guestworker: signal update reload: %w", err)
 	}
