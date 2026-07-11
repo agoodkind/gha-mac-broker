@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"goodkind.io/gha-mac-broker/internal/config"
+	"goodkind.io/gha-mac-broker/internal/hostedload"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
 )
 
@@ -59,7 +60,8 @@ type webhookJobField struct {
 }
 
 type capacityResponse struct {
-	Available bool `json:"available"`
+	Available  bool `json:"available"`
+	HostedFree bool `json:"hosted_free"`
 }
 
 type statusResponse struct {
@@ -76,6 +78,7 @@ type Server struct {
 	webhookCIDRs  []*net.IPNet
 	cfg           *config.Config
 	pool          pooler
+	hostedTracker *hostedload.Tracker
 }
 
 type serverConfig struct {
@@ -86,7 +89,7 @@ type serverConfig struct {
 }
 
 // New builds a Server and registers its routes on an internal mux.
-func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler) *Server {
+func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler, hostedTracker *hostedload.Tracker) *Server {
 	s := &Server{
 		mux:           http.NewServeMux(),
 		mu:            sync.RWMutex{},
@@ -95,6 +98,7 @@ func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCID
 		webhookCIDRs:  webhookCIDRs,
 		cfg:           cfg,
 		pool:          p,
+		hostedTracker: hostedTracker,
 	}
 	s.mux.HandleFunc("/webhook", s.handleWebhook)
 	s.mux.HandleFunc("/capacity", s.handleCapacity)
@@ -162,9 +166,13 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		s.dispatchJob(w, r, payload, liveConfig)
 	case webhookActionInProgress:
 		slog.DebugContext(r.Context(), "workflow job in progress", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "runner", payload.WorkflowJob.RunnerName, "runner_id", payload.WorkflowJob.RunnerID)
+		if hostedload.IsHostedMacOSJob(payload.WorkflowJob.Labels, liveConfig.cfg.Labels) {
+			s.hostedTracker.MarkInProgress(payload.WorkflowJob.ID)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	case webhookActionCompleted:
 		slog.DebugContext(r.Context(), "workflow job completed", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "job_id", payload.WorkflowJob.ID, "status", payload.WorkflowJob.Status, "conclusion", payload.WorkflowJob.Conclusion)
+		s.hostedTracker.MarkCompleted(payload.WorkflowJob.ID)
 		if payload.WorkflowJob.Conclusion == "cancelled" || payload.WorkflowJob.Conclusion == "skipped" {
 			s.pool.CancelRun(payload.WorkflowJob.ID)
 		}
@@ -231,15 +239,21 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	xcode := r.URL.Query().Get("xcode")
 	slog.DebugContext(r.Context(), "capacity request", "repo", repo, "os", macos, "xcode", xcode)
 	liveConfig := s.configSnapshot()
+	// hosted_free reports whether the account is below its GitHub-hosted macOS
+	// concurrency limit, so a consumer can spill to hosted runners even when the
+	// pool cannot serve the image. A non-positive limit means unbounded, so it is
+	// always free. Compute it once and include it in both responses below.
+	limit := liveConfig.cfg.HostedMacOSConcurrencyLimit
+	hostedFree := limit <= 0 || s.hostedTracker.Count() < limit
 	// Available only when the requested image resolves to the exact image the
 	// pool is running. The pool warms every VM on cfg.Tart.BaseImage, so a
 	// mappable-but-different tag cannot be served and must route to hosted.
 	tag, ok := liveConfig.cfg.ResolveImage(macos, xcode)
 	if !ok || tag != liveConfig.cfg.Tart.BaseImage {
-		writeJSON(w, capacityResponse{Available: false})
+		writeJSON(w, capacityResponse{Available: false, HostedFree: hostedFree})
 		return
 	}
-	writeJSON(w, capacityResponse{Available: s.pool.Ready()})
+	writeJSON(w, capacityResponse{Available: s.pool.Ready(), HostedFree: hostedFree})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {

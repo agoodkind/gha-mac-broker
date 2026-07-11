@@ -310,6 +310,87 @@ func TestListRunnersReadsAllPages(t *testing.T) {
 	}
 }
 
+func TestListInProgressHostedMacOSJobsFiltersToHostedMacOS(t *testing.T) {
+	pemKey, _ := testKeyPEM(t)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/app/installations":
+			page := r.URL.Query().Get("page")
+			if page == "" {
+				page = "1"
+			}
+			switch page {
+			case "1":
+				_ = json.NewEncoder(w).Encode([]map[string]int64{{"id": 100}})
+			default:
+				_ = json.NewEncoder(w).Encode([]map[string]int64{})
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/100/access_tokens":
+			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "token-100"})
+		case r.Method == http.MethodGet && r.URL.Path == "/installation/repositories":
+			_ = json.NewEncoder(w).Encode(installedRepositoriesResponse{
+				TotalCount:   1,
+				Repositories: []installedRepository{{FullName: "owner/repo"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/installation":
+			_ = json.NewEncoder(w).Encode(installationResponse{ID: 100})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/actions/runs":
+			if got := r.URL.Query().Get("status"); got != "in_progress" {
+				t.Errorf("runs status = %q, want in_progress", got)
+			}
+			_ = json.NewEncoder(w).Encode(inProgressRunsResponse{
+				TotalCount: 1,
+				WorkflowRuns: []struct {
+					ID int64 `json:"id"`
+				}{{ID: 555}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/actions/runs/555/jobs":
+			_ = json.NewEncoder(w).Encode(runJobsResponse{
+				TotalCount: 2,
+				Jobs: []struct {
+					ID     int64    `json:"id"`
+					Status string   `json:"status"`
+					Labels []string `json:"labels"`
+				}{
+					{ID: 1001, Status: "in_progress", Labels: []string{"macos-14"}},
+					{ID: 1002, Status: "in_progress", Labels: []string{"ubuntu-latest"}},
+				},
+			})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	})
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, r)
+			return recorder.Result(), nil
+		}),
+	}
+
+	client, err := New("12345", pemKey, WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client.apiBase = "https://api.github.test"
+
+	jobs, err := client.ListInProgressHostedMacOSJobs(context.Background(), []string{"self-hosted", "agk-local-macos-26"})
+	if err != nil {
+		t.Fatalf("ListInProgressHostedMacOSJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("job count = %d, want 1 (only the hosted macOS job)", len(jobs))
+	}
+	if _, ok := jobs[1001]; !ok {
+		t.Errorf("expected hosted macOS job 1001 in set, got %v", jobs)
+	}
+	if _, ok := jobs[1002]; ok {
+		t.Errorf("ubuntu job 1002 must not be in the hosted macOS set")
+	}
+}
+
 func TestListInstalledReposReadsAppInstallations(t *testing.T) {
 	pemKey, _ := testKeyPEM(t)
 	type installedRepo struct {

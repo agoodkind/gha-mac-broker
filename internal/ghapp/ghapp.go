@@ -26,6 +26,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"goodkind.io/gha-mac-broker/internal/hostedload"
 )
 
 // defaultAPIBase is the GitHub REST API root.
@@ -44,6 +46,10 @@ const runnerListPageSize = 100
 // installationListPageSize is the largest page size used for App installations
 // and installation repository lists.
 const installationListPageSize = 100
+
+// actionsListPageSize is the largest page size accepted by GitHub's Actions runs
+// and jobs list endpoints.
+const actionsListPageSize = 100
 
 // Client authenticates as one GitHub App.
 type Client struct {
@@ -345,6 +351,26 @@ type runnerListResponse struct {
 	Runners    []Runner `json:"runners"`
 }
 
+// inProgressRunsResponse is the relevant subset of
+// GET /repos/{owner}/{repo}/actions/runs?status=in_progress.
+type inProgressRunsResponse struct {
+	TotalCount   int `json:"total_count"`
+	WorkflowRuns []struct {
+		ID int64 `json:"id"`
+	} `json:"workflow_runs"`
+}
+
+// runJobsResponse is the relevant subset of
+// GET /repos/{owner}/{repo}/actions/runs/{runID}/jobs.
+type runJobsResponse struct {
+	TotalCount int `json:"total_count"`
+	Jobs       []struct {
+		ID     int64    `json:"id"`
+		Status string   `json:"status"`
+		Labels []string `json:"labels"`
+	} `json:"jobs"`
+}
+
 // JITConfig is the result of generate-jitconfig.
 type JITConfig struct {
 	// EncodedJITConfig is passed verbatim to the runner via --jitconfig.
@@ -438,6 +464,95 @@ func (c *Client) DeleteRunner(ctx context.Context, repo string, runnerID int64) 
 		return fmt.Errorf("ghapp: delete runner %s#%d: %w", repo, runnerID, err)
 	}
 	return nil
+}
+
+// ListInProgressHostedMacOSJobs returns the set of in-progress GitHub-hosted
+// macOS job IDs across every installed repository. It is the periodic reconcile
+// that corrects the live webhook counter for restart or missed-delivery drift.
+// On any API error it returns the error so the caller keeps its existing live
+// set rather than clobbering it to empty.
+func (c *Client) ListInProgressHostedMacOSJobs(ctx context.Context, poolLabels []string) (map[int64]struct{}, error) {
+	repos, err := c.ListInstalledRepos(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "ghapp hosted job sweep list repos failed", "err", err)
+		return nil, fmt.Errorf("ghapp: list installed repos for hosted job sweep: %w", err)
+	}
+	result := make(map[int64]struct{})
+	for _, repo := range repos {
+		owner, repoName, ok := strings.Cut(repo, "/")
+		if !ok || owner == "" || repoName == "" {
+			slog.WarnContext(ctx, "ghapp hosted job sweep skipping malformed repo", "repo", repo)
+			continue
+		}
+		_, _, token, err := c.repoToken(ctx, repo)
+		if err != nil {
+			slog.ErrorContext(ctx, "ghapp hosted job sweep repo token failed", "err", err, "repo", repo)
+			return nil, fmt.Errorf("ghapp: repo token for hosted job sweep %s: %w", repo, err)
+		}
+		runIDs, err := c.listInProgressRunIDs(ctx, owner, repoName, token)
+		if err != nil {
+			return nil, err
+		}
+		for _, runID := range runIDs {
+			if err := c.collectHostedMacOSJobs(ctx, owner, repoName, token, runID, poolLabels, result); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return result, nil
+}
+
+// listInProgressRunIDs returns the ids of every in-progress workflow run in one
+// repository, following pagination until the reported total is reached.
+func (c *Client) listInProgressRunIDs(ctx context.Context, owner, repoName, token string) ([]int64, error) {
+	var runIDs []int64
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/repos/%s/%s/actions/runs?status=in_progress&per_page=%d&page=%d", owner, repoName, actionsListPageSize, page)
+		body, err := c.do(ctx, http.MethodGet, path, "token "+token, nil)
+		if err != nil {
+			slog.ErrorContext(ctx, "ghapp in-progress runs list failed", "err", err, "repo", owner+"/"+repoName, "page", page)
+			return nil, fmt.Errorf("ghapp: list in-progress runs %s/%s page %d: %w", owner, repoName, page, err)
+		}
+		var out inProgressRunsResponse
+		if err := json.Unmarshal(body, &out); err != nil {
+			slog.ErrorContext(ctx, "ghapp decode in-progress runs failed", "err", err, "repo", owner+"/"+repoName, "page", page)
+			return nil, fmt.Errorf("ghapp: decode in-progress runs %s/%s page %d: %w", owner, repoName, page, err)
+		}
+		for _, run := range out.WorkflowRuns {
+			runIDs = append(runIDs, run.ID)
+		}
+		if len(out.WorkflowRuns) == 0 || len(runIDs) >= out.TotalCount {
+			return runIDs, nil
+		}
+	}
+}
+
+// collectHostedMacOSJobs adds every in-progress GitHub-hosted macOS job id in one
+// run to result, following pagination until the reported total is reached.
+func (c *Client) collectHostedMacOSJobs(ctx context.Context, owner, repoName, token string, runID int64, poolLabels []string, result map[int64]struct{}) error {
+	collected := 0
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?per_page=%d&page=%d", owner, repoName, runID, actionsListPageSize, page)
+		body, err := c.do(ctx, http.MethodGet, path, "token "+token, nil)
+		if err != nil {
+			slog.ErrorContext(ctx, "ghapp run jobs list failed", "err", err, "repo", owner+"/"+repoName, "run_id", runID, "page", page)
+			return fmt.Errorf("ghapp: list jobs for run %s/%s#%d page %d: %w", owner, repoName, runID, page, err)
+		}
+		var out runJobsResponse
+		if err := json.Unmarshal(body, &out); err != nil {
+			slog.ErrorContext(ctx, "ghapp decode run jobs failed", "err", err, "repo", owner+"/"+repoName, "run_id", runID, "page", page)
+			return fmt.Errorf("ghapp: decode jobs for run %s/%s#%d page %d: %w", owner, repoName, runID, page, err)
+		}
+		for _, job := range out.Jobs {
+			if job.Status == "in_progress" && hostedload.IsHostedMacOSJob(job.Labels, poolLabels) {
+				result[job.ID] = struct{}{}
+			}
+		}
+		collected += len(out.Jobs)
+		if len(out.Jobs) == 0 || collected >= out.TotalCount {
+			return nil
+		}
+	}
 }
 
 func (c *Client) repoToken(ctx context.Context, fullRepo string) (string, string, string, error) {

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"goodkind.io/gha-mac-broker/internal/config"
+	"goodkind.io/gha-mac-broker/internal/hostedload"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
 )
 
@@ -224,7 +225,7 @@ func TestVerifySignatureWrongSecret(t *testing.T) {
 }
 
 func TestWebhookBadSignatureReturns401(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{})
+	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker())
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 42)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-Hub-Signature-256", "sha256=badbadbadbad")
@@ -237,7 +238,7 @@ func TestWebhookBadSignatureReturns401(t *testing.T) {
 
 func TestWebhookNonQueuedReturns204(t *testing.T) {
 	pool := &testPool{}
-	srv := New(testSecret, newTestConfig(), nil, nil, pool)
+	srv := New(testSecret, newTestConfig(), nil, nil, pool, hostedload.NewTracker())
 	body := webhookBody("in_progress", "owner/repo", []string{"self-hosted"}, 42)
 	w := postWebhook(t, srv, body)
 	if w.Code != http.StatusNoContent {
@@ -250,7 +251,7 @@ func TestWebhookNonQueuedReturns204(t *testing.T) {
 
 func TestWebhookCompletedCancelsCancelledAndSkippedJobs(t *testing.T) {
 	pool := &testPool{}
-	srv := New(testSecret, newTestConfig(), nil, nil, pool)
+	srv := New(testSecret, newTestConfig(), nil, nil, pool, hostedload.NewTracker())
 	testCases := []struct {
 		name       string
 		runID      int64
@@ -281,7 +282,7 @@ func TestWebhookCompletedCancelsCancelledAndSkippedJobs(t *testing.T) {
 
 func TestWebhookQueuedEnqueuesJobForAnyRepoWithMatchingLabel(t *testing.T) {
 	pool := &testPool{}
-	srv := New(testSecret, newTestConfig(), nil, nil, pool)
+	srv := New(testSecret, newTestConfig(), nil, nil, pool, hostedload.NewTracker())
 	body := webhookBody("queued", "other/repo", []string{"self-hosted"}, 99)
 	w := postWebhook(t, srv, body)
 	if w.Code != http.StatusAccepted {
@@ -299,7 +300,7 @@ func TestWebhookQueuedEnqueuesJobForAnyRepoWithMatchingLabel(t *testing.T) {
 
 func TestWebhookNoMatchingLabelReturns204(t *testing.T) {
 	pool := &testPool{}
-	srv := New(testSecret, newTestConfig(), nil, nil, pool)
+	srv := New(testSecret, newTestConfig(), nil, nil, pool, hostedload.NewTracker())
 	body := webhookBody("queued", "owner/repo", []string{"ubuntu-latest"}, 99)
 	w := postWebhook(t, srv, body)
 	if w.Code != http.StatusNoContent {
@@ -312,7 +313,7 @@ func TestWebhookNoMatchingLabelReturns204(t *testing.T) {
 
 func TestWebhookQueuedEnqueuesJobAndReturns202(t *testing.T) {
 	pool := &testPool{}
-	srv := New(testSecret, newTestConfig(), nil, nil, pool)
+	srv := New(testSecret, newTestConfig(), nil, nil, pool, hostedload.NewTracker())
 	body := webhookBodyWithJobID("queued", "owner/repo", []string{"self-hosted"}, 7, 1007)
 	w := postWebhook(t, srv, body)
 	if w.Code != http.StatusAccepted {
@@ -330,7 +331,7 @@ func TestWebhookQueuedEnqueuesJobAndReturns202(t *testing.T) {
 
 func TestWebhookQueuedReturns503WhenEnqueueFails(t *testing.T) {
 	pool := &testPool{enqueueErr: errors.New("pool shutting down")}
-	srv := New(testSecret, newTestConfig(), nil, nil, pool)
+	srv := New(testSecret, newTestConfig(), nil, nil, pool, hostedload.NewTracker())
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 7)
 	w := postWebhook(t, srv, body)
 	if w.Code != http.StatusServiceUnavailable {
@@ -343,7 +344,7 @@ func TestWebhookQueuedWithUnresolvedDefaultImageReturns204(t *testing.T) {
 	cfg.Tart.Images = nil
 	cfg.Tart.BaseImage = "docker.io/library/alpine:latest"
 	pool := &testPool{}
-	srv := New(testSecret, cfg, nil, nil, pool)
+	srv := New(testSecret, cfg, nil, nil, pool, hostedload.NewTracker())
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 7)
 	w := postWebhook(t, srv, body)
 	if w.Code != http.StatusNoContent {
@@ -357,7 +358,7 @@ func TestWebhookQueuedWithUnresolvedDefaultImageReturns204(t *testing.T) {
 func TestWebhookUsesSingleConfigSnapshotDuringRequest(t *testing.T) {
 	pool := &testPool{}
 	allowed := []*net.IPNet{mustParseCIDR(t, "192.30.252.0/22")}
-	srv := New(testSecret, newTestConfig(), nil, allowed, pool)
+	srv := New(testSecret, newTestConfig(), nil, allowed, pool, hostedload.NewTracker())
 	body := webhookBodyWithJobID("queued", "owner/repo", []string{"self-hosted"}, 7, 1007)
 	blockingBody := &blockingWebhookBody{
 		body:        body,
@@ -407,7 +408,7 @@ func TestWebhookUsesSingleConfigSnapshotDuringRequest(t *testing.T) {
 }
 
 func TestWebhookNonPostMethodReturns405(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{})
+	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker())
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 42)
 	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
 		req := httptest.NewRequest(method, "/webhook", strings.NewReader(string(body)))
@@ -421,7 +422,7 @@ func TestWebhookNonPostMethodReturns405(t *testing.T) {
 }
 
 func TestCapacityAvailableForAnyRepo(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true})
+	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker())
 	resp := capacityRequest(t, srv, "/capacity?repo=other/repo&run_id=1")
 	if !resp.Available {
 		t.Fatal("expected available=true for any repo when runner pool is ready")
@@ -429,7 +430,7 @@ func TestCapacityAvailableForAnyRepo(t *testing.T) {
 }
 
 func TestCapacityAvailableUsesPoolReadiness(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true})
+	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker())
 	resp := capacityRequest(t, srv, "/capacity?repo=owner/repo&os=tahoe&xcode=26.5")
 	if !resp.Available {
 		t.Fatal("expected available=true when runner pool is ready")
@@ -437,7 +438,7 @@ func TestCapacityAvailableUsesPoolReadiness(t *testing.T) {
 }
 
 func TestCapacityUnmappedImageReturnsUnavailable(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true})
+	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker())
 	resp := capacityRequest(t, srv, "/capacity?repo=owner/repo&os=tahoe&xcode=raw")
 	if resp.Available {
 		t.Fatal("expected available=false for unmapped image")
@@ -445,7 +446,7 @@ func TestCapacityUnmappedImageReturnsUnavailable(t *testing.T) {
 }
 
 func TestCapacityNotAvailableWhenPoolNotReady(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: false})
+	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: false}, hostedload.NewTracker())
 	resp := capacityRequest(t, srv, "/capacity?repo=owner/repo")
 	if resp.Available {
 		t.Fatal("expected available=false when runner pool is not ready")
@@ -453,7 +454,7 @@ func TestCapacityNotAvailableWhenPoolNotReady(t *testing.T) {
 }
 
 func TestCapacityPublicNoHeaderReturns200(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true})
+	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker())
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=10", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
@@ -463,7 +464,7 @@ func TestCapacityPublicNoHeaderReturns200(t *testing.T) {
 }
 
 func TestCapacityPublicIgnoresWrongToken(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true})
+	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker())
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=11", nil)
 	req.Header.Set("Authorization", "Bearer wrong-token")
 	w := httptest.NewRecorder()
@@ -474,11 +475,69 @@ func TestCapacityPublicIgnoresWrongToken(t *testing.T) {
 }
 
 func TestCapacityReturns200AndAvailable(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true})
+	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker())
 	resp := capacityRequest(t, srv, "/capacity")
 	if !resp.Available {
 		t.Fatal("expected available=true when runner pool is ready")
 	}
+}
+
+func TestCapacityHostedFree(t *testing.T) {
+	t.Run("free when in-progress count is below the limit", func(t *testing.T) {
+		cfg := newTestConfig()
+		cfg.HostedMacOSConcurrencyLimit = 2
+		tracker := hostedload.NewTracker()
+		srv := New(testSecret, cfg, testCapacityToken, nil, &testPool{ready: true}, tracker)
+		tracker.MarkInProgress(1)
+		resp := capacityRequest(t, srv, "/capacity")
+		if !resp.Available {
+			t.Fatal("expected available=true when runner pool is ready")
+		}
+		if !resp.HostedFree {
+			t.Fatal("expected hosted_free=true when count is below the limit")
+		}
+	})
+
+	t.Run("not free when in-progress count reaches the limit", func(t *testing.T) {
+		cfg := newTestConfig()
+		cfg.HostedMacOSConcurrencyLimit = 2
+		tracker := hostedload.NewTracker()
+		srv := New(testSecret, cfg, testCapacityToken, nil, &testPool{ready: true}, tracker)
+		tracker.MarkInProgress(1)
+		tracker.MarkInProgress(2)
+		resp := capacityRequest(t, srv, "/capacity")
+		if resp.HostedFree {
+			t.Fatal("expected hosted_free=false when count is at the limit")
+		}
+	})
+
+	t.Run("free regardless of count when the limit is non-positive", func(t *testing.T) {
+		cfg := newTestConfig()
+		cfg.HostedMacOSConcurrencyLimit = 0
+		tracker := hostedload.NewTracker()
+		srv := New(testSecret, cfg, testCapacityToken, nil, &testPool{ready: true}, tracker)
+		tracker.MarkInProgress(1)
+		tracker.MarkInProgress(2)
+		tracker.MarkInProgress(3)
+		resp := capacityRequest(t, srv, "/capacity")
+		if !resp.HostedFree {
+			t.Fatal("expected hosted_free=true when the limit is non-positive")
+		}
+	})
+
+	t.Run("spill case reports hosted_free even when unavailable", func(t *testing.T) {
+		cfg := newTestConfig()
+		cfg.HostedMacOSConcurrencyLimit = 2
+		tracker := hostedload.NewTracker()
+		srv := New(testSecret, cfg, testCapacityToken, nil, &testPool{ready: true}, tracker)
+		resp := capacityRequest(t, srv, "/capacity?os=tahoe&xcode=raw")
+		if resp.Available {
+			t.Fatal("expected available=false for an unmapped image")
+		}
+		if !resp.HostedFree {
+			t.Fatal("expected hosted_free=true in the unavailable spill response")
+		}
+	})
 }
 
 func TestStatusRequiresBearerTokenAndReturnsPoolViews(t *testing.T) {
@@ -514,7 +573,7 @@ func TestStatusRequiresBearerTokenAndReturnsPoolViews(t *testing.T) {
 			},
 		},
 	}
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, pool)
+	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, pool, hostedload.NewTracker())
 
 	unauthorizedReq := httptest.NewRequest(http.MethodGet, "/status", nil)
 	unauthorizedRecorder := httptest.NewRecorder()
@@ -563,7 +622,7 @@ func mustParseCIDR(t *testing.T, cidr string) *net.IPNet {
 
 func TestWebhookDisallowedIPReturns403(t *testing.T) {
 	allowed := []*net.IPNet{mustParseCIDR(t, "192.30.252.0/22")}
-	srv := New(testSecret, newTestConfig(), nil, allowed, &testPool{})
+	srv := New(testSecret, newTestConfig(), nil, allowed, &testPool{}, hostedload.NewTracker())
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 99)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-Hub-Signature-256", signBody(body))
@@ -577,7 +636,7 @@ func TestWebhookDisallowedIPReturns403(t *testing.T) {
 
 func TestWebhookAllowedIPProceedsToHMAC(t *testing.T) {
 	allowed := []*net.IPNet{mustParseCIDR(t, "192.30.252.0/22")}
-	srv := New(testSecret, newTestConfig(), nil, allowed, &testPool{})
+	srv := New(testSecret, newTestConfig(), nil, allowed, &testPool{}, hostedload.NewTracker())
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 99)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-Hub-Signature-256", "sha256=badbadbadbad")
@@ -590,7 +649,7 @@ func TestWebhookAllowedIPProceedsToHMAC(t *testing.T) {
 }
 
 func TestWebhookEmptyCIDRsSkipsIPCheck(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{})
+	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker())
 	body := webhookBody("in_progress", "owner/repo", []string{"self-hosted"}, 42)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-Hub-Signature-256", signBody(body))
@@ -602,7 +661,7 @@ func TestWebhookEmptyCIDRsSkipsIPCheck(t *testing.T) {
 }
 
 func TestHealthz(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{})
+	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker())
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)

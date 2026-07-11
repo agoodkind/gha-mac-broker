@@ -40,6 +40,9 @@ private_key_path = "/tmp/key.pem"
 	if cfg.JobsPerVM != 1 {
 		t.Errorf("default jobs per VM = %d", cfg.JobsPerVM)
 	}
+	if cfg.HostedMacOSConcurrencyLimit != 5 {
+		t.Errorf("default hosted macOS concurrency limit = %d, want 5", cfg.HostedMacOSConcurrencyLimit)
+	}
 	// MaxIdle and MaxAge are honored verbatim, so an unset value stays zero and
 	// disables that recycle trigger rather than defaulting.
 	if time.Duration(cfg.MaxIdle) != 0 {
@@ -281,6 +284,33 @@ private_key_path = "/tmp/key.pem"
 	}
 	if !strings.Contains(err.Error(), "jobs_per_vm must be at least 1") {
 		t.Errorf("error = %q, want jobs_per_vm validation", err.Error())
+	}
+}
+
+func TestNegativeHostedMacOSConcurrencyLimitIsAcceptedAsDisableSentinel(t *testing.T) {
+	cfg := &Config{
+		ListenAddr:                  "[::1]:8080",
+		RunnerCount:                 1,
+		JobsPerVM:                   1,
+		HostedMacOSConcurrencyLimit: -1,
+		App: AppConfig{
+			AppID:          "12345",
+			PrivateKeyPath: "/tmp/key.pem",
+		},
+		Tart: TartConfig{
+			Binary:    "tart",
+			BaseImage: DefaultBaseImage,
+		},
+	}
+	// A negative limit is the disable sentinel: validate accepts it and applyDefaults
+	// leaves it unchanged (only an explicit zero is defaulted), so it reaches the
+	// server's limit <= 0 branch that keeps hosted_free always true.
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("negative hosted_macos_concurrency_limit should be accepted as a disable sentinel, got %v", err)
+	}
+	cfg.applyDefaults()
+	if cfg.HostedMacOSConcurrencyLimit != -1 {
+		t.Errorf("applyDefaults changed negative limit to %d, want it left as -1", cfg.HostedMacOSConcurrencyLimit)
 	}
 }
 

@@ -32,6 +32,9 @@ const (
 	// fast_pull_parallel is unset. ghcr throttles each connection, so more
 	// concurrent streams raise the cold-pull rate.
 	defaultFastPullParallel = 16
+	// defaultHostedMacOSConcurrencyLimit is the common personal/Pro GitHub-hosted
+	// macOS concurrent-job limit, used when config does not set one.
+	defaultHostedMacOSConcurrencyLimit = 5
 )
 
 // Config is the broker's runtime configuration.
@@ -67,6 +70,16 @@ type Config struct {
 
 	// StallReap allows a stalled busy worker to be recycled after logging.
 	StallReap bool `toml:"stall_reap"`
+
+	// HostedMacOSConcurrencyLimit is the account-wide GitHub-hosted macOS
+	// concurrent-job limit. The /capacity endpoint reports hosted_free=true while
+	// fewer than this many hosted macOS jobs are in progress, so a CI consumer can
+	// release a queued job to hosted only when hosted has headroom. Zero or unset
+	// defaults to defaultHostedMacOSConcurrencyLimit. A negative value disables the
+	// gate: /capacity then always reports hosted_free=true (the limit <= 0 branch in
+	// the server). Only an explicit zero is defaulted, so negative survives as the
+	// disable sentinel, mirroring the unset-vs-zero handling of Tart.FastPull.
+	HostedMacOSConcurrencyLimit int `toml:"hosted_macos_concurrency_limit"`
 
 	// App identifies the GitHub App and where its private key lives.
 	App AppConfig `toml:"app"`
@@ -215,6 +228,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.JobsPerVM == 0 {
 		c.JobsPerVM = defaultJobsPerVM
+	}
+	if c.HostedMacOSConcurrencyLimit == 0 {
+		c.HostedMacOSConcurrencyLimit = defaultHostedMacOSConcurrencyLimit
 	}
 	if c.Tart.Binary == "" {
 		c.Tart.Binary = "tart"
