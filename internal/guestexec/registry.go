@@ -214,6 +214,82 @@ func (r *Registry) Subscribe(
 	return events, cancel, nil
 }
 
+// Cancel kills the execution process group. Repeated cancellation is a no-op.
+func (r *Registry) Cancel(executionID string) error {
+	r.mu.Lock()
+	execState, found := r.executions[executionID]
+	r.mu.Unlock()
+	if !found {
+		slog.Error("guest execution cancellation not found", "err", ErrExecutionNotFound, "execution_id", executionID)
+		return fmt.Errorf("%w: %s", ErrExecutionNotFound, executionID)
+	}
+
+	execState.mu.Lock()
+	if !execState.running || execState.reaped || execState.cancelled {
+		execState.mu.Unlock()
+		return nil
+	}
+	processID := execState.processID
+	err := killProcessGroup(processID)
+	if err == nil {
+		execState.cancelled = true
+	}
+	execState.mu.Unlock()
+	if err != nil {
+		slog.Error("guest execution cancellation failed", "err", err, "execution_id", executionID)
+		return fmt.Errorf("guestexec: cancel %s: %w", executionID, err)
+	}
+	return nil
+}
+
+// List returns active and retained executions sorted by execution ID.
+func (r *Registry) List() []ExecutionState {
+	r.mu.Lock()
+	executions := make([]*execution, 0, len(r.executions))
+	for _, execState := range r.executions {
+		executions = append(executions, execState)
+	}
+	r.mu.Unlock()
+
+	states := make([]ExecutionState, 0, len(executions))
+	for _, execState := range executions {
+		execState.mu.Lock()
+		lastSequence := uint64(0)
+		if len(execState.events) > 0 {
+			lastSequence = execState.events[len(execState.events)-1].Sequence
+		}
+		states = append(states, ExecutionState{
+			ExecutionID:  execState.id,
+			Slot:         execState.slot,
+			Meta:         execState.meta,
+			Phase:        execState.phase,
+			Running:      execState.running,
+			LastSequence: lastSequence,
+		})
+		execState.mu.Unlock()
+	}
+	sort.Slice(states, func(i, j int) bool {
+		return states[i].ExecutionID < states[j].ExecutionID
+	})
+	return states
+}
+
+// Drain refuses new executions and returns an atomic state plus an idle notification.
+func (r *Registry) Drain() DrainState {
+	r.mu.Lock()
+	r.draining = true
+	if r.activeCount == 0 {
+		r.closeDrainedLocked()
+	}
+	state := DrainState{
+		Idle:             r.activeCount == 0,
+		ActiveExecutions: r.activeCount,
+		Done:             r.drained,
+	}
+	r.mu.Unlock()
+	return state
+}
+
 func (r *Registry) runExecution(
 	execState *execution,
 	stdoutReader *os.File,
@@ -286,8 +362,19 @@ func (r *Registry) completeExecution(execState *execution, exitCode int32, waitE
 	close(execState.done)
 	delete(r.slots, execState.slot)
 	r.activeCount--
+	if r.draining && r.activeCount == 0 {
+		r.closeDrainedLocked()
+	}
 	execState.mu.Unlock()
 	r.mu.Unlock()
+}
+
+func (r *Registry) closeDrainedLocked() {
+	if r.drainedClosed {
+		return
+	}
+	close(r.drained)
+	r.drainedClosed = true
 }
 
 func captureOutput(
