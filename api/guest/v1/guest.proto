@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package gha.guest.v1;
+
+option go_package = "goodkind.io/gha-mac-broker/internal/guestproto;guestproto";
+
+service GuestAgentService {
+  rpc Hello(HelloRequest) returns (HelloResponse);
+  rpc RunJob(RunJobRequest) returns (RunJobResponse);
+  rpc JobStatus(JobStatusRequest) returns (stream JobStatusEvent);
+  rpc Reattach(ReattachRequest) returns (ReattachResponse);
+  rpc Drain(DrainRequest) returns (DrainResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+}
+
+message HelloRequest {}
+
+message HelloResponse {
+  string boot_id = 1;
+  string agent_build = 2;
+  uint32 protocol_major = 3;
+  repeated string capabilities = 4;
+  repeated SlotInfo slots = 5;
+  string golden_fingerprint = 6;
+}
+
+message SlotInfo {
+  uint32 index = 1;
+  bool busy = 2;
+  string execution_id = 3;
+}
+
+message RunJobRequest {
+  string execution_id = 1;
+  uint32 slot = 2;
+  string jit_config = 3;
+  map<string, string> env = 4;
+  JobMeta meta = 5;
+}
+
+message JobMeta {
+  string repo = 1;
+  int64 job_id = 2;
+  int64 run_id = 3;
+  string runner_name = 4;
+}
+
+message RunJobResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    ACCEPTED = 1;
+    ALREADY_RUNNING = 2;
+    ALREADY_COMPLETED = 3;
+    CONFLICT = 4;
+  }
+
+  Outcome outcome = 1;
+}
+
+message JobStatusRequest {
+  string execution_id = 1;
+  uint64 from_sequence = 2;
+}
+
+message JobStatusEvent {
+  uint64 sequence = 1;
+
+  oneof event {
+    PhaseChange phase = 2;
+    LogChunk log = 3;
+    Heartbeat heartbeat = 4;
+    TerminalResult result = 5;
+  }
+}
+
+message PhaseChange {
+  string phase = 1;
+}
+
+message LogChunk {
+  enum Stream {
+    STREAM_UNSPECIFIED = 0;
+    STDOUT = 1;
+    STDERR = 2;
+  }
+
+  Stream stream = 1;
+  bytes data = 2;
+}
+
+message Heartbeat {
+  int64 unix_nanos = 1;
+}
+
+message TerminalResult {
+  int32 exit_code = 1;
+  string message = 2;
+}
+
+message ReattachRequest {}
+
+message ReattachResponse {
+  repeated ExecutionState executions = 1;
+}
+
+message ExecutionState {
+  string execution_id = 1;
+  uint32 slot = 2;
+  JobMeta meta = 3;
+  string phase = 4;
+  bool running = 5;
+  uint64 last_sequence = 6;
+}
+
+message DrainRequest {}
+
+message DrainResponse {
+  bool idle = 1;
+  uint32 active_executions = 2;
+}
+
+message CancelJobRequest {
+  string execution_id = 1;
+}
+
+message CancelJobResponse {}
