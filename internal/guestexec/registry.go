@@ -176,7 +176,35 @@ func (r *Registry) Start(spec ExecSpec) (Outcome, error) {
 	goSafe("execution reaper", func() {
 		r.runExecution(execState, stdoutReader, stderrReader)
 	})
+	goSafe("execution heartbeat", func() {
+		r.emitHeartbeats(execState)
+	})
 	return OutcomeAccepted, nil
+}
+
+// Subscribe replays events with Sequence greater than fromSequence, then follows live events.
+func (r *Registry) Subscribe(
+	executionID string,
+	fromSequence uint64,
+) (<-chan Event, func(), error) {
+	r.mu.Lock()
+	execState, found := r.executions[executionID]
+	r.mu.Unlock()
+	if !found {
+		slog.Error("guest execution subscription not found", "err", ErrExecutionNotFound, "execution_id", executionID)
+		return nil, nil, fmt.Errorf("%w: %s", ErrExecutionNotFound, executionID)
+	}
+
+	events := make(chan Event)
+	done := make(chan struct{})
+	var cancelOnce sync.Once
+	cancel := func() {
+		cancelOnce.Do(func() { close(done) })
+	}
+	goSafe("execution subscriber", func() {
+		execState.stream(fromSequence, events, done)
+	})
+	return events, cancel, nil
 }
 
 func (r *Registry) runExecution(
@@ -207,6 +235,32 @@ func (r *Registry) runExecution(
 	readers.Wait()
 	exitCode := processExitCode(execState.command.ProcessState)
 	r.completeExecution(execState, exitCode, waitErr)
+
+	time.AfterFunc(r.retention, func() {
+		r.expire(execState)
+	})
+}
+
+func (r *Registry) emitHeartbeats(execState *execution) {
+	ticker := time.NewTicker(r.heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			execState.appendHeartbeat(now)
+		case <-execState.done:
+			return
+		}
+	}
+}
+
+func (r *Registry) expire(execState *execution) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, found := r.executions[execState.id]
+	if found && current == execState {
+		delete(r.executions, execState.id)
+	}
 }
 
 func (r *Registry) completeExecution(execState *execution, exitCode int32, waitErr error) {
@@ -262,6 +316,15 @@ func (e *execution) appendEvent(payload EventPayload) {
 	e.mu.Unlock()
 }
 
+func (e *execution) appendHeartbeat(now time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.running {
+		return
+	}
+	e.appendEventLocked(Heartbeat{UnixNanos: now.UnixNano()})
+}
+
 func (e *execution) appendEventLocked(payload EventPayload) {
 	sequence := uint64(len(e.events) + 1)
 	e.events = append(e.events, Event{Sequence: sequence, Payload: payload})
@@ -299,4 +362,43 @@ func goSafe(label string, function func()) {
 		}()
 		function()
 	}()
+}
+
+func (e *execution) stream(fromSequence uint64, output chan<- Event, done <-chan struct{}) {
+	defer close(output)
+	nextSequence := fromSequence + 1
+	for {
+		e.mu.Lock()
+		if nextSequence > 0 && nextSequence <= uint64(len(e.events)) {
+			event := cloneEvent(e.events[nextSequence-1])
+			e.mu.Unlock()
+			select {
+			case output <- event:
+				nextSequence++
+			case <-done:
+				return
+			}
+			continue
+		}
+		terminal := !e.running
+		notify := e.notify
+		e.mu.Unlock()
+		if terminal {
+			return
+		}
+		select {
+		case <-notify:
+		case <-done:
+			return
+		}
+	}
+}
+
+func cloneEvent(event Event) Event {
+	chunk, ok := event.Payload.(LogChunk)
+	if ok {
+		chunk.Data = append([]byte(nil), chunk.Data...)
+		event.Payload = chunk
+	}
+	return event
 }
