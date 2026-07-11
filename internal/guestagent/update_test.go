@@ -95,8 +95,136 @@ func TestUpdateAgentAcceptsSignedArm64Binary(t *testing.T) {
 	if !bytes.Equal(written, binaryBytes) {
 		t.Fatal("placed binary content differs from the uploaded bytes")
 	}
+	info, err := os.Stat(placed)
+	if err != nil {
+		t.Fatalf("stat placed binary: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("placed binary mode = %o, want 0755 so the reload can execve it", info.Mode().Perm())
+	}
 	if leftover := tempLeftovers(t, installDir); len(leftover) != 0 {
 		t.Fatalf("temp files left behind after success: %v", leftover)
+	}
+}
+
+// TestUpdateAgentReplacesSameVersionRegularFile proves a re-verified retry of a
+// version already placed as a regular file succeeds by atomically replacing it,
+// so a failed reload does not permanently wedge that version.
+func TestUpdateAgentReplacesSameVersionRegularFile(t *testing.T) {
+	publicKey, privateKey := updateKeypair(t)
+	binaryBytes := machoImage(machoCPUArm64, true)
+	reloader := &stubReloader{calls: nil, err: nil}
+	_, address := startUpdateServer(t, guestagent.Options{
+		Reloader:        reloader,
+		InstallDir:      "",
+		UpdatePublicKey: publicKey,
+	})
+
+	header := signedHeader(privateKey, "4.5.6", binaryBytes)
+	if _, err := sendUpdate(t, address, header, binaryBytes); err != nil {
+		t.Fatalf("first placement rejected: %v", err)
+	}
+	if _, err := sendUpdate(t, address, signedHeader(privateKey, "4.5.6", binaryBytes), binaryBytes); err != nil {
+		t.Fatalf("same-version retry rejected, want atomic replace: %v", err)
+	}
+	if calls := reloader.recorded(); len(calls) != 2 {
+		t.Fatalf("reloader called %d times, want 2 (one per placement)", len(calls))
+	}
+}
+
+// TestUpdateAgentRejectsSymlinkTarget proves a symlink sitting at the versioned
+// path is refused, so an update can never be redirected out of the install dir.
+func TestUpdateAgentRejectsSymlinkTarget(t *testing.T) {
+	publicKey, privateKey := updateKeypair(t)
+	binaryBytes := machoImage(machoCPUArm64, true)
+	reloader := &stubReloader{calls: nil, err: nil}
+	installDir, address := startUpdateServer(t, guestagent.Options{
+		Reloader:        reloader,
+		InstallDir:      "",
+		UpdatePublicKey: publicKey,
+	})
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve executable: %v", err)
+	}
+	target := filepath.Join(installDir, filepath.Base(executable)+"-7.7.7")
+	outside := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.Symlink(outside, target); err != nil {
+		t.Fatalf("create symlink target: %v", err)
+	}
+
+	_, err = sendUpdate(t, address, signedHeader(privateKey, "7.7.7", binaryBytes), binaryBytes)
+	if err == nil {
+		t.Fatal("update onto a symlink target was accepted, want rejection")
+	}
+	if got := connect.CodeOf(err); got != connect.CodeAlreadyExists {
+		t.Fatalf("error code = %v, want AlreadyExists (err: %v)", got, err)
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("error %q does not mention symlink", err.Error())
+	}
+	if calls := reloader.recorded(); len(calls) != 0 {
+		t.Fatalf("reloader triggered on a symlink rejection: %v", calls)
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("lstat target after rejection: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("symlink target was replaced, want it left intact")
+	}
+}
+
+// TestUpdateAgentRejectsEmptyFrameFlood proves an authenticated stream of only
+// empty data frames is refused promptly rather than spinning until the deadline.
+func TestUpdateAgentRejectsEmptyFrameFlood(t *testing.T) {
+	publicKey, privateKey := updateKeypair(t)
+	binaryBytes := machoImage(machoCPUArm64, true)
+	reloader := &stubReloader{calls: nil, err: nil}
+	installDir, address := startUpdateServer(t, guestagent.Options{
+		Reloader:        reloader,
+		InstallDir:      "",
+		UpdatePublicKey: publicKey,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	transport := guesttransport.DialContext(ctx, address, updateTestToken)
+	service := guestprotoconnect.NewGuestAgentServiceClient(
+		transport.HTTPClient(),
+		"http://"+address,
+		connect.WithInterceptors(transport.Interceptor()),
+	)
+	stream := service.UpdateAgent(ctx)
+	if err := stream.Send(&guestproto.UpdateAgentRequest{
+		Chunk: &guestproto.UpdateAgentRequest_Header{Header: signedHeader(privateKey, "8.8.8", binaryBytes)},
+	}); err != nil {
+		t.Fatalf("send header: %v", err)
+	}
+	const emptyFrameFlood = 4096
+	sendErr := error(nil)
+	for frame := 0; frame < emptyFrameFlood; frame++ {
+		if sendErr = stream.Send(&guestproto.UpdateAgentRequest{
+			Chunk: &guestproto.UpdateAgentRequest_Data{Data: nil},
+		}); sendErr != nil {
+			break
+		}
+	}
+	_, closeErr := stream.CloseAndReceive()
+	if closeErr == nil {
+		t.Fatal("empty-frame flood was accepted, want rejection")
+	}
+	if got := connect.CodeOf(closeErr); got != connect.CodeInvalidArgument {
+		t.Fatalf("error code = %v, want InvalidArgument (err: %v)", got, closeErr)
+	}
+	if calls := reloader.recorded(); len(calls) != 0 {
+		t.Fatalf("reloader triggered on an empty-frame flood: %v", calls)
+	}
+	if entries, err := os.ReadDir(installDir); err != nil {
+		t.Fatalf("read install dir: %v", err)
+	} else if len(entries) != 0 {
+		t.Fatalf("install dir not clean after empty-frame rejection: %d entries", len(entries))
 	}
 }
 

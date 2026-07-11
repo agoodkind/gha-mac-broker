@@ -35,6 +35,15 @@ const (
 	// token holder cannot exhaust the guest disk with an unbounded stream.
 	maxUpdateSize = 512 << 20
 
+	// updateBinaryMode makes the placed binary executable so the reload can
+	// execve it; os.CreateTemp yields 0600, which would fail execve with EACCES.
+	updateBinaryMode = 0o755
+
+	// maxEmptyUpdateFrames bounds how many zero-length data frames a stream may
+	// send. Empty frames carry no bytes, so the size counter never bounds them; a
+	// token holder could otherwise spin the receive loop until the deadline.
+	maxEmptyUpdateFrames = 64
+
 	// machoCodeSignatureCommand is LC_CODE_SIGNATURE, the ad-hoc seal the Go
 	// linker emits on a darwin/arm64 image. debug/macho does not type this load
 	// command, so the structural check scans the raw load-command list for it.
@@ -145,13 +154,17 @@ func (handler *Handler) UpdateAgent(
 			errors.New("guestagent: update version matches the running binary path"),
 		)
 	}
-	if _, statErr := os.Lstat(target); statErr == nil {
+	// A symlink at the target is rejected so an update can never be redirected out
+	// of the install dir onto an attacker-chosen path. A regular file is a prior
+	// placement of this same version, whose reload may have failed; os.Rename
+	// atomically replaces it so a re-verified retry succeeds without manual cleanup.
+	if info, statErr := os.Lstat(target); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
 		return nil, connect.NewError(
 			connect.CodeAlreadyExists,
-			fmt.Errorf("guestagent: update version %q is already placed", header.GetVersion()),
+			fmt.Errorf("guestagent: update target %q is a symlink", target),
 		)
 	}
-	// Rename to a fresh versioned filename on the same filesystem, never onto the
+	// Rename to the versioned filename on the same filesystem, never onto the
 	// running inode. macOS AMFI kills a process whose live image is mutated, and
 	// writing the running path risks ETXTBSY; a new directory entry pointing at a
 	// new inode leaves the live process untouched, so the swap is atomic and safe.
@@ -267,6 +280,7 @@ func (handler *Handler) streamToTemp(
 
 	hasher := sha256.New()
 	received := uint64(0)
+	emptyFrames := 0
 	streamErr := error(nil)
 	for stream.Receive() {
 		message := stream.Msg()
@@ -279,6 +293,14 @@ func (handler *Handler) streamToTemp(
 		}
 		data := message.GetData()
 		if len(data) == 0 {
+			emptyFrames++
+			if emptyFrames > maxEmptyUpdateFrames {
+				streamErr = connect.NewError(
+					connect.CodeInvalidArgument,
+					fmt.Errorf("guestagent: update stream sent more than %d empty frames", maxEmptyUpdateFrames),
+				)
+				break
+			}
 			continue
 		}
 		received += uint64(len(data))
@@ -305,6 +327,12 @@ func (handler *Handler) streamToTemp(
 		streamErr = connect.NewError(
 			connect.CodeInvalidArgument,
 			fmt.Errorf("guestagent: update received %d bytes, declared size %d", received, declaredSize),
+		)
+	}
+	if chmodErr := tempFile.Chmod(updateBinaryMode); chmodErr != nil && streamErr == nil {
+		streamErr = connect.NewError(
+			connect.CodeInternal,
+			fmt.Errorf("guestagent: mark update binary executable: %w", chmodErr),
 		)
 	}
 	if syncErr := tempFile.Sync(); syncErr != nil && streamErr == nil {
