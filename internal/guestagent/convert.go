@@ -8,22 +8,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"strconv"
-	"strings"
 
 	"connectrpc.com/connect"
 	"goodkind.io/gha-mac-broker/internal/guestexec"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
 )
-
-const phase0Placeholder = "echo guest-agent phase0 placeholder"
-
-func phase0Script(jitConfig string) string {
-	script := strings.TrimSpace(jitConfig)
-	if script == "" {
-		return phase0Placeholder
-	}
-	return script
-}
 
 func copyEnvironment(environment map[string]string) map[string]string {
 	if len(environment) == 0 {

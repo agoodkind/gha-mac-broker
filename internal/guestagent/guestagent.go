@@ -17,7 +17,6 @@ const (
 	protocolMajor       = uint32(1)
 	defaultAgentBuild   = "dev"
 	defaultSlotCount    = uint32(1)
-	phase0Shell         = "/bin/sh"
 	capabilityRunJob    = "run-job"
 	capabilityReattach  = "reattach"
 	capabilityDrain     = "drain"
@@ -35,13 +34,17 @@ type ChildLauncher interface {
 	Run(spec guestexec.ExecSpec) (guestexec.Outcome, error)
 }
 
-// Options configures the Phase 0 guest-agent service.
+// Options configures the guest-agent service.
 type Options struct {
 	SlotCount         uint32
 	BootID            string
 	AgentBuild        string
 	GoldenFingerprint string
 	ChildLauncher     ChildLauncher
+	// SpecBuilder assembles the runner ExecSpec and runs per-slot setup for each
+	// RunJob. When nil the handler uses the production runner executor, which
+	// clones the runner, seeds the slot HOME, and sets the slot keychain.
+	SpecBuilder SpecBuilder
 }
 
 // Handler implements GuestAgentService over a guest execution registry.
@@ -52,6 +55,7 @@ type Handler struct {
 	agentBuild        string
 	goldenFingerprint string
 	childLauncher     ChildLauncher
+	specBuilder       SpecBuilder
 }
 
 var _ guestprotoconnect.GuestAgentServiceHandler = (*Handler)(nil)
@@ -79,6 +83,10 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 	if agentBuild == "" {
 		agentBuild = defaultAgentBuild
 	}
+	specBuilder := options.SpecBuilder
+	if specBuilder == nil {
+		specBuilder = newRunnerExecutor()
+	}
 	return &Handler{
 		registry:          registry,
 		slotCount:         slotCount,
@@ -86,6 +94,7 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 		agentBuild:        agentBuild,
 		goldenFingerprint: options.GoldenFingerprint,
 		childLauncher:     options.ChildLauncher,
+		specBuilder:       specBuilder,
 	}
 }
 
@@ -118,19 +127,23 @@ func (handler *Handler) Hello(
 	return connect.NewResponse(response), nil
 }
 
-// RunJob starts or reuses a registry execution using the request ID as the
-// idempotency key.
+// RunJob builds the runner ExecSpec through the spec builder, which prepares the
+// slot and returns the absolute run.sh launch, then starts or reuses a registry
+// execution using the request ID as the idempotency key.
 func (handler *Handler) RunJob(
-	_ context.Context,
+	ctx context.Context,
 	request *connect.Request[guestproto.RunJobRequest],
 ) (*connect.Response[guestproto.RunJobResponse], error) {
-	spec := guestexec.ExecSpec{
+	jobRequest := JobRequest{
 		ExecutionID: request.Msg.GetExecutionId(),
 		Slot:        request.Msg.GetSlot(),
 		Meta:        protoMetaToExec(request.Msg.GetMeta()),
-		Command:     phase0Shell,
-		Args:        []string{"-c", phase0Script(request.Msg.GetJitConfig())},
+		JitConfig:   request.Msg.GetJitConfig(),
 		Env:         copyEnvironment(request.Msg.GetEnv()),
+	}
+	spec, err := handler.specBuilder.Build(ctx, jobRequest)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	outcome, err := handler.startExecution(spec)
 	if err != nil {

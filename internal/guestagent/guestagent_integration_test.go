@@ -41,7 +41,7 @@ func TestJobStatusReconnectDoesNotCancelExecution(t *testing.T) {
 		serverContext,
 		listener,
 		registry,
-		guestagent.Options{SlotCount: 1},
+		guestagent.Options{SlotCount: 1, SpecBuilder: scriptSpecBuilder{}},
 		testBootToken,
 	)
 	t.Cleanup(func() {
@@ -138,6 +138,22 @@ func TestJobStatusReconnectDoesNotCancelExecution(t *testing.T) {
 	if state.GetLastSequence() < resumedEvents[len(resumedEvents)-1].GetSequence() {
 		t.Fatalf("reattach last_sequence = %d, want at least %d", state.GetLastSequence(), resumedEvents[len(resumedEvents)-1].GetSequence())
 	}
+}
+
+// scriptSpecBuilder runs the request jit_config as a shell script, so the
+// durability test drives real process output and a terminal result without a
+// GitHub runner. The production runner executor is exercised by runner_test.go.
+type scriptSpecBuilder struct{}
+
+func (scriptSpecBuilder) Build(_ context.Context, request guestagent.JobRequest) (guestexec.ExecSpec, error) {
+	return guestexec.ExecSpec{
+		ExecutionID: request.ExecutionID,
+		Slot:        request.Slot,
+		Meta:        request.Meta,
+		Command:     "/bin/sh",
+		Args:        []string{"-c", request.JitConfig},
+		Env:         request.Env,
+	}, nil
 }
 
 func serveGuestAgent(

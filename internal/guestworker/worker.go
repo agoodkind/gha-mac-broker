@@ -19,6 +19,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -54,6 +55,12 @@ func init() {
 	gob.Register(guestexec.Heartbeat{UnixNanos: 0})
 	gob.Register(guestexec.TerminalResult{ExitCode: 0, Message: ""})
 }
+
+// specBuilderOverride lets tests substitute a shell passthrough spec builder for
+// the production runner executor, so the reload tests drive the durability
+// mechanics without a real GitHub runner. It is nil in production, where the
+// guest agent defaults to the real runner executor.
+var specBuilderOverride guestagent.SpecBuilder
 
 type pipeFD struct {
 	PID    int `json:"pid"`
@@ -136,18 +143,7 @@ func Run(ctx context.Context) error {
 		return guestsupervisor.PollExits(w.controlSocket, w.generation, pollTimeout)
 	}
 
-	launcher := &supervisorLauncher{
-		registry:      registry,
-		controlSocket: cfg.controlSocket,
-		tracker:       tracker,
-	}
-	handler := guestagent.NewHTTPHandler(registry, guestagent.Options{
-		SlotCount:         cfg.slotCount,
-		BootID:            "",
-		AgentBuild:        "",
-		GoldenFingerprint: "",
-		ChildLauncher:     launcher,
-	})
+	handler := buildAgentHandler(cfg, registry, tracker)
 
 	// Install the reload signal handler before attaching, so once the supervisor
 	// marks this worker current a reload signal is always handled here rather than
@@ -374,6 +370,26 @@ func (w *worker) degradeUnreachable() {
 		w.tracker.remove(pid)
 		w.log.Warn("guest worker degraded runner exit to unobserved", "pid", pid)
 	}
+}
+
+// buildAgentHandler wires the guest-agent HTTP handler over the registry with a
+// supervisor-backed launcher, so the durable supervisor forks and waits each
+// runner. A nil specBuilderOverride selects the production runner executor; a
+// test sets it to a shell passthrough builder.
+func buildAgentHandler(cfg config, registry *guestexec.Registry, tracker *pidTracker) http.Handler {
+	launcher := &supervisorLauncher{
+		registry:      registry,
+		controlSocket: cfg.controlSocket,
+		tracker:       tracker,
+	}
+	return guestagent.NewHTTPHandler(registry, guestagent.Options{
+		SlotCount:         cfg.slotCount,
+		BootID:            "",
+		AgentBuild:        "",
+		GoldenFingerprint: "",
+		ChildLauncher:     launcher,
+		SpecBuilder:       specBuilderOverride,
+	})
 }
 
 // supervisorLauncher records an execution by asking the supervisor to fork the
