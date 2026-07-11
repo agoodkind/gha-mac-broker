@@ -13,6 +13,7 @@
 //	install            scaffold config and secrets, build golden, install the service
 //	uninstall          remove the installed service unit
 //	update             check, apply, or show release update state
+//	guest-agent        run the Phase 0 guest-side execution agent
 package main
 
 import (
@@ -65,6 +66,7 @@ const (
 	commandInstall     commandName = "install"
 	commandUninstall   commandName = "uninstall"
 	commandUpdate      commandName = "update"
+	commandGuestAgent  commandName = "guest-agent"
 
 	brokerBinaryName = "gha-mac-broker"
 )
@@ -131,6 +133,8 @@ func main() {
 		err = runUninstall(ctx, args)
 	case commandUpdate:
 		err = runUpdate(ctx, args)
+	case commandGuestAgent:
+		err = runGuestAgent(ctx, args)
 	default:
 		usage()
 		os.Exit(2)
@@ -142,7 +146,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|status|build-golden|install|uninstall|update> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|status|build-golden|install|uninstall|update|guest-agent> [flags]")
 }
 
 func writeUserLine(writer io.Writer, line string) {
