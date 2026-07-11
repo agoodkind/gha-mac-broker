@@ -141,6 +141,22 @@ func (handler *Handler) RunJob(
 		JitConfig:   request.Msg.GetJitConfig(),
 		Env:         copyEnvironment(request.Msg.GetEnv()),
 	}
+	// Peek admission before any destructive per-slot prep. Build runs prepareSlot,
+	// which rm -rf's and re-clones the slot's runner dir, HOME, and keychain, so an
+	// idempotent retry of a live execution or a job routed to a busy slot must be
+	// rejected here rather than wiping a co-tenant runner out from under it. The
+	// authoritative admission still happens under the registry lock at Register.
+	admission, admitErr := handler.registry.CheckAdmission(guestexec.ExecSpec{
+		ExecutionID: jobRequest.ExecutionID,
+		Slot:        jobRequest.Slot,
+	})
+	if admitErr != nil {
+		return nil, mapRegistryError(admitErr)
+	}
+	if admission != guestexec.OutcomeAccepted {
+		response := &guestproto.RunJobResponse{Outcome: outcomeToProto(admission)}
+		return connect.NewResponse(response), nil
+	}
 	spec, err := handler.specBuilder.Build(ctx, jobRequest)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
