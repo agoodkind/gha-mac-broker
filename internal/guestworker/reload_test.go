@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -48,6 +49,9 @@ type harness struct {
 	controlSocket string
 	addr          string
 	runErr        chan error
+
+	spawnCount atomic.Int32
+	failNext   atomic.Bool
 }
 
 func startHarness(t *testing.T) *harness {
@@ -57,20 +61,29 @@ func startHarness(t *testing.T) *harness {
 		t.Fatalf("listen tcp: %v", err)
 	}
 	controlSocket := shortSocketPath(t)
+	h := &harness{
+		supervisor:    nil,
+		controlSocket: controlSocket,
+		addr:          listener.Addr().String(),
+		runErr:        make(chan error, 1),
+		spawnCount:    atomic.Int32{},
+		failNext:      atomic.Bool{},
+	}
 	supervisor := guestsupervisor.New(guestsupervisor.Options{
 		Listener:          listener,
 		ControlSocketPath: controlSocket,
 		Token:             harnessToken,
 		SlotCount:         1,
-		WorkerCommand:     reExecWorker,
-		Log:               nil,
+		WorkerCommand: func(spec guestsupervisor.WorkerSpec) *exec.Cmd {
+			h.spawnCount.Add(1)
+			if h.failNext.CompareAndSwap(true, false) {
+				return failWorker(spec)
+			}
+			return reExecWorker(spec)
+		},
+		Log: nil,
 	})
-	h := &harness{
-		supervisor:    supervisor,
-		controlSocket: controlSocket,
-		addr:          listener.Addr().String(),
-		runErr:        make(chan error, 1),
-	}
+	h.supervisor = supervisor
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		h.runErr <- supervisor.Run(ctx)
@@ -91,6 +104,18 @@ func startHarness(t *testing.T) *harness {
 func reExecWorker(spec guestsupervisor.WorkerSpec) *exec.Cmd {
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(append([]string(nil), spec.Environment...), workerMainEnv+"=1")
+	cmd.ExtraFiles = spec.ExtraFiles
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
+}
+
+// failWorker builds a replacement that exits non-zero before it can attach or
+// signal ready, standing in for a freshly deployed worker binary that crashes on
+// boot. The old worker's readiness read end then sees EOF, so it must roll back.
+func failWorker(spec guestsupervisor.WorkerSpec) *exec.Cmd {
+	cmd := exec.Command("/bin/sh", "-c", "exit 1")
+	cmd.Env = append([]string(nil), spec.Environment...)
 	cmd.ExtraFiles = spec.ExtraFiles
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -262,6 +287,101 @@ func TestSecondReloadWhileDrainingRejected(t *testing.T) {
 	gen3PID := h.reloadAndWait(t, gen2PID)
 	if gen3PID == gen2PID {
 		t.Fatalf("worker pid did not change after second reload: gen2=%d gen3=%d", gen2PID, gen3PID)
+	}
+}
+
+// TestReloadRollsBackWhenReplacementFails proves that when the replacement worker
+// fails to signal ready, the old worker rolls back to live serving instead of
+// staying frozen: it captures runner output produced after the failed reload, a
+// still-running job completes with the correct exit code, and a second reload
+// attempt then succeeds with no panic.
+func TestReloadRollsBackWhenReplacementFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), harnessTimeout)
+	defer cancel()
+	h := startHarness(t)
+	gen1PID := h.supervisor.CurrentWorkerPID()
+
+	gate := filepath.Join(t.TempDir(), "gate")
+	script := fmt.Sprintf("echo A; while [ ! -f '%s' ]; do sleep 0.05; done; echo B", gate)
+
+	client := guestclient.New(ctx, h.addr, harnessToken)
+	runResponse, err := client.RunJob(ctx, &guestproto.RunJobRequest{
+		ExecutionId: "job-rollback",
+		Slot:        0,
+		JitConfig:   script,
+	})
+	if err != nil {
+		t.Fatalf("run job: %v", err)
+	}
+	if runResponse.GetOutcome() != guestproto.RunJobResponse_ACCEPTED {
+		t.Fatalf("run job outcome = %v, want ACCEPTED", runResponse.GetOutcome())
+	}
+
+	firstStreamCtx, cancelFirst := context.WithCancel(ctx)
+	firstStream, err := client.JobStatus(firstStreamCtx, "job-rollback", 0)
+	if err != nil {
+		t.Fatalf("job status: %v", err)
+	}
+	beforeReload := readUntilLog(t, firstStreamCtx, firstStream, "A")
+	cursor := beforeReload[len(beforeReload)-1].GetSequence()
+	cancelFirst()
+
+	// Arm the next spawn to crash before attaching, then trigger the reload and
+	// wait until that failed replacement was spawned. The old worker stays current.
+	spawnsBefore := h.spawnCount.Load()
+	h.failNext.Store(true)
+	if err := syscall.Kill(gen1PID, syscall.SIGHUP); err != nil {
+		t.Fatalf("signal reload: %v", err)
+	}
+	waitSpawnCount(t, h, spawnsBefore+1)
+	if pid := h.supervisor.CurrentWorkerPID(); pid != gen1PID {
+		t.Fatalf("current worker changed after a failed reload: was %d, now %d", gen1PID, pid)
+	}
+
+	// Release the gate so the still-running runner emits output and exits. Only the
+	// rolled-back old worker can capture the new output and record the exit.
+	if err := os.WriteFile(gate, []byte("go\n"), 0o600); err != nil {
+		t.Fatalf("write gate: %v", err)
+	}
+
+	resumeStream, err := client.JobStatus(ctx, "job-rollback", cursor)
+	if err != nil {
+		t.Fatalf("resume job status: %v", err)
+	}
+	resumed := readThroughTerminal(t, ctx, resumeStream)
+	assertContiguous(t, resumed, cursor+1)
+	if !containsLog(resumed, "B") {
+		t.Fatalf("resumed logs = %q, want B captured after the failed reload", joinedLogs(resumed))
+	}
+	result := terminalResult(t, resumed)
+	if result.GetExitCode() != 0 {
+		t.Fatalf("terminal exit code = %d, want 0; message = %q", result.GetExitCode(), result.GetMessage())
+	}
+
+	// A second reload now succeeds with no panic, proving the rollback left the
+	// worker fully healthy and that a repeat reload does not double-close.
+	gen2PID := h.reloadAndWait(t, gen1PID)
+	if gen2PID == gen1PID {
+		t.Fatalf("second reload did not replace the worker: gen1=%d gen2=%d", gen1PID, gen2PID)
+	}
+}
+
+func waitSpawnCount(t *testing.T, h *harness, target int32) {
+	t.Helper()
+	deadline := time.Now().Add(harnessTimeout)
+	for {
+		select {
+		case err := <-h.runErr:
+			t.Fatalf("supervisor exited before spawn count %d: %v", target, err)
+		default:
+		}
+		if h.spawnCount.Load() >= target {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("spawn count did not reach %d before deadline", target)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

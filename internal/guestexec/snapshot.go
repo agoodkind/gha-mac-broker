@@ -133,6 +133,70 @@ func freezeCapture(execState *execution) {
 	}
 }
 
+// Thaw reverses a Freeze that never handed off, so the same registry resumes
+// live capture on its still-open pipe read ends. It is the rollback path for a
+// reload whose replacement never became current: rather than a bricked worker
+// serving a permanently frozen registry, the worker calls Thaw and keeps serving
+// with live capture, heartbeat, and supervisor goroutines. For each running
+// execution it installs a fresh stopped, supervised, and readers set, then
+// relaunches the goroutines. captureOutput clears the freeze read deadline on
+// entry, so reading resumes from the same offset and the sequence stays
+// contiguous. It is safe to call only after a Freeze whose goroutines have all
+// settled, which the caller serializes with its reload lock.
+func (r *Registry) Thaw() {
+	r.mu.Lock()
+	executions := make([]*execution, 0, len(r.executions))
+	for _, execState := range r.executions {
+		executions = append(executions, execState)
+	}
+	r.mu.Unlock()
+
+	for _, execState := range executions {
+		execState.mu.Lock()
+		running := execState.running
+		execState.mu.Unlock()
+		if !running {
+			continue
+		}
+		r.resumeCapture(execState)
+	}
+}
+
+// resumeCapture relaunches one running execution's capture, heartbeat, and
+// supervisor goroutines against its existing read ends and event sequence, with
+// fresh stopped, supervised, and readers so a later Freeze does not double-close
+// a channel this execution already closed.
+func (r *Registry) resumeCapture(execState *execution) {
+	execState.mu.Lock()
+	stdoutReader := execState.stdoutReader
+	stderrReader := execState.stderrReader
+	readers := &sync.WaitGroup{}
+	execState.readers = readers
+	execState.stopped = make(chan struct{})
+	execState.supervised = make(chan struct{})
+	stopped := execState.stopped
+	execState.mu.Unlock()
+
+	if stdoutReader != nil {
+		readers.Add(1)
+		goSafe("stdout capture", func() {
+			captureOutput(execState, StreamStdout, stdoutReader, readers, stopped)
+		})
+	}
+	if stderrReader != nil {
+		readers.Add(1)
+		goSafe("stderr capture", func() {
+			captureOutput(execState, StreamStderr, stderrReader, readers, stopped)
+		})
+	}
+	goSafe("execution heartbeat", func() {
+		r.emitHeartbeats(execState)
+	})
+	goSafe("execution supervisor", func() {
+		r.superviseExecution(execState)
+	})
+}
+
 // freezeReadDeadline is a fixed past instant. Setting it as a read deadline
 // makes any blocked capture Read return immediately without consuming bytes, so
 // the goroutine stops at a boundary and the next generation resumes from the

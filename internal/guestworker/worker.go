@@ -40,6 +40,12 @@ const (
 	unobservedExitCode   = -1
 	unobservedMessage    = "exit status unobserved"
 	defaultSlotCount     = uint32(1)
+	// degradeFailureThreshold is the number of consecutive poll failures the
+	// worker tolerates before it degrades a runner whose process is gone to an
+	// unobserved exit. A buffered exit in the supervisor proves it did observe the
+	// child, so degrading stays conservative and a single transient dial failure
+	// right after a runner exits never overwrites the real exit code with -1.
+	degradeFailureThreshold = 5
 )
 
 func init() {
@@ -78,6 +84,12 @@ type worker struct {
 	pollCancel context.CancelFunc
 	pollDone   chan struct{}
 
+	// pollFn returns the supervisor's currently buffered runner exits, injected
+	// so a test can drive the degrade threshold without a real supervisor.
+	pollFn           func() ([]guestexec.ExitReport, error)
+	backoff          time.Duration
+	degradeThreshold int
+
 	reloadMu sync.Mutex
 	replaced bool
 }
@@ -106,16 +118,22 @@ func Run(ctx context.Context) error {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	w := &worker{
-		registry:      registry,
-		controlSocket: cfg.controlSocket,
-		generation:    cfg.generation,
-		log:           log,
-		tracker:       tracker,
-		cancelRun:     cancelRun,
-		pollCancel:    nil,
-		pollDone:      nil,
-		reloadMu:      sync.Mutex{},
-		replaced:      false,
+		registry:         registry,
+		controlSocket:    cfg.controlSocket,
+		generation:       cfg.generation,
+		log:              log,
+		tracker:          tracker,
+		cancelRun:        cancelRun,
+		pollCancel:       nil,
+		pollDone:         nil,
+		pollFn:           nil,
+		backoff:          pollBackoff,
+		degradeThreshold: degradeFailureThreshold,
+		reloadMu:         sync.Mutex{},
+		replaced:         false,
+	}
+	w.pollFn = func() ([]guestexec.ExitReport, error) {
+		return guestsupervisor.PollExits(w.controlSocket, w.generation, pollTimeout)
 	}
 
 	launcher := &supervisorLauncher{
@@ -175,20 +193,24 @@ func Run(ctx context.Context) error {
 			go func() {
 				defer func() {
 					if recovered := recover(); recovered != nil {
-						w.log.ErrorContext(ctx, "guest worker reload goroutine panic recovered", "err", fmt.Errorf("panic: %v", recovered))
+						w.log.ErrorContext(runCtx, "guest worker reload goroutine panic recovered", "err", fmt.Errorf("panic: %v", recovered))
 					}
 				}()
-				if err := w.reload(ctx); err != nil {
-					w.log.WarnContext(ctx, "guest worker reload failed; continuing to serve", "err", err)
+				if err := w.reload(runCtx); err != nil {
+					w.log.WarnContext(runCtx, "guest worker reload failed; continuing to serve", "err", err)
 				}
 			}()
 		}
 	}
 }
 
-// reload freezes the registry, hands a snapshot to the supervisor, waits for the
-// replacement to become ready, then cancels its own serve context so in-flight
-// JobStatus streams return nil without cancelling any execution.
+// reload freezes the registry and hands a snapshot to the supervisor. On a
+// successful handoff it cancels its own serve context so in-flight JobStatus
+// streams return nil without cancelling any execution, then exits. On any error
+// after the freeze it rolls back with resumeServing, so a failed handoff leaves
+// the old worker fully serving with live capture and poll rather than bricked on
+// a frozen registry. Because resumeServing installs fresh stopped channels, a
+// later reload never double-closes and never panics.
 func (w *worker) reload(ctx context.Context) error {
 	w.reloadMu.Lock()
 	defer w.reloadMu.Unlock()
@@ -203,25 +225,51 @@ func (w *worker) reload(ctx context.Context) error {
 
 	snapshot, err := w.registry.Freeze()
 	if err != nil {
-		w.log.WarnContext(ctx, "guest worker freeze registry failed", "err", err)
+		w.resumeServing(ctx)
+		w.log.WarnContext(ctx, "guest worker freeze registry failed; resumed serving", "err", err)
 		return fmt.Errorf("guestworker: freeze registry: %w", err)
 	}
+
+	newPID, err := w.handOff(ctx, snapshot)
+	if err != nil {
+		// The replacement never became current, so resume live serving instead of
+		// staying frozen and bricked.
+		w.resumeServing(ctx)
+		w.log.WarnContext(ctx, "guest worker reload rolled back; resumed serving", "err", err)
+		return err
+	}
+
+	w.replaced = true
+	w.log.InfoContext(ctx, "guest worker replaced; draining", "new_pid", newPID, "generation", w.generation)
+	// Cancel the serve context so in-flight JobStatus streams return nil. No
+	// execution is cancelled, so every runner keeps running under the supervisor.
+	w.cancelRun()
+	return nil
+}
+
+// handOff writes the snapshot, asks the supervisor to spawn the replacement, and
+// waits for it to signal ready. It returns the replacement pid only once the
+// replacement has attached (become current) and signaled ready; any earlier
+// failure returns an error so the caller rolls back.
+func (w *worker) handOff(ctx context.Context, snapshot *guestexec.Snapshot) (int, error) {
 	snapshotFile, err := writeSnapshotFile(snapshot)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = snapshotFile.Close() }()
 
 	readRead, readWrite, err := os.Pipe()
 	if err != nil {
-		return fmt.Errorf("guestworker: create readiness pipe: %w", err)
+		w.log.WarnContext(ctx, "guest worker create readiness pipe failed", "err", err)
+		return 0, fmt.Errorf("guestworker: create readiness pipe: %w", err)
 	}
 	defer func() { _ = readRead.Close() }()
 
 	executablePath, err := os.Executable()
 	if err != nil {
 		_ = readWrite.Close()
-		return fmt.Errorf("guestworker: resolve executable: %w", err)
+		w.log.WarnContext(ctx, "guest worker resolve executable failed", "err", err)
+		return 0, fmt.Errorf("guestworker: resolve executable: %w", err)
 	}
 	newPID, err := guestsupervisor.RequestReplacement(
 		w.controlSocket,
@@ -236,18 +284,22 @@ func (w *worker) reload(ctx context.Context) error {
 	// close and readiness could hang.
 	_ = readWrite.Close()
 	if err != nil {
-		return fmt.Errorf("guestworker: request replacement: %w", err)
+		return 0, fmt.Errorf("guestworker: request replacement: %w", err)
 	}
 
 	if err := waitReady(ctx, readRead); err != nil {
-		return fmt.Errorf("guestworker: wait for replacement readiness: %w", err)
+		return 0, fmt.Errorf("guestworker: wait for replacement readiness: %w", err)
 	}
-	w.replaced = true
-	w.log.InfoContext(ctx, "guest worker replaced; draining", "new_pid", newPID, "generation", w.generation)
-	// Cancel the serve context so in-flight JobStatus streams return nil. No
-	// execution is cancelled, so every runner keeps running under the supervisor.
-	w.cancelRun()
-	return nil
+	return newPID, nil
+}
+
+// resumeServing rolls a failed reload back to live serving: Thaw resumes capture
+// on the still-open pipe read ends, and the poll loop restarts under the worker's
+// run context so runner exits are recorded again. The worker stays current and
+// healthy.
+func (w *worker) resumeServing(runCtx context.Context) {
+	w.registry.Thaw()
+	w.startPollLoop(runCtx)
 }
 
 func (w *worker) startPollLoop(ctx context.Context) {
@@ -275,24 +327,30 @@ func (w *worker) stopPollLoop() {
 }
 
 // pollLoop long-polls the supervisor for runner exits, records each into the
-// registry, and acks it. On supervisor loss it degrades any runner whose process
-// is gone to an unobserved exit, so a job never hangs when the supervisor dies
-// mid-handoff.
+// registry, and acks it. It degrades a runner whose process is gone to an
+// unobserved exit only after degradeThreshold consecutive poll failures, so a
+// single transient control-socket failure right after a runner exits cannot
+// overwrite the real exit code with -1. Any successful poll resets the counter.
 func (w *worker) pollLoop(ctx context.Context) {
+	consecutiveFailures := 0
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		reports, err := guestsupervisor.PollExits(w.controlSocket, w.generation, pollTimeout)
+		reports, err := w.pollFn()
 		if err != nil {
-			w.degradeUnreachable()
+			consecutiveFailures++
+			if consecutiveFailures >= w.degradeThreshold {
+				w.degradeUnreachable()
+			}
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(pollBackoff):
+			case <-time.After(w.backoff):
 			}
 			continue
 		}
+		consecutiveFailures = 0
 		for _, report := range reports {
 			w.registry.ReportExit(report.PID, report.ExitCode, report.Message)
 			w.tracker.remove(report.PID)
