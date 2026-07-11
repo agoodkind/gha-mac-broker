@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
+	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/guestsupervisor"
 )
 
@@ -63,6 +65,7 @@ func runGuestSupervisor(ctx context.Context, args []string) error {
 		Listener:          tcpListener,
 		ControlSocketPath: *controlSocket,
 		Token:             token,
+		GoldenFingerprint: readGoldenFingerprint(ctx),
 		SlotCount:         uint32(*slotCount),
 		WorkerCommand:     nil,
 		Log:               slog.Default(),
@@ -83,4 +86,16 @@ func runGuestSupervisor(ctx context.Context, args []string) error {
 
 func defaultGuestControlSocket() string {
 	return filepath.Join(os.TempDir(), guestSupervisorSocketName)
+}
+
+// readGoldenFingerprint reads the baked golden fingerprint the provisioner wrote.
+// It is best effort: a golden without the file (or a dev run) simply reports an
+// empty fingerprint via Hello rather than failing supervisor startup.
+func readGoldenFingerprint(ctx context.Context) string {
+	content, err := os.ReadFile(golden.FingerprintPath)
+	if err != nil {
+		slog.DebugContext(ctx, "golden fingerprint file absent; reporting empty", "path", golden.FingerprintPath, "err", err)
+		return ""
+	}
+	return strings.TrimSpace(string(content))
 }

@@ -1,19 +1,24 @@
 // Package golden builds the golden Tart VM image the broker pool clones. It
-// clones a Cirrus base image, boots it, installs the GitHub Actions runner
-// (unconfigured) and the guest liveness watchdog over the tart-exec vsock
-// channel (no SSH, no IP), clean-shuts-down, snapshots the golden, then verifies
-// a fresh clone so a broken image can never ship silently.
+// clones a Cirrus base image, boots it, and runs an all-Go golden-provision
+// subcommand over the tart-exec vsock channel (no SSH, no IP): the provisioner
+// installs the GitHub Actions runner (unconfigured), bakes the guest broker
+// binary and the guest-supervisor LaunchDaemon, and persists a golden
+// fingerprint. The builder then host-side stops the VM, snapshots the golden,
+// and verifies a fresh clone so a broken image can never ship silently.
 package golden
 
 import (
 	"context"
-	_ "embed"
-	"encoding/base64"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -21,19 +26,23 @@ import (
 	"goodkind.io/gha-mac-broker/internal/tart"
 )
 
-//go:embed guest/gha-broker-watchdog.sh
-var watchdogScript []byte
-
-//go:embed guest/io.goodkind.gha-broker-watchdog.plist
-var watchdogPlist []byte
-
 const (
-	watchdogScriptPath = "/usr/local/bin/gha-broker-watchdog.sh"
-	watchdogPlistPath  = "/Library/LaunchDaemons/io.goodkind.gha-broker-watchdog.plist"
-	readyTimeout       = 120 * time.Second
-	readyInterval      = 3 * time.Second
-	shutdownTimeout    = 90 * time.Second
-	runnerLatestURL    = "https://api.github.com/repos/actions/runner/releases/latest"
+	readyTimeout    = 120 * time.Second
+	readyInterval   = 3 * time.Second
+	runnerLatestURL = "https://api.github.com/repos/actions/runner/releases/latest"
+	// provisionMountName is the tart --dir share name that carries the signed
+	// guest binary into the build VM.
+	provisionMountName = "ghaprovision"
+	// tartSharedMountRoot is where tart surfaces --dir shares inside a macOS guest.
+	tartSharedMountRoot = "/Volumes/My Shared Files"
+	// provisionBinaryName is the guest binary filename inside the scratch mount.
+	provisionBinaryName = "gha-mac-broker"
+	// localProvisionerPath is the in-VM path the host copies the mounted binary to
+	// before signing and running it, so it never execs straight off the share.
+	localProvisionerPath = "/tmp/gha-mac-broker-provision"
+	// runnerTarballTimeout bounds the host-side runner tarball fetch used only to
+	// compute the fingerprint digest.
+	runnerTarballTimeout = 10 * time.Minute
 )
 
 // tarter is the VM substrate the builder drives; *tart.Tart satisfies it. It is
@@ -43,6 +52,7 @@ type tarter interface {
 	Clone(ctx context.Context, source, name string, insecure bool) error
 	BootCommand(ctx context.Context, name string, opts tart.BootOptions) *exec.Cmd
 	Exec(ctx context.Context, name string, argv ...string) ([]byte, error)
+	IP(ctx context.Context, name string) (string, error)
 	Stop(ctx context.Context, name string) error
 	Delete(ctx context.Context, name string) error
 }
@@ -52,6 +62,11 @@ type tarter interface {
 type BaseStager interface {
 	Stage(ctx context.Context, image string) (ref string, stop func(), err error)
 }
+
+// runnerTarballDigester returns the content digest of the actions/runner release
+// tarball for a version. It is a field so tests can supply a digest without
+// downloading the tarball.
+type runnerTarballDigester func(ctx context.Context, version string) (string, error)
 
 // Option configures a Builder.
 type Option func(*Builder)
@@ -64,15 +79,17 @@ func WithBaseStager(s BaseStager) Option {
 
 // Builder builds and self-verifies the golden image.
 type Builder struct {
-	vm   tarter
-	base BaseStager
+	vm           tarter
+	base         BaseStager
+	runnerDigest runnerTarballDigester
 }
 
 // New returns a Builder driving the given VM substrate.
 func New(vm tarter, opts ...Option) *Builder {
 	builder := &Builder{
-		vm:   vm,
-		base: nil,
+		vm:           vm,
+		base:         nil,
+		runnerDigest: downloadRunnerTarballDigest,
 	}
 	for _, opt := range opts {
 		opt(builder)
@@ -90,6 +107,9 @@ type Options struct {
 	BuildVM string
 	// RunnerVersion is the actions/runner version to install (e.g. "2.335.1").
 	RunnerVersion string
+	// BinaryPath is the guest broker binary baked into the image. When empty the
+	// running executable is baked, so a bare host bootstrap needs no extra flag.
+	BinaryPath string
 }
 
 // EnsureOptions configures an idempotent golden ensure operation.
@@ -159,6 +179,7 @@ func (b *Builder) EnsureGolden(ctx context.Context, opts EnsureOptions) (string,
 		GoldenName:    goldenName,
 		BuildVM:       buildVM,
 		RunnerVersion: runnerVersion,
+		BinaryPath:    "",
 	}); err != nil {
 		slog.ErrorContext(ctx, "ensure golden build failed", "err", err, "golden", goldenName, "image", opts.Image)
 		return "", fmt.Errorf("golden: ensure %s: %w", goldenName, err)
@@ -204,28 +225,35 @@ func ResolveRunnerVersion(ctx context.Context) (string, error) {
 func (b *Builder) Build(ctx context.Context, opts Options) error {
 	slog.InfoContext(ctx, "building golden", "base", opts.BaseImage, "golden", opts.GoldenName, "runner", opts.RunnerVersion)
 
+	scratchDir, mountBinary, fingerprint, err := b.stageProvisionInputs(ctx, opts)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(scratchDir) }()
+
 	cloneSource, insecure := opts.BaseImage, false
 	if b.base != nil {
-		ref, stop, err := b.base.Stage(ctx, opts.BaseImage)
-		if err != nil {
-			slog.WarnContext(ctx, "fast-pull stage failed; cloning base directly", "err", err, "image", opts.BaseImage)
+		ref, stop, stageErr := b.base.Stage(ctx, opts.BaseImage)
+		if stageErr != nil {
+			slog.WarnContext(ctx, "fast-pull stage failed; cloning base directly", "err", stageErr, "image", opts.BaseImage)
 		} else {
 			defer stop()
 			cloneSource, insecure = ref, true
 		}
 	}
-	boot, err := b.cloneAndBoot(ctx, cloneSource, opts.BuildVM, insecure)
+	dirs := []tart.DirMount{{Name: provisionMountName, Path: scratchDir}}
+	boot, err := b.cloneAndBoot(ctx, cloneSource, opts.BuildVM, insecure, dirs)
 	if err != nil {
 		return err
 	}
 
-	if err := b.provision(ctx, opts.BuildVM, opts.RunnerVersion); err != nil {
+	if err := b.provision(ctx, opts.BuildVM, opts.RunnerVersion, mountBinary, fingerprint); err != nil {
 		_ = boot.Process.Kill()
 		b.teardown(ctx, opts.BuildVM)
 		return err
 	}
 
-	if err := b.cleanShutdown(ctx, opts.BuildVM); err != nil {
+	if err := b.stopBuildVM(ctx, opts.BuildVM); err != nil {
 		_ = boot.Process.Kill()
 		b.teardown(ctx, opts.BuildVM)
 		return err
@@ -236,15 +264,93 @@ func (b *Builder) Build(ctx context.Context, opts Options) error {
 		return err
 	}
 
-	return b.verify(ctx, opts.GoldenName, opts.BuildVM+"-verify")
+	return b.verify(ctx, opts.GoldenName, opts.BuildVM+"-verify", fingerprint)
 }
 
-// provision installs the runner and bakes the watchdog into the booted VM.
-func (b *Builder) provision(ctx context.Context, name, runnerVersion string) error {
-	if err := b.installRunner(ctx, name, runnerVersion); err != nil {
-		return err
+// stageProvisionInputs prepares a host scratch dir holding the guest binary to
+// mount into the build VM, and computes the golden fingerprint host-side from the
+// base ref, runner version, runner-tarball digest, baked-binary digest, and each
+// baked payload digest. The fingerprint is a pure function of these inputs, so it
+// is unit-testable without a VM.
+func (b *Builder) stageProvisionInputs(ctx context.Context, opts Options) (scratchDir, mountBinary, fingerprint string, err error) {
+	binaryPath := opts.BinaryPath
+	if binaryPath == "" {
+		exe, exeErr := os.Executable()
+		if exeErr != nil {
+			slog.ErrorContext(ctx, "resolve executable for golden bake failed", "err", exeErr)
+			return "", "", "", fmt.Errorf("golden: resolve executable: %w", exeErr)
+		}
+		binaryPath = exe
 	}
-	return b.installWatchdog(ctx, name)
+	scratchDir, err = os.MkdirTemp("", "gha-golden-provision-")
+	if err != nil {
+		return "", "", "", fmt.Errorf("golden: create provision scratch dir: %w", err)
+	}
+	scratchBinary := filepath.Join(scratchDir, provisionBinaryName)
+	if err := copyFileMode(ctx, binaryPath, scratchBinary, 0o755); err != nil {
+		_ = os.RemoveAll(scratchDir)
+		return "", "", "", err
+	}
+	tarballDigest, err := b.runnerDigest(ctx, opts.RunnerVersion)
+	if err != nil {
+		_ = os.RemoveAll(scratchDir)
+		return "", "", "", err
+	}
+	binaryDigest, err := sha256File(ctx, scratchBinary)
+	if err != nil {
+		_ = os.RemoveAll(scratchDir)
+		return "", "", "", err
+	}
+	fingerprint = Fingerprint(FingerprintInputs{
+		BaseImageRef:        opts.BaseImage,
+		RunnerVersion:       opts.RunnerVersion,
+		RunnerTarballDigest: tarballDigest,
+		BinaryDigest:        binaryDigest,
+		Payloads: []PayloadDigest{
+			{Name: GuestSupervisorPlistLabel, Digest: sha256Bytes(GuestSupervisorPlist())},
+		},
+	})
+	mountBinary = tartSharedMountRoot + "/" + provisionMountName + "/" + provisionBinaryName
+	return scratchDir, mountBinary, fingerprint, nil
+}
+
+// provision lands the all-Go provisioner into the booted build VM and runs it.
+// The mounted binary is copied to a local path, its quarantine attribute cleared,
+// and it is ad-hoc signed before it runs, all via discrete-argv tart exec with no
+// shell. The provisioner then installs the runner, bakes the binary and launchd
+// unit, persists the fingerprint, and deletes the retired watchdog.
+func (b *Builder) provision(ctx context.Context, name, runnerVersion, mountBinary, fingerprint string) error {
+	homeOut, err := b.vm.Exec(ctx, name, "printenv", "HOME")
+	if err != nil {
+		slog.ErrorContext(ctx, "resolve guest home failed", "err", err, "vm", name)
+		return fmt.Errorf("golden: resolve guest home on %s: %w", name, err)
+	}
+	guestHome := strings.TrimSpace(string(homeOut))
+	if guestHome == "" {
+		return fmt.Errorf("golden: guest home is empty on %s", name)
+	}
+	runnerDir := guestHome + "/actions-runner"
+
+	steps := [][]string{
+		{"cp", mountBinary, localProvisionerPath},
+		{"xattr", "-c", localProvisionerPath},
+		{"codesign", "-s", "-", "-f", localProvisionerPath},
+		{
+			"sudo", localProvisionerPath, "golden-provision",
+			"-runner-version", runnerVersion,
+			"-binary", mountBinary,
+			"-runner-dir", runnerDir,
+			"-fingerprint", fingerprint,
+		},
+	}
+	slog.InfoContext(ctx, "provisioning golden", "vm", name, "runner", runnerVersion, "runner_dir", runnerDir)
+	for _, argv := range steps {
+		if _, err := b.vm.Exec(ctx, name, argv...); err != nil {
+			slog.ErrorContext(ctx, "provision step failed", "err", err, "vm", name, "step", argv[0])
+			return fmt.Errorf("golden: provision %s on %s: %w", argv[0], name, err)
+		}
+	}
+	return nil
 }
 
 // snapshot replaces the golden with a clone of the prepared, stopped build VM,
@@ -263,9 +369,10 @@ func (b *Builder) snapshot(ctx context.Context, buildVM, golden string) error {
 	return nil
 }
 
-// cloneAndBoot clones source to name, boots it headless, and waits for the vsock
-// channel. The returned boot process must be killed by the caller.
-func (b *Builder) cloneAndBoot(ctx context.Context, source, name string, insecure bool) (*exec.Cmd, error) {
+// cloneAndBoot clones source to name, boots it headless with the given shared
+// directories, and waits for the vsock channel. The returned boot process must be
+// killed by the caller.
+func (b *Builder) cloneAndBoot(ctx context.Context, source, name string, insecure bool, dirs []tart.DirMount) (*exec.Cmd, error) {
 	if err := b.vm.Delete(ctx, name); err != nil {
 		slog.DebugContext(ctx, "pre-clone delete (ignored if absent)", "err", err, "vm", name)
 	}
@@ -273,7 +380,7 @@ func (b *Builder) cloneAndBoot(ctx context.Context, source, name string, insecur
 		slog.ErrorContext(ctx, "clone failed", "err", err, "vm", name, "source", source)
 		return nil, fmt.Errorf("golden: clone %s from %s: %w", name, source, err)
 	}
-	boot := b.vm.BootCommand(ctx, name, tart.BootOptions{Dirs: nil, Detach: false, NoGraphics: true})
+	boot := b.vm.BootCommand(ctx, name, tart.BootOptions{Dirs: dirs, Detach: false, NoGraphics: true})
 	if err := boot.Start(); err != nil {
 		slog.ErrorContext(ctx, "boot failed", "err", err, "vm", name)
 		b.teardown(ctx, name)
@@ -306,76 +413,25 @@ func (b *Builder) waitForReady(ctx context.Context, name string) error {
 	}
 }
 
-// installRunner downloads and unpacks the GitHub Actions runner, unconfigured,
-// into ~/actions-runner inside the VM.
-func (b *Builder) installRunner(ctx context.Context, name, version string) error {
-	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/actions-runner-osx-arm64-%s.tar.gz", version, version)
-	script := fmt.Sprintf("set -e; mkdir -p ~/actions-runner && cd ~/actions-runner && "+
-		"curl -fsSL -o runner.tar.gz %q && tar xzf runner.tar.gz && rm runner.tar.gz && test -f run.sh", url)
-	slog.InfoContext(ctx, "installing runner", "vm", name, "version", version)
-	if _, err := b.vm.Exec(ctx, name, "bash", "-lc", script); err != nil {
-		slog.ErrorContext(ctx, "install runner failed", "err", err, "vm", name)
-		return fmt.Errorf("golden: install runner on %s: %w", name, err)
+// stopBuildVM powers the build VM off host-side with tart stop, so the disk is
+// flushed before the snapshot without an in-guest shutdown command.
+func (b *Builder) stopBuildVM(ctx context.Context, name string) error {
+	slog.InfoContext(ctx, "stopping build vm", "vm", name)
+	if err := b.vm.Stop(ctx, name); err != nil {
+		slog.ErrorContext(ctx, "stop build vm failed", "err", err, "vm", name)
+		return fmt.Errorf("golden: stop build vm %s: %w", name, err)
 	}
 	return nil
 }
 
-// installWatchdog bakes the guest liveness watchdog (script + LaunchDaemon
-// plist) into the VM. The plist in /Library/LaunchDaemons auto-loads on every
-// subsequent boot, so no launchctl call is needed here.
-func (b *Builder) installWatchdog(ctx context.Context, name string) error {
-	slog.InfoContext(ctx, "installing watchdog", "vm", name)
-	if err := b.writeGuestFile(ctx, name, watchdogScript, watchdogScriptPath, "755"); err != nil {
-		return err
-	}
-	return b.writeGuestFile(ctx, name, watchdogPlist, watchdogPlistPath, "644")
-}
-
-// writeGuestFile writes content to dest inside the VM with the given chmod mode,
-// transferring it base64-encoded over tart exec (no special-char or stdin
-// handling needed). The macOS guest decodes with `base64 -D`.
-func (b *Builder) writeGuestFile(ctx context.Context, name string, content []byte, dest, mode string) error {
-	enc := base64.StdEncoding.EncodeToString(content)
-	script := fmt.Sprintf("echo %s | base64 -D | sudo tee %s >/dev/null && sudo chmod %s %s", enc, dest, mode, dest)
-	if _, err := b.vm.Exec(ctx, name, "bash", "-lc", script); err != nil {
-		slog.ErrorContext(ctx, "write guest file failed", "err", err, "vm", name, "dest", dest)
-		return fmt.Errorf("golden: write %s on %s: %w", dest, name, err)
-	}
-	return nil
-}
-
-// cleanShutdown asks the guest OS to power off (flushing disk) and waits until
-// the vsock channel stops answering, confirming the VM is down before snapshot.
-func (b *Builder) cleanShutdown(ctx context.Context, name string) error {
-	slog.InfoContext(ctx, "shutting down build vm", "vm", name)
-	// The connection drops as the VM powers off, so an error here is expected.
-	// Use the absolute path: tart exec's PATH does not include /sbin.
-	if _, err := b.vm.Exec(ctx, name, "sudo", "/sbin/shutdown", "-h", "now"); err != nil {
-		slog.DebugContext(ctx, "shutdown exec returned error (expected as vm powers off)", "err", err, "vm", name)
-	}
-	deadline, cancel := context.WithTimeout(ctx, shutdownTimeout)
-	defer cancel()
-	ticker := time.NewTicker(readyInterval)
-	defer ticker.Stop()
-	for {
-		if _, err := b.vm.Exec(deadline, name, "true"); err != nil {
-			return nil // no longer reachable: the VM is down
-		}
-		select {
-		case <-deadline.Done():
-			slog.ErrorContext(ctx, "timed out waiting for build vm to power off", "err", deadline.Err(), "vm", name)
-			return fmt.Errorf("golden: build vm %s did not power off: %w", name, deadline.Err())
-		case <-ticker.C:
-		}
-	}
-}
-
-// verify clones the freshly built golden, boots it, and confirms the runner and
-// the watchdog are actually present and the watchdog auto-loaded, failing loudly
-// otherwise. The verify VM is always torn down.
-func (b *Builder) verify(ctx context.Context, golden, verifyVM string) error {
+// verify clones the freshly built golden, boots it, and confirms the runner, the
+// guest-supervisor launchd unit, and the baked fingerprint are present and the
+// fingerprint matches the computed value, failing loudly otherwise. It also
+// asserts the retired watchdog script was not baked. The verify VM is always torn
+// down.
+func (b *Builder) verify(ctx context.Context, golden, verifyVM, fingerprint string) error {
 	slog.InfoContext(ctx, "verifying golden", "golden", golden)
-	boot, err := b.cloneAndBoot(ctx, golden, verifyVM, false)
+	boot, err := b.cloneAndBoot(ctx, golden, verifyVM, false, nil)
 	if err != nil {
 		return fmt.Errorf("golden: verify boot: %w", err)
 	}
@@ -384,22 +440,53 @@ func (b *Builder) verify(ctx context.Context, golden, verifyVM string) error {
 		b.teardown(ctx, verifyVM)
 	}()
 
-	if _, err := b.vm.Exec(ctx, verifyVM, "bash", "-lc", "test -f ~/actions-runner/run.sh"); err != nil {
+	if _, err := b.vm.IP(ctx, verifyVM); err != nil {
+		slog.ErrorContext(ctx, "verify failed: tart ip did not resolve", "err", err, "golden", golden)
+		return fmt.Errorf("golden: verify %s: tart ip did not resolve: %w", golden, err)
+	}
+
+	homeOut, err := b.vm.Exec(ctx, verifyVM, "printenv", "HOME")
+	if err != nil {
+		return fmt.Errorf("golden: verify %s: resolve guest home: %w", golden, err)
+	}
+	runnerRun := strings.TrimSpace(string(homeOut)) + "/actions-runner/run.sh"
+	if _, err := b.vm.Exec(ctx, verifyVM, "test", "-f", runnerRun); err != nil {
 		slog.ErrorContext(ctx, "verify failed: runner missing", "err", err, "golden", golden)
 		return fmt.Errorf("golden: verify %s: runner run.sh missing: %w", golden, err)
 	}
-	check := "test -x " + watchdogScriptPath + " && sudo launchctl print system/io.goodkind.gha-broker-watchdog >/dev/null 2>&1"
-	if _, err := b.vm.Exec(ctx, verifyVM, "bash", "-lc", check); err != nil {
-		slog.ErrorContext(ctx, "verify failed: watchdog not active", "err", err, "golden", golden)
-		return fmt.Errorf("golden: verify %s: watchdog not installed/loaded: %w", golden, err)
+
+	baked, err := b.vm.Exec(ctx, verifyVM, "cat", FingerprintPath)
+	if err != nil {
+		slog.ErrorContext(ctx, "verify failed: fingerprint file missing", "err", err, "golden", golden)
+		return fmt.Errorf("golden: verify %s: read fingerprint: %w", golden, err)
+	}
+	bakedFingerprint := strings.TrimSpace(string(baked))
+	if bakedFingerprint == "" {
+		return fmt.Errorf("golden: verify %s: baked fingerprint is empty", golden)
+	}
+	if bakedFingerprint != fingerprint {
+		return fmt.Errorf("golden: verify %s: baked fingerprint %q does not match computed %q", golden, bakedFingerprint, fingerprint)
+	}
+
+	if _, err := b.vm.Exec(ctx, verifyVM, "test", "-f", GuestSupervisorPlistPath); err != nil {
+		slog.ErrorContext(ctx, "verify failed: supervisor plist missing", "err", err, "golden", golden)
+		return fmt.Errorf("golden: verify %s: supervisor plist missing: %w", golden, err)
+	}
+	if _, err := b.vm.Exec(ctx, verifyVM, "sudo", "launchctl", "print", "system/"+GuestSupervisorPlistLabel); err != nil {
+		slog.ErrorContext(ctx, "verify failed: supervisor unit not loaded", "err", err, "golden", golden)
+		return fmt.Errorf("golden: verify %s: guest-supervisor unit not loaded: %w", golden, err)
+	}
+	if _, err := b.vm.Exec(ctx, verifyVM, "test", "!", "-e", LegacyWatchdogScriptPath); err != nil {
+		slog.ErrorContext(ctx, "verify failed: watchdog shell script was baked", "err", err, "golden", golden)
+		return fmt.Errorf("golden: verify %s: retired watchdog script %s is present: %w", golden, LegacyWatchdogScriptPath, err)
 	}
 	// A golden that cannot build Swift is useless, so fail loudly here rather
 	// than ship an image whose first real build dies at Xcode selection.
-	if _, err := b.vm.Exec(ctx, verifyVM, "bash", "-lc", "xcodebuild -version"); err != nil {
+	if _, err := b.vm.Exec(ctx, verifyVM, "xcodebuild", "-version"); err != nil {
 		slog.ErrorContext(ctx, "verify failed: xcodebuild -version did not succeed", "err", err, "golden", golden)
 		return fmt.Errorf("golden: verify %s: xcodebuild -version failed (Xcode absent, not selected, or license/first-run pending): %w", golden, err)
 	}
-	slog.InfoContext(ctx, "golden verified", "golden", golden)
+	slog.InfoContext(ctx, "golden verified", "golden", golden, "fingerprint", fingerprint)
 	return nil
 }
 
@@ -411,4 +498,104 @@ func (b *Builder) teardown(ctx context.Context, name string) {
 	if err := b.vm.Delete(ctx, name); err != nil {
 		slog.WarnContext(ctx, "vm delete failed", "err", err, "vm", name)
 	}
+}
+
+// downloadRunnerTarballDigest fetches the actions/runner release tarball and
+// returns its sha256, so the fingerprint changes if the runner bytes change.
+func downloadRunnerTarballDigest(ctx context.Context, version string) (string, error) {
+	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/actions-runner-osx-arm64-%s.tar.gz", version, version)
+	fetchCtx, cancel := context.WithTimeout(ctx, runnerTarballTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, url, nil)
+	if err != nil {
+		slog.ErrorContext(ctx, "build runner tarball request failed", "err", err, "url", url)
+		return "", fmt.Errorf("golden: build runner tarball request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		slog.ErrorContext(ctx, "fetch runner tarball failed", "err", err, "url", url)
+		return "", fmt.Errorf("golden: fetch runner tarball %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		statusErr := fmt.Errorf("status %d", resp.StatusCode)
+		slog.ErrorContext(ctx, "fetch runner tarball bad status", "err", statusErr, "url", url)
+		return "", fmt.Errorf("golden: fetch runner tarball %s: %w", url, statusErr)
+	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, resp.Body); err != nil {
+		slog.ErrorContext(ctx, "hash runner tarball failed", "err", err, "url", url)
+		return "", fmt.Errorf("golden: hash runner tarball: %w", err)
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+// sha256File returns the hex sha256 of a file's contents.
+func sha256File(ctx context.Context, path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		slog.ErrorContext(ctx, "open file for digest failed", "err", err, "path", path)
+		return "", fmt.Errorf("golden: open %s: %w", path, err)
+	}
+	defer func() { _ = file.Close() }()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		slog.ErrorContext(ctx, "digest file failed", "err", err, "path", path)
+		return "", fmt.Errorf("golden: digest %s: %w", path, err)
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+// sha256Bytes returns the hex sha256 of a byte slice.
+func sha256Bytes(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
+}
+
+// copyFileMode copies source to dest atomically via a temp file and rename,
+// creating dest's parent directory and setting the given mode.
+func copyFileMode(ctx context.Context, source, dest string, mode os.FileMode) error {
+	destDir := filepath.Dir(dest)
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		slog.ErrorContext(ctx, "create binary dir failed", "err", err, "dir", destDir)
+		return fmt.Errorf("golden: create dir %s: %w", destDir, err)
+	}
+	in, err := os.Open(source)
+	if err != nil {
+		slog.ErrorContext(ctx, "open source binary failed", "err", err, "source", source)
+		return fmt.Errorf("golden: open source %s: %w", source, err)
+	}
+	defer func() { _ = in.Close() }()
+	temp, err := os.CreateTemp(destDir, ".gha-golden-*")
+	if err != nil {
+		slog.ErrorContext(ctx, "create temp binary failed", "err", err, "dir", destDir)
+		return fmt.Errorf("golden: create temp in %s: %w", destDir, err)
+	}
+	tempPath := temp.Name()
+	removeTemp := true
+	defer func() {
+		if removeTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if _, err := io.Copy(temp, in); err != nil {
+		_ = temp.Close()
+		slog.ErrorContext(ctx, "copy binary failed", "err", err, "temp", tempPath)
+		return fmt.Errorf("golden: copy to %s: %w", tempPath, err)
+	}
+	if err := temp.Chmod(mode); err != nil {
+		_ = temp.Close()
+		slog.ErrorContext(ctx, "chmod temp binary failed", "err", err, "temp", tempPath)
+		return fmt.Errorf("golden: chmod %s: %w", tempPath, err)
+	}
+	if err := temp.Close(); err != nil {
+		slog.ErrorContext(ctx, "close temp binary failed", "err", err, "temp", tempPath)
+		return fmt.Errorf("golden: close %s: %w", tempPath, err)
+	}
+	if err := os.Rename(tempPath, dest); err != nil {
+		slog.ErrorContext(ctx, "rename binary failed", "err", err, "temp", tempPath, "dest", dest)
+		return fmt.Errorf("golden: rename to %s: %w", dest, err)
+	}
+	removeTemp = false
+	return nil
 }

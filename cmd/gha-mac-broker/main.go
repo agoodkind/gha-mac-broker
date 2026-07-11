@@ -16,6 +16,7 @@
 //	guest-agent        alias that runs the guest supervisor
 //	guest-supervisor   run the durable guest-side supervisor of runner processes
 //	guest-worker       run one swappable guest-worker generation (supervisor spawns it)
+//	golden-provision   provision a golden build VM from inside it (host-invoked)
 package main
 
 import (
@@ -71,6 +72,7 @@ const (
 	commandGuestAgent  commandName = "guest-agent"
 	commandGuestSuper  commandName = "guest-supervisor"
 	commandGuestWorker commandName = "guest-worker"
+	commandGoldenProv  commandName = "golden-provision"
 
 	brokerBinaryName = "gha-mac-broker"
 )
@@ -143,6 +145,8 @@ func main() {
 		err = runGuestSupervisor(ctx, args)
 	case commandGuestWorker:
 		err = runGuestWorker(ctx, args)
+	case commandGoldenProv:
+		err = runGoldenProvision(ctx, args)
 	default:
 		usage()
 		os.Exit(2)
@@ -154,7 +158,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|status|build-golden|install|uninstall|update|guest-agent|guest-supervisor|guest-worker> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|status|build-golden|install|uninstall|update|guest-agent|guest-supervisor|guest-worker|golden-provision> [flags]")
 }
 
 func writeUserLine(writer io.Writer, line string) {
@@ -492,6 +496,7 @@ func runBuildGolden(ctx context.Context, args []string) error {
 		GoldenName:    *goldenName,
 		BuildVM:       *buildVM,
 		RunnerVersion: version,
+		BinaryPath:    "",
 	}); err != nil {
 		return fmt.Errorf("build-golden: %w", err)
 	}

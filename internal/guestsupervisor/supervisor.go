@@ -55,6 +55,9 @@ type Options struct {
 	ControlSocketPath string
 	// Token is the boot-scoped bearer token passed to each worker.
 	Token string
+	// GoldenFingerprint is the baked golden fingerprint the supervisor read at
+	// startup; it is passed to each worker so Hello reports it.
+	GoldenFingerprint string
 	// SlotCount is the configured guest execution slot count.
 	SlotCount uint32
 	// WorkerCommand builds the exec.Cmd for a worker from a WorkerSpec. When nil
@@ -472,14 +475,15 @@ func (s *Supervisor) assembleEnv(
 		pipeJSON = string(encoded)
 	}
 	overrides := map[string]string{
-		EnvControlSocket: s.opts.ControlSocketPath,
-		EnvListenerFD:    strconv.Itoa(listenerFD),
-		EnvReadyFD:       strconv.Itoa(readyFD),
-		EnvGeneration:    strconv.FormatUint(generation, 10),
-		EnvSlots:         strconv.FormatUint(uint64(s.opts.SlotCount), 10),
-		EnvToken:         s.opts.Token,
-		EnvPipeFDs:       pipeJSON,
-		EnvSnapshotFD:    "",
+		EnvControlSocket:     s.opts.ControlSocketPath,
+		EnvListenerFD:        strconv.Itoa(listenerFD),
+		EnvReadyFD:           strconv.Itoa(readyFD),
+		EnvGeneration:        strconv.FormatUint(generation, 10),
+		EnvSlots:             strconv.FormatUint(uint64(s.opts.SlotCount), 10),
+		EnvToken:             s.opts.Token,
+		EnvGoldenFingerprint: s.opts.GoldenFingerprint,
+		EnvPipeFDs:           pipeJSON,
+		EnvSnapshotFD:        "",
 	}
 	if snapshotFD >= 0 {
 		overrides[EnvSnapshotFD] = strconv.Itoa(snapshotFD)

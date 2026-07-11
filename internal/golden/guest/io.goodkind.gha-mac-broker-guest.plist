@@ -4,18 +4,19 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>io.goodkind.gha-broker-watchdog</string>
+  <string>io.goodkind.gha-mac-broker-guest</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/gha-broker-watchdog.sh</string>
+    <string>/usr/local/bin/gha-mac-broker</string>
+    <string>guest-supervisor</string>
   </array>
+  <key>KeepAlive</key>
+  <true/>
   <key>RunAtLoad</key>
   <true/>
-  <key>StartInterval</key>
-  <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/var/log/gha-broker-watchdog.log</string>
+  <string>/var/log/gha-mac-broker-guest.log</string>
   <key>StandardErrorPath</key>
-  <string>/var/log/gha-broker-watchdog.log</string>
+  <string>/var/log/gha-mac-broker-guest.log</string>
 </dict>
 </plist>

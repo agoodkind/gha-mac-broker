@@ -11,14 +11,15 @@ import (
 )
 
 // stubTart records Exec calls and satisfies the tarter interface for white-box
-// command-construction tests.
+// command-construction tests. It simulates a guest that persisted the fingerprint
+// the provisioner was asked to bake, so verify can read it back.
 type stubTart struct {
-	execCalls     [][]string
-	cloneFrom     []string
-	cloneTo       []string
-	cloneInsecure []bool
-	names         []string
-	shutdown      map[string]bool
+	execCalls              [][]string
+	cloneFrom              []string
+	cloneTo                []string
+	cloneInsecure          []bool
+	names                  []string
+	provisionedFingerprint string
 }
 
 type stubStager struct {
@@ -47,23 +48,53 @@ func (s *stubTart) BootCommand(_ context.Context, _ string, _ tart.BootOptions) 
 	return exec.Command("true")
 }
 
-func (s *stubTart) Exec(_ context.Context, name string, argv ...string) ([]byte, error) {
+func (s *stubTart) IP(_ context.Context, _ string) (string, error) {
+	return "192.168.64.2", nil
+}
+
+func (s *stubTart) Exec(_ context.Context, _ string, argv ...string) ([]byte, error) {
 	s.execCalls = append(s.execCalls, argv)
-	if len(argv) >= 3 && argv[0] == "sudo" && argv[1] == "/sbin/shutdown" {
-		if s.shutdown == nil {
-			s.shutdown = make(map[string]bool)
-		}
-		s.shutdown[name] = true
+	if len(argv) >= 2 && argv[0] == "printenv" && argv[1] == "HOME" {
+		return []byte("/Users/admin\n"), nil
+	}
+	if fingerprint, ok := fingerprintFromProvision(argv); ok {
+		s.provisionedFingerprint = fingerprint
 		return nil, nil
 	}
-	if len(argv) == 1 && argv[0] == "true" && s.shutdown[name] {
-		return nil, errors.New("vm is down")
+	if len(argv) == 2 && argv[0] == "cat" && argv[1] == FingerprintPath {
+		return []byte(s.provisionedFingerprint + "\n"), nil
 	}
 	return nil, nil
 }
 
+// fingerprintFromProvision extracts the -fingerprint value from a golden-provision
+// exec, so the stub can echo it back through the baked fingerprint file.
+func fingerprintFromProvision(argv []string) (string, bool) {
+	provision := false
+	for _, arg := range argv {
+		if arg == "golden-provision" {
+			provision = true
+			break
+		}
+	}
+	if !provision {
+		return "", false
+	}
+	for index := 0; index+1 < len(argv); index++ {
+		if argv[index] == "-fingerprint" {
+			return argv[index+1], true
+		}
+	}
+	return "", true
+}
+
 func (s *stubTart) Stop(_ context.Context, _ string) error   { return nil }
 func (s *stubTart) Delete(_ context.Context, _ string) error { return nil }
+
+// fakeDigester injects a fixed runner-tarball digest so Build needs no network.
+func fakeDigester(_ context.Context, _ string) (string, error) {
+	return "fakerunnerdigest", nil
+}
 
 func TestNameForImageSanitizesCirrusTag(t *testing.T) {
 	got := NameForImage("ghcr.io/cirruslabs/macos-tahoe-xcode:26.5")
@@ -100,6 +131,7 @@ func TestEnsureGoldenBuildsMissingGoldenFromImage(t *testing.T) {
 	goldenName := NameForImage(image)
 	s := &stubTart{names: []string{}}
 	b := New(s)
+	b.runnerDigest = fakeDigester
 
 	got, err := b.EnsureGolden(context.Background(), EnsureOptions{
 		Image:         image,
@@ -131,6 +163,7 @@ func TestBuildStagesBaseBeforeFirstClone(t *testing.T) {
 		stopped: false,
 	}
 	builder := New(tartStub, WithBaseStager(stager))
+	builder.runnerDigest = fakeDigester
 
 	err := builder.Build(context.Background(), Options{
 		BaseImage:     image,
@@ -153,6 +186,9 @@ func TestBuildStagesBaseBeforeFirstClone(t *testing.T) {
 	if !stager.stopped {
 		t.Fatalf("stager stop was not called")
 	}
+	if tartStub.provisionedFingerprint == "" {
+		t.Fatalf("provisioner was not asked to bake a fingerprint")
+	}
 }
 
 func TestBuildFallsBackToBaseImageWhenStageFails(t *testing.T) {
@@ -165,6 +201,7 @@ func TestBuildFallsBackToBaseImageWhenStageFails(t *testing.T) {
 		stopped: false,
 	}
 	builder := New(tartStub, WithBaseStager(stager))
+	builder.runnerDigest = fakeDigester
 
 	err := builder.Build(context.Background(), Options{
 		BaseImage:     image,
@@ -186,64 +223,93 @@ func TestBuildFallsBackToBaseImageWhenStageFails(t *testing.T) {
 	}
 }
 
-func TestInstallRunnerURL(t *testing.T) {
+func TestProvisionLandsProvisionerViaDiscreteArgv(t *testing.T) {
 	s := &stubTart{}
 	b := New(s)
-	if err := b.installRunner(context.Background(), "vm", "2.99.0"); err != nil {
-		t.Fatalf("installRunner: %v", err)
-	}
-	if len(s.execCalls) != 1 {
-		t.Fatalf("want 1 exec, got %d", len(s.execCalls))
-	}
-	joined := strings.Join(s.execCalls[0], " ")
-	if !strings.Contains(joined, "actions-runner-osx-arm64-2.99.0.tar.gz") {
-		t.Errorf("runner install missing versioned url: %s", joined)
-	}
-	if !strings.Contains(joined, "test -f run.sh") {
-		t.Errorf("runner install should verify run.sh: %s", joined)
-	}
-}
+	mountBinary := tartSharedMountRoot + "/" + provisionMountName + "/" + provisionBinaryName
 
-func TestVerifyChecksRunnerWatchdogAndXcode(t *testing.T) {
-	s := &stubTart{}
-	b := New(s)
-	if err := b.verify(context.Background(), "gha-golden", "gha-golden-verify"); err != nil {
-		t.Fatalf("verify: %v", err)
+	if err := b.provision(context.Background(), "vm", "2.99.0", mountBinary, "fp123"); err != nil {
+		t.Fatalf("provision: %v", err)
 	}
+
+	var provisionCall []string
+	for _, call := range s.execCalls {
+		for _, arg := range call {
+			if arg == "bash" || arg == "-lc" {
+				t.Fatalf("provision used a shell: %v", call)
+			}
+		}
+		if len(call) >= 3 && call[0] == "sudo" && call[1] == localProvisionerPath && call[2] == "golden-provision" {
+			provisionCall = call
+		}
+	}
+	if provisionCall == nil {
+		t.Fatalf("provision did not run the landed provisioner, calls = %v", s.execCalls)
+	}
+	joined := strings.Join(provisionCall, " ")
+	for _, want := range []string{
+		"-runner-version 2.99.0",
+		"-binary " + mountBinary,
+		"-runner-dir /Users/admin/actions-runner",
+		"-fingerprint fp123",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("provisioner argv %q missing %q", joined, want)
+		}
+	}
+
 	all := ""
 	for _, call := range s.execCalls {
 		all += strings.Join(call, " ") + "\n"
 	}
-	for _, want := range []string{"test -f ~/actions-runner/run.sh", "io.goodkind.gha-broker-watchdog", "xcodebuild -version"} {
+	for _, want := range []string{
+		"cp " + mountBinary + " " + localProvisionerPath,
+		"xattr -c " + localProvisionerPath,
+		"codesign -s - -f " + localProvisionerPath,
+	} {
+		if !strings.Contains(all, want) {
+			t.Errorf("provision missing fixup step %q in:\n%s", want, all)
+		}
+	}
+}
+
+func TestVerifyChecksFingerprintRunnerAndSupervisor(t *testing.T) {
+	s := &stubTart{provisionedFingerprint: "fpABC"}
+	b := New(s)
+	if err := b.verify(context.Background(), "gha-golden", "gha-golden-verify", "fpABC"); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	all := ""
+	for _, call := range s.execCalls {
+		for _, arg := range call {
+			if arg == "bash" || arg == "-lc" {
+				t.Fatalf("verify used a shell: %v", call)
+			}
+		}
+		all += strings.Join(call, " ") + "\n"
+	}
+	for _, want := range []string{
+		"test -f /Users/admin/actions-runner/run.sh",
+		"cat " + FingerprintPath,
+		"test -f " + GuestSupervisorPlistPath,
+		"launchctl print system/" + GuestSupervisorPlistLabel,
+		"test ! -e " + LegacyWatchdogScriptPath,
+		"xcodebuild -version",
+	} {
 		if !strings.Contains(all, want) {
 			t.Errorf("verify missing check %q in:\n%s", want, all)
 		}
 	}
 }
 
-func TestInstallWatchdogWritesBothAssets(t *testing.T) {
-	s := &stubTart{}
+func TestVerifyRejectsFingerprintMismatch(t *testing.T) {
+	s := &stubTart{provisionedFingerprint: "different"}
 	b := New(s)
-	if err := b.installWatchdog(context.Background(), "vm"); err != nil {
-		t.Fatalf("installWatchdog: %v", err)
+	err := b.verify(context.Background(), "gha-golden", "gha-golden-verify", "expected")
+	if err == nil {
+		t.Fatal("verify accepted a fingerprint mismatch, want failure")
 	}
-	if len(s.execCalls) != 2 {
-		t.Fatalf("want 2 writes (script + plist), got %d", len(s.execCalls))
-	}
-	all := strings.Join(s.execCalls[0], " ") + "\n" + strings.Join(s.execCalls[1], " ")
-	for _, want := range []string{watchdogScriptPath, watchdogPlistPath, "base64 -D", "sudo tee"} {
-		if !strings.Contains(all, want) {
-			t.Errorf("watchdog install missing %q in:\n%s", want, all)
-		}
-	}
-}
-
-func TestWatchdogDoesNotShutdownGuestOnStaleHeartbeat(t *testing.T) {
-	script := string(watchdogScript)
-	if strings.Contains(script, "/sbin/shutdown") {
-		t.Fatalf("watchdog script contains guest shutdown command:\n%s", script)
-	}
-	if !strings.Contains(script, "heartbeat stale") {
-		t.Fatalf("watchdog script = %q, want stale heartbeat diagnostic", script)
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("verify error = %q, want a fingerprint mismatch message", err.Error())
 	}
 }
