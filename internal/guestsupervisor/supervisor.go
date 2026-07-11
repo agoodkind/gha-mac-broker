@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"goodkind.io/gha-mac-broker/internal/guestexec"
@@ -366,22 +367,12 @@ func (s *Supervisor) buildInherit(
 	extraFiles := []*os.File{listenerFile}
 	listenerFD := firstWorkerFDBase
 
-	s.mu.Lock()
-	pids := make([]int, 0, len(s.children))
-	for pid := range s.children {
-		pids = append(pids, pid)
+	dupedReadEnds, pipeWires, err := s.dupRunnerReadEnds(firstWorkerFDBase + len(extraFiles))
+	if err != nil {
+		_ = listenerFile.Close()
+		return nil, nil, nil, err
 	}
-	sort.Ints(pids)
-	pipeWires := make([]pipeFDWire, 0, len(pids))
-	for _, pid := range pids {
-		runnerChild := s.children[pid]
-		extraFiles = append(extraFiles, runnerChild.stdoutR)
-		stdoutFD := firstWorkerFDBase + len(extraFiles) - 1
-		extraFiles = append(extraFiles, runnerChild.stderrR)
-		stderrFD := firstWorkerFDBase + len(extraFiles) - 1
-		pipeWires = append(pipeWires, pipeFDWire{PID: pid, Stdout: stdoutFD, Stderr: stderrFD})
-	}
-	s.mu.Unlock()
+	extraFiles = append(extraFiles, dupedReadEnds...)
 
 	snapshotFD := -1
 	if snapshot != nil {
@@ -397,10 +388,12 @@ func (s *Supervisor) buildInherit(
 	env, err := s.assembleEnv(baseEnv, generation, listenerFD, pipeWires, snapshotFD, readyFD)
 	if err != nil {
 		_ = listenerFile.Close()
+		closeFiles(dupedReadEnds)
 		return nil, nil, nil, err
 	}
 	cleanup := func() {
 		_ = listenerFile.Close()
+		closeFiles(dupedReadEnds)
 		if snapshot != nil {
 			_ = snapshot.Close()
 		}
@@ -409,6 +402,56 @@ func (s *Supervisor) buildInherit(
 		}
 	}
 	return extraFiles, env, cleanup, nil
+}
+
+// dupRunnerReadEnds duplicates every live runner's stdout and stderr read ends
+// while holding the lock, so a concurrent ack_exit cannot close the originals in
+// the gap before the replacement worker starts and let Start dup a closed or
+// reused descriptor. The dup shares the open file description, so the kernel read
+// offset and the zero-gap capture property are preserved. startFD is the
+// descriptor number the first duplicate occupies in the child. The caller owns
+// the returned duplicates and closes them after Start; on error the partial set
+// is unwound before returning.
+func (s *Supervisor) dupRunnerReadEnds(startFD int) ([]*os.File, []pipeFDWire, error) {
+	dupReadEnd := func(file *os.File) (*os.File, error) {
+		fd, dupErr := syscall.Dup(int(file.Fd()))
+		if dupErr != nil {
+			return nil, fmt.Errorf("guestsupervisor: dup runner read end: %w", dupErr)
+		}
+		return os.NewFile(uintptr(fd), file.Name()), nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pids := make([]int, 0, len(s.children))
+	for pid := range s.children {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+
+	duped := make([]*os.File, 0, 2*len(pids))
+	pipeWires := make([]pipeFDWire, 0, len(pids))
+	for _, pid := range pids {
+		runnerChild := s.children[pid]
+		stdoutDup, dupErr := dupReadEnd(runnerChild.stdoutR)
+		if dupErr != nil {
+			closeFiles(duped)
+			s.log.Warn("guest supervisor dup runner read end failed", "pid", pid, "stream", "stdout", "err", dupErr)
+			return nil, nil, dupErr
+		}
+		stdoutFD := startFD + len(duped)
+		duped = append(duped, stdoutDup)
+		stderrDup, dupErr := dupReadEnd(runnerChild.stderrR)
+		if dupErr != nil {
+			closeFiles(duped)
+			s.log.Warn("guest supervisor dup runner read end failed", "pid", pid, "stream", "stderr", "err", dupErr)
+			return nil, nil, dupErr
+		}
+		stderrFD := startFD + len(duped)
+		duped = append(duped, stderrDup)
+		pipeWires = append(pipeWires, pipeFDWire{PID: pid, Stdout: stdoutFD, Stderr: stderrFD})
+	}
+	return duped, pipeWires, nil
 }
 
 func (s *Supervisor) assembleEnv(
@@ -771,20 +814,30 @@ func (s *Supervisor) replyError(conn *net.UnixConn, err error) {
 }
 
 // stopCurrentWorker signals the current worker to stop and waits briefly before
-// forcing it.
+// forcing it. The exit channel carries exits for every generation, including
+// superseded workers still draining, so it waits for the exit whose generation
+// matches the signaled worker rather than accepting the first exit as proof.
 func (s *Supervisor) stopCurrentWorker() {
 	s.mu.Lock()
-	handle := s.workers[s.currentGeneration]
+	generation := s.currentGeneration
+	handle := s.workers[generation]
 	s.mu.Unlock()
 	if handle == nil || handle.cmd.Process == nil {
 		return
 	}
 	_ = handle.cmd.Process.Signal(os.Interrupt)
-	select {
-	case exit := <-s.workerExitCh:
-		s.handleWorkerExitBookkeeping(exit)
-	case <-time.After(workerStopTimeout):
-		_ = handle.cmd.Process.Kill()
+	deadline := time.After(workerStopTimeout)
+	for {
+		select {
+		case exit := <-s.workerExitCh:
+			s.handleWorkerExitBookkeeping(exit)
+			if exit.generation == generation {
+				return
+			}
+		case <-deadline:
+			_ = handle.cmd.Process.Kill()
+			return
+		}
 	}
 }
 
