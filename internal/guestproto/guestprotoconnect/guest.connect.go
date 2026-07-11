@@ -49,6 +49,9 @@ const (
 	// GuestAgentServiceCancelJobProcedure is the fully-qualified name of the GuestAgentService's
 	// CancelJob RPC.
 	GuestAgentServiceCancelJobProcedure = "/gha.guest.v1.GuestAgentService/CancelJob"
+	// GuestAgentServiceUpdateAgentProcedure is the fully-qualified name of the GuestAgentService's
+	// UpdateAgent RPC.
+	GuestAgentServiceUpdateAgentProcedure = "/gha.guest.v1.GuestAgentService/UpdateAgent"
 )
 
 // GuestAgentServiceClient is a client for the gha.guest.v1.GuestAgentService service.
@@ -59,6 +62,7 @@ type GuestAgentServiceClient interface {
 	Reattach(context.Context, *connect.Request[guestproto.ReattachRequest]) (*connect.Response[guestproto.ReattachResponse], error)
 	Drain(context.Context, *connect.Request[guestproto.DrainRequest]) (*connect.Response[guestproto.DrainResponse], error)
 	CancelJob(context.Context, *connect.Request[guestproto.CancelJobRequest]) (*connect.Response[guestproto.CancelJobResponse], error)
+	UpdateAgent(context.Context) *connect.ClientStreamForClient[guestproto.UpdateAgentRequest, guestproto.UpdateAgentResponse]
 }
 
 // NewGuestAgentServiceClient constructs a client for the gha.guest.v1.GuestAgentService service. By
@@ -108,17 +112,24 @@ func NewGuestAgentServiceClient(httpClient connect.HTTPClient, baseURL string, o
 			connect.WithSchema(guestAgentServiceMethods.ByName("CancelJob")),
 			connect.WithClientOptions(opts...),
 		),
+		updateAgent: connect.NewClient[guestproto.UpdateAgentRequest, guestproto.UpdateAgentResponse](
+			httpClient,
+			baseURL+GuestAgentServiceUpdateAgentProcedure,
+			connect.WithSchema(guestAgentServiceMethods.ByName("UpdateAgent")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
 // guestAgentServiceClient implements GuestAgentServiceClient.
 type guestAgentServiceClient struct {
-	hello     *connect.Client[guestproto.HelloRequest, guestproto.HelloResponse]
-	runJob    *connect.Client[guestproto.RunJobRequest, guestproto.RunJobResponse]
-	jobStatus *connect.Client[guestproto.JobStatusRequest, guestproto.JobStatusEvent]
-	reattach  *connect.Client[guestproto.ReattachRequest, guestproto.ReattachResponse]
-	drain     *connect.Client[guestproto.DrainRequest, guestproto.DrainResponse]
-	cancelJob *connect.Client[guestproto.CancelJobRequest, guestproto.CancelJobResponse]
+	hello       *connect.Client[guestproto.HelloRequest, guestproto.HelloResponse]
+	runJob      *connect.Client[guestproto.RunJobRequest, guestproto.RunJobResponse]
+	jobStatus   *connect.Client[guestproto.JobStatusRequest, guestproto.JobStatusEvent]
+	reattach    *connect.Client[guestproto.ReattachRequest, guestproto.ReattachResponse]
+	drain       *connect.Client[guestproto.DrainRequest, guestproto.DrainResponse]
+	cancelJob   *connect.Client[guestproto.CancelJobRequest, guestproto.CancelJobResponse]
+	updateAgent *connect.Client[guestproto.UpdateAgentRequest, guestproto.UpdateAgentResponse]
 }
 
 // Hello calls gha.guest.v1.GuestAgentService.Hello.
@@ -151,6 +162,11 @@ func (c *guestAgentServiceClient) CancelJob(ctx context.Context, req *connect.Re
 	return c.cancelJob.CallUnary(ctx, req)
 }
 
+// UpdateAgent calls gha.guest.v1.GuestAgentService.UpdateAgent.
+func (c *guestAgentServiceClient) UpdateAgent(ctx context.Context) *connect.ClientStreamForClient[guestproto.UpdateAgentRequest, guestproto.UpdateAgentResponse] {
+	return c.updateAgent.CallClientStream(ctx)
+}
+
 // GuestAgentServiceHandler is an implementation of the gha.guest.v1.GuestAgentService service.
 type GuestAgentServiceHandler interface {
 	Hello(context.Context, *connect.Request[guestproto.HelloRequest]) (*connect.Response[guestproto.HelloResponse], error)
@@ -159,6 +175,7 @@ type GuestAgentServiceHandler interface {
 	Reattach(context.Context, *connect.Request[guestproto.ReattachRequest]) (*connect.Response[guestproto.ReattachResponse], error)
 	Drain(context.Context, *connect.Request[guestproto.DrainRequest]) (*connect.Response[guestproto.DrainResponse], error)
 	CancelJob(context.Context, *connect.Request[guestproto.CancelJobRequest]) (*connect.Response[guestproto.CancelJobResponse], error)
+	UpdateAgent(context.Context, *connect.ClientStream[guestproto.UpdateAgentRequest]) (*connect.Response[guestproto.UpdateAgentResponse], error)
 }
 
 // NewGuestAgentServiceHandler builds an HTTP handler from the service implementation. It returns
@@ -204,6 +221,12 @@ func NewGuestAgentServiceHandler(svc GuestAgentServiceHandler, opts ...connect.H
 		connect.WithSchema(guestAgentServiceMethods.ByName("CancelJob")),
 		connect.WithHandlerOptions(opts...),
 	)
+	guestAgentServiceUpdateAgentHandler := connect.NewClientStreamHandler(
+		GuestAgentServiceUpdateAgentProcedure,
+		svc.UpdateAgent,
+		connect.WithSchema(guestAgentServiceMethods.ByName("UpdateAgent")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/gha.guest.v1.GuestAgentService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case GuestAgentServiceHelloProcedure:
@@ -218,6 +241,8 @@ func NewGuestAgentServiceHandler(svc GuestAgentServiceHandler, opts ...connect.H
 			guestAgentServiceDrainHandler.ServeHTTP(w, r)
 		case GuestAgentServiceCancelJobProcedure:
 			guestAgentServiceCancelJobHandler.ServeHTTP(w, r)
+		case GuestAgentServiceUpdateAgentProcedure:
+			guestAgentServiceUpdateAgentHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -249,4 +274,8 @@ func (UnimplementedGuestAgentServiceHandler) Drain(context.Context, *connect.Req
 
 func (UnimplementedGuestAgentServiceHandler) CancelJob(context.Context, *connect.Request[guestproto.CancelJobRequest]) (*connect.Response[guestproto.CancelJobResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("gha.guest.v1.GuestAgentService.CancelJob is not implemented"))
+}
+
+func (UnimplementedGuestAgentServiceHandler) UpdateAgent(context.Context, *connect.ClientStream[guestproto.UpdateAgentRequest]) (*connect.Response[guestproto.UpdateAgentResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("gha.guest.v1.GuestAgentService.UpdateAgent is not implemented"))
 }
