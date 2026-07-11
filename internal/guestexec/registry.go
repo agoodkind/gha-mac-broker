@@ -1,0 +1,302 @@
+package guestexec
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
+)
+
+const (
+	defaultRetention         = 5 * time.Minute
+	defaultHeartbeatInterval = 10 * time.Second
+	outputReadBufferSize     = 32 * 1024
+	maximumProcessExitCode   = 1<<31 - 1
+)
+
+var (
+	// ErrDraining means the registry no longer accepts new executions.
+	ErrDraining = errors.New("guestexec: registry is draining")
+	// ErrExecutionNotFound means no active or retained execution has the supplied ID.
+	ErrExecutionNotFound = errors.New("guestexec: execution not found")
+)
+
+// Registry owns process lifetimes, retained event logs, slots, and drain state.
+type Registry struct {
+	mu                sync.Mutex
+	executions        map[string]*execution
+	slots             map[uint32]string
+	retention         time.Duration
+	heartbeatInterval time.Duration
+	draining          bool
+	activeCount       uint32
+	drained           chan struct{}
+	drainedClosed     bool
+}
+
+type execution struct {
+	mu        sync.Mutex
+	id        string
+	slot      uint32
+	meta      JobMeta
+	command   *exec.Cmd
+	processID int
+	phase     string
+	running   bool
+	reaped    bool
+	cancelled bool
+	events    []Event
+	notify    chan struct{}
+	done      chan struct{}
+}
+
+// New returns an empty process registry.
+func New(options Options) *Registry {
+	retention := options.Retention
+	if retention <= 0 {
+		retention = defaultRetention
+	}
+	heartbeatInterval := options.HeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = defaultHeartbeatInterval
+	}
+	registry := &Registry{
+		mu:                sync.Mutex{},
+		executions:        make(map[string]*execution),
+		slots:             make(map[uint32]string),
+		retention:         retention,
+		heartbeatInterval: heartbeatInterval,
+		draining:          false,
+		activeCount:       uint32(0),
+		drained:           make(chan struct{}),
+		drainedClosed:     false,
+	}
+	slog.Debug("guest execution registry created",
+		"retention", retention,
+		"heartbeat_interval", heartbeatInterval,
+	)
+	return registry
+}
+
+// Start launches a fresh execution or reports the idempotent outcome.
+func (r *Registry) Start(spec ExecSpec) (Outcome, error) {
+	if spec.ExecutionID == "" {
+		return OutcomeUnspecified, fmt.Errorf("guestexec: execution ID is required")
+	}
+	if spec.Command == "" {
+		return OutcomeUnspecified, fmt.Errorf("guestexec: command is required")
+	}
+	if !filepath.IsAbs(spec.Command) {
+		return OutcomeUnspecified, fmt.Errorf("guestexec: command path must be absolute")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.draining {
+		return OutcomeUnspecified, ErrDraining
+	}
+	if existing, found := r.executions[spec.ExecutionID]; found {
+		existing.mu.Lock()
+		sameSlot := existing.slot == spec.Slot
+		running := existing.running
+		existing.mu.Unlock()
+		if !sameSlot {
+			return OutcomeConflict, nil
+		}
+		if running {
+			return OutcomeAlreadyRunning, nil
+		}
+		return OutcomeAlreadyCompleted, nil
+	}
+	if _, occupied := r.slots[spec.Slot]; occupied {
+		return OutcomeConflict, nil
+	}
+
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		slog.Error("guest execution stdout pipe creation failed", "err", err)
+		return OutcomeUnspecified, fmt.Errorf("guestexec: create stdout pipe: %w", err)
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+		slog.Error("guest execution stderr pipe creation failed", "err", err)
+		return OutcomeUnspecified, fmt.Errorf("guestexec: create stderr pipe: %w", err)
+	}
+	closePipes := func() {
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+		_ = stderrReader.Close()
+		_ = stderrWriter.Close()
+	}
+
+	command := new(exec.Cmd)
+	command.Path = spec.Command
+	command.Args = append([]string{spec.Command}, spec.Args...)
+	command.Dir = spec.WorkingDir
+	command.Env = mergedEnvironment(spec.Env)
+	command.Stdout = stdoutWriter
+	command.Stderr = stderrWriter
+	configureProcessGroup(command)
+	if err := command.Start(); err != nil {
+		closePipes()
+		slog.Error("guest execution process start failed", "err", err, "execution_id", spec.ExecutionID)
+		return OutcomeUnspecified, fmt.Errorf("guestexec: start %q: %w", spec.Command, err)
+	}
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
+
+	execState := &execution{
+		mu:        sync.Mutex{},
+		id:        spec.ExecutionID,
+		slot:      spec.Slot,
+		meta:      spec.Meta,
+		command:   command,
+		processID: command.Process.Pid,
+		phase:     "running",
+		running:   true,
+		reaped:    false,
+		cancelled: false,
+		events:    nil,
+		notify:    make(chan struct{}),
+		done:      make(chan struct{}),
+	}
+	execState.appendEvent(PhaseChange{Phase: "running"})
+	r.executions[spec.ExecutionID] = execState
+	r.slots[spec.Slot] = spec.ExecutionID
+	r.activeCount++
+
+	goSafe("execution reaper", func() {
+		r.runExecution(execState, stdoutReader, stderrReader)
+	})
+	return OutcomeAccepted, nil
+}
+
+func (r *Registry) runExecution(
+	execState *execution,
+	stdoutReader *os.File,
+	stderrReader *os.File,
+) {
+	var readers sync.WaitGroup
+	readers.Add(2)
+	goSafe("stdout capture", func() {
+		captureOutput(execState, StreamStdout, stdoutReader, &readers)
+	})
+	goSafe("stderr capture", func() {
+		captureOutput(execState, StreamStderr, stderrReader, &readers)
+	})
+
+	observeErr := waitUntilExited(execState.processID)
+	// command.Wait must not run under execState.mu. On the platform where
+	// waitUntilExited is a non-reaping stub, Wait blocks until the child exits,
+	// and the child does not exit until its stdout/stderr pipes drain. The
+	// capture goroutines need execState.mu to append log events, so holding the
+	// mutex across Wait would stall the drain and deadlock on large output.
+	waitErr := execState.command.Wait()
+	execState.mu.Lock()
+	execState.reaped = true
+	execState.mu.Unlock()
+	waitErr = errors.Join(observeErr, waitErr)
+	readers.Wait()
+	exitCode := processExitCode(execState.command.ProcessState)
+	r.completeExecution(execState, exitCode, waitErr)
+}
+
+func (r *Registry) completeExecution(execState *execution, exitCode int32, waitErr error) {
+	r.mu.Lock()
+	execState.mu.Lock()
+	message := ""
+	if execState.cancelled {
+		message = "execution cancelled"
+	} else if waitErr != nil {
+		message = waitErr.Error()
+	}
+	execState.phase = "completed"
+	execState.running = false
+	execState.appendEventLocked(PhaseChange{Phase: "completed"})
+	execState.appendEventLocked(TerminalResult{ExitCode: exitCode, Message: message})
+	close(execState.done)
+	delete(r.slots, execState.slot)
+	r.activeCount--
+	execState.mu.Unlock()
+	r.mu.Unlock()
+}
+
+func captureOutput(
+	execState *execution,
+	stream Stream,
+	reader *os.File,
+	readers *sync.WaitGroup,
+) {
+	defer readers.Done()
+	defer func() { _ = reader.Close() }()
+	buffer := make([]byte, outputReadBufferSize)
+	for {
+		bytesRead, err := reader.Read(buffer)
+		if bytesRead > 0 {
+			data := append([]byte(nil), buffer[:bytesRead]...)
+			execState.appendEvent(LogChunk{Stream: stream, Data: data})
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				execState.appendEvent(LogChunk{
+					Stream: StreamStderr,
+					Data:   fmt.Appendf(nil, "guestexec: capture %v: %v\n", stream, err),
+				})
+			}
+			return
+		}
+	}
+}
+
+func (e *execution) appendEvent(payload EventPayload) {
+	e.mu.Lock()
+	e.appendEventLocked(payload)
+	e.mu.Unlock()
+}
+
+func (e *execution) appendEventLocked(payload EventPayload) {
+	sequence := uint64(len(e.events) + 1)
+	e.events = append(e.events, Event{Sequence: sequence, Payload: payload})
+	close(e.notify)
+	e.notify = make(chan struct{})
+}
+
+func mergedEnvironment(overrides map[string]string) []string {
+	environment := append([]string(nil), os.Environ()...)
+	keys := make([]string, 0, len(overrides))
+	for key := range overrides {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		environment = append(environment, key+"="+overrides[key])
+	}
+	return environment
+}
+
+func processExitCode(processState *os.ProcessState) int32 {
+	exitCode := processState.ExitCode()
+	if exitCode < 0 || exitCode > maximumProcessExitCode {
+		return -1
+	}
+	return int32(exitCode)
+}
+
+func goSafe(label string, function func()) {
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				slog.Error(label+" panic recovered", "err", fmt.Errorf("panic: %v", recovered))
+			}
+		}()
+		function()
+	}()
+}
