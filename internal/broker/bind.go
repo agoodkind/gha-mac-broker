@@ -38,6 +38,18 @@ const readinessInterval = 2 * time.Second
 // over vsock. The guest watchdog's stale timeout must exceed this.
 const touchInterval = 10 * time.Second
 
+// checkAliveTimeout bounds the warm VM vsock liveness probe. It is the reconcile
+// loop's per-VM ceiling, so one wedged guest cannot park the whole pass.
+const checkAliveTimeout = 15 * time.Second
+
+// cloneRunnerSlotsTimeout bounds the guest-side runner slot clone, which copies
+// the actions-runner tree once per extra slot.
+const cloneRunnerSlotsTimeout = 5 * time.Minute
+
+// slotBindingIOTimeout bounds the small per-slot binding file reads and writes
+// over vsock.
+const slotBindingIOTimeout = 15 * time.Second
+
 // heartbeatFile is the guest path the broker touches on a timer; the baked guest
 // watchdog logs when this file goes stale.
 const heartbeatFile = "/tmp/gha-broker.alive"
@@ -220,6 +232,8 @@ func (b *Binder) cloneRunnerSlots(ctx context.Context, vmName string, slotCount 
 	if remote == "" {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, cloneRunnerSlotsTimeout)
+	defer cancel()
 	if _, err := b.vm.Exec(ctx, vmName, "bash", "-lc", remote); err != nil {
 		slog.ErrorContext(ctx, "runner slot clone failed", "err", err, "vm", vmName)
 		return fmt.Errorf("broker: clone runner slots on %s: %w", vmName, err)
@@ -303,6 +317,8 @@ func (b *Binder) writeSlotBinding(ctx context.Context, vmName string, binding Sl
 	}
 	path := slotBindingPath(binding.SlotIndex)
 	remote := fmt.Sprintf("cat > %s <<'EOF'\n%s\nEOF\n", shellQuote(path), string(data))
+	ctx, cancel := context.WithTimeout(ctx, slotBindingIOTimeout)
+	defer cancel()
 	if _, err := b.vm.Exec(ctx, vmName, "bash", "-lc", remote); err != nil {
 		slog.WarnContext(ctx, "slot binding write failed", "err", err, "vm", vmName, "slot", binding.SlotIndex)
 		return fmt.Errorf("broker: write slot binding on %s slot %d: %w", vmName, binding.SlotIndex, err)
@@ -311,6 +327,8 @@ func (b *Binder) writeSlotBinding(ctx context.Context, vmName string, binding Sl
 }
 
 func (b *Binder) clearSlotBinding(ctx context.Context, vmName string, slotIndex int) {
+	ctx, cancel := context.WithTimeout(ctx, slotBindingIOTimeout)
+	defer cancel()
 	if _, err := b.vm.Exec(ctx, vmName, "rm", "-f", slotBindingPath(slotIndex)); err != nil {
 		slog.DebugContext(ctx, "slot binding clear failed", "err", err, "vm", vmName, "slot", slotIndex)
 	}
@@ -320,6 +338,8 @@ func (b *Binder) readSlotBinding(ctx context.Context, vmName string, slotIndex i
 	var zero SlotBinding
 	path := shellQuote(slotBindingPath(slotIndex))
 	remote := fmt.Sprintf("if [[ -f %s ]]; then cat %s; fi", path, path)
+	ctx, cancel := context.WithTimeout(ctx, slotBindingIOTimeout)
+	defer cancel()
 	out, err := b.vm.Exec(ctx, vmName, "bash", "-lc", remote)
 	if err != nil {
 		slog.WarnContext(ctx, "slot binding read failed", "err", err, "vm", vmName, "slot", slotIndex)
@@ -428,8 +448,11 @@ func (b *Binder) Teardown(ctx context.Context, vm *WarmVM) {
 	b.teardown(ctx, vm.Name)
 }
 
-// CheckAlive verifies that a cached warm VM still answers over vsock.
+// CheckAlive verifies that a cached warm VM still answers over vsock. It bounds
+// the probe so one wedged guest cannot park the whole reconcile pass.
 func (b *Binder) CheckAlive(ctx context.Context, vm *WarmVM) error {
+	ctx, cancel := context.WithTimeout(ctx, checkAliveTimeout)
+	defer cancel()
 	if _, err := b.vm.Exec(ctx, vm.Name, "touch", heartbeatFile); err != nil {
 		slog.WarnContext(ctx, "warm vm liveness probe failed", "err", err, "vm", vm.Name)
 		return fmt.Errorf("broker: check alive %s: %w", vm.Name, err)
