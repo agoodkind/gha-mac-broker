@@ -41,6 +41,7 @@ import (
 	"goodkind.io/gha-mac-broker/internal/fastpull"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/golden"
+	"goodkind.io/gha-mac-broker/internal/hostedload"
 	"goodkind.io/gha-mac-broker/internal/install"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
 	"goodkind.io/gha-mac-broker/internal/server"
@@ -722,7 +723,8 @@ func runServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p)
+	hostedTracker := hostedload.NewTracker()
+	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, hostedTracker)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -735,6 +737,7 @@ func runServe(ctx context.Context, args []string) error {
 			return applyReloadedConfig(reloadCtx, reloadedConfig, binder, p, srv)
 		},
 	})
+	startHostedLoadReconcile(ctx, gh, hostedTracker, cfg.Labels)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -873,6 +876,46 @@ func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, clean
 	deleteStaleRunners(ctx, cfg, cleaner)
 	p.Start(ctx)
 	p.StartReconcile(ctx, 0)
+}
+
+// hostedLoadReconcileInterval is how often the in-progress hosted-macOS job
+// set is rebuilt from the GitHub API to correct webhook-counter drift after a
+// broker restart or a missed webhook delivery.
+const hostedLoadReconcileInterval = 5 * time.Minute
+
+type hostedJobLister interface {
+	ListInProgressHostedMacOSJobs(ctx context.Context, poolLabels []string) (map[int64]struct{}, error)
+}
+
+func startHostedLoadReconcile(ctx context.Context, lister hostedJobLister, tracker *hostedload.Tracker, poolLabels []string) {
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				slog.ErrorContext(ctx, "hosted load reconcile goroutine panic recovered", "err", recovered)
+			}
+		}()
+		reconcileHostedLoadOnce(ctx, lister, tracker, poolLabels)
+		ticker := time.NewTicker(hostedLoadReconcileInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reconcileHostedLoadOnce(ctx, lister, tracker, poolLabels)
+			}
+		}
+	}()
+}
+
+func reconcileHostedLoadOnce(ctx context.Context, lister hostedJobLister, tracker *hostedload.Tracker, poolLabels []string) {
+	jobs, err := lister.ListInProgressHostedMacOSJobs(ctx, poolLabels)
+	if err != nil {
+		slog.WarnContext(ctx, "hosted load reconcile failed; keeping live counter", "err", err)
+		return
+	}
+	tracker.Reconcile(jobs)
+	slog.DebugContext(ctx, "hosted load reconciled", "in_progress_hosted_macos", len(jobs))
 }
 
 func startUpdateSchedulerInBackground(ctx context.Context, stop func(), log *slog.Logger) {

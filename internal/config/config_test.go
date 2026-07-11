@@ -40,6 +40,9 @@ private_key_path = "/tmp/key.pem"
 	if cfg.JobsPerVM != 1 {
 		t.Errorf("default jobs per VM = %d", cfg.JobsPerVM)
 	}
+	if cfg.HostedMacOSConcurrencyLimit != 5 {
+		t.Errorf("default hosted macOS concurrency limit = %d, want 5", cfg.HostedMacOSConcurrencyLimit)
+	}
 	// MaxIdle and MaxAge are honored verbatim, so an unset value stays zero and
 	// disables that recycle trigger rather than defaulting.
 	if time.Duration(cfg.MaxIdle) != 0 {
@@ -281,6 +284,30 @@ private_key_path = "/tmp/key.pem"
 	}
 	if !strings.Contains(err.Error(), "jobs_per_vm must be at least 1") {
 		t.Errorf("error = %q, want jobs_per_vm validation", err.Error())
+	}
+}
+
+func TestValidateRejectsNegativeHostedMacOSConcurrencyLimit(t *testing.T) {
+	cfg := &Config{
+		ListenAddr:                  "[::1]:8080",
+		RunnerCount:                 1,
+		JobsPerVM:                   1,
+		HostedMacOSConcurrencyLimit: -1,
+		App: AppConfig{
+			AppID:          "12345",
+			PrivateKeyPath: "/tmp/key.pem",
+		},
+		Tart: TartConfig{
+			Binary:    "tart",
+			BaseImage: DefaultBaseImage,
+		},
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error for negative hosted_macos_concurrency_limit")
+	}
+	if !strings.Contains(err.Error(), "hosted_macos_concurrency_limit must not be negative") {
+		t.Errorf("error = %q, want hosted_macos_concurrency_limit validation", err.Error())
 	}
 }
 
