@@ -28,3 +28,20 @@ GO_MK_MODULES := go-build.mk go-release.mk
 include bootstrap.mk
 
 .DEFAULT_GOAL := check
+
+.PHONY: buf-generate buf-lint buf-breaking
+
+# Generated protobuf and ConnectRPC code is committed.
+buf-generate:
+	buf generate
+
+buf-lint:
+	buf lint
+
+buf-breaking:
+	git fetch origin
+	@if git cat-file -e origin/main:api/guest/v1/guest.proto 2>/dev/null; then \
+	    buf breaking --against '.git#ref=origin/main'; \
+	else \
+	    echo 'No guest protobuf baseline exists on origin/main; skipping.'; \
+	fi
