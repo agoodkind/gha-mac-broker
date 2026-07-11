@@ -186,6 +186,41 @@ func TestStartDrainsLargeOutputWithoutStallingReaper(t *testing.T) {
 	}
 }
 
+func TestCancelKillsProcessGroupAndIsIdempotent(t *testing.T) {
+	registry := newTestRegistry()
+	executionID := "cancel-group"
+	_, err := registry.Start(ExecSpec{
+		ExecutionID: executionID,
+		Slot:        4,
+		Command:     "/bin/sh",
+		Args:        []string{"-c", "sleep 30 & wait"},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	events, unsubscribe, err := registry.Subscribe(executionID, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer unsubscribe()
+	waitForPhase(t, events, "running")
+
+	if err := registry.Cancel(executionID); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if err := registry.Cancel(executionID); err != nil {
+		t.Fatalf("second Cancel while reaping: %v", err)
+	}
+	remaining := collectThroughTerminal(t, events)
+	result := terminalResult(t, remaining)
+	if result.ExitCode == 0 {
+		t.Fatalf("cancelled exit code = %d, want non-zero", result.ExitCode)
+	}
+	if err := registry.Cancel(executionID); err != nil {
+		t.Fatalf("third Cancel after completion: %v", err)
+	}
+}
+
 func TestCompletedExecutionRemainsSubscribableWithinRetention(t *testing.T) {
 	registry := New(Options{Retention: time.Second, HeartbeatInterval: 10 * time.Millisecond})
 	executionID := "retained"
@@ -366,6 +401,79 @@ func TestEnforceLogByteCapResumesCursorEvictsOldestAndKeepsLaterSequences(t *tes
 		if isChunk && len(chunk.Data) != 0 {
 			t.Fatalf("events[%d] before cursor still holds %d live bytes", index, len(chunk.Data))
 		}
+	}
+}
+
+func TestStartRejectsExecutionAndSlotConflicts(t *testing.T) {
+	registry := newTestRegistry()
+	first := ExecSpec{ExecutionID: "first", Slot: 6, Command: "/bin/sh", Args: []string{"-c", "sleep 30"}}
+	if _, err := registry.Start(first); err != nil {
+		t.Fatalf("Start first: %v", err)
+	}
+	t.Cleanup(func() { _ = registry.Cancel(first.ExecutionID) })
+
+	slotConflict, err := registry.Start(ExecSpec{
+		ExecutionID: "second",
+		Slot:        first.Slot,
+		Command:     "/bin/sh",
+		Args:        []string{"-c", "true"},
+	})
+	if err != nil {
+		t.Fatalf("Start slot conflict: %v", err)
+	}
+	if slotConflict != OutcomeConflict {
+		t.Fatalf("slot conflict outcome = %v, want %v", slotConflict, OutcomeConflict)
+	}
+
+	idConflict, err := registry.Start(ExecSpec{
+		ExecutionID: first.ExecutionID,
+		Slot:        first.Slot + 1,
+		Command:     "/bin/sh",
+		Args:        []string{"-c", "true"},
+	})
+	if err != nil {
+		t.Fatalf("Start execution conflict: %v", err)
+	}
+	if idConflict != OutcomeConflict {
+		t.Fatalf("execution conflict outcome = %v, want %v", idConflict, OutcomeConflict)
+	}
+}
+
+func TestListAndDrainTrackActiveExecutions(t *testing.T) {
+	registry := newTestRegistry()
+	executionID := "draining"
+	meta := JobMeta{Repo: "owner/repo", JobID: 11, RunID: 22, RunnerName: "runner"}
+	_, err := registry.Start(ExecSpec{
+		ExecutionID: executionID,
+		Slot:        7,
+		Meta:        meta,
+		Command:     "/bin/sh",
+		Args:        []string{"-c", "sleep 0.2"},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	states := registry.List()
+	if len(states) != 1 || !states[0].Running || states[0].ExecutionID != executionID || states[0].Meta != meta || states[0].LastSequence == 0 {
+		t.Fatalf("List active = %+v", states)
+	}
+	drained := registry.Drain()
+	if drained.Idle || drained.ActiveExecutions != 1 {
+		t.Fatalf("Drain state = %+v, want one active execution", drained)
+	}
+	if outcome, err := registry.Start(ExecSpec{ExecutionID: "refused", Slot: 8, Command: "/bin/true"}); !errors.Is(err, ErrDraining) || outcome != OutcomeUnspecified {
+		t.Fatalf("Start while draining = (%v, %v), want (%v, %v)", outcome, err, OutcomeUnspecified, ErrDraining)
+	}
+
+	select {
+	case <-drained.Done:
+	case <-time.After(testTimeout):
+		t.Fatal("Drain did not report idle")
+	}
+	states = registry.List()
+	if len(states) != 1 || states[0].Running || states[0].Phase != "completed" {
+		t.Fatalf("List completed = %+v", states)
 	}
 }
 
