@@ -32,7 +32,17 @@ setup_slot_keychain() {
         security create-keychain -p "" "$slot_keychain" || return 1
     fi
     security default-keychain -s "$slot_keychain" || return 1
-    security list-keychains -d user -s "$slot_keychain" || return 1
+    # Prepend the slot keychain to the user search list while preserving the
+    # existing entries. The System keychain carries the trust anchors codesign
+    # and notarization need, so replacing the list with only the slot keychain
+    # would break the signing trust chain. Drop any prior copy of the slot
+    # keychain first so a re-run does not duplicate it.
+    local existing_keychains
+    existing_keychains=$(security list-keychains -d user \
+        | sed -e 's/^[[:space:]]*//' -e 's/"//g' \
+        | grep -vxF "$slot_keychain" || true)
+    # shellcheck disable=SC2086 # intentional word-split: one keychain path per argument
+    security list-keychains -d user -s "$slot_keychain" $existing_keychains || return 1
     security unlock-keychain -p "" "$slot_keychain" || return 1
     security set-keychain-settings "$slot_keychain" || return 1
 }
