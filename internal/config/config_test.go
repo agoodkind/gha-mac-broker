@@ -287,7 +287,7 @@ private_key_path = "/tmp/key.pem"
 	}
 }
 
-func TestValidateRejectsNegativeHostedMacOSConcurrencyLimit(t *testing.T) {
+func TestNegativeHostedMacOSConcurrencyLimitIsAcceptedAsDisableSentinel(t *testing.T) {
 	cfg := &Config{
 		ListenAddr:                  "[::1]:8080",
 		RunnerCount:                 1,
@@ -302,12 +302,15 @@ func TestValidateRejectsNegativeHostedMacOSConcurrencyLimit(t *testing.T) {
 			BaseImage: DefaultBaseImage,
 		},
 	}
-	err := cfg.validate()
-	if err == nil {
-		t.Fatal("expected error for negative hosted_macos_concurrency_limit")
+	// A negative limit is the disable sentinel: validate accepts it and applyDefaults
+	// leaves it unchanged (only an explicit zero is defaulted), so it reaches the
+	// server's limit <= 0 branch that keeps hosted_free always true.
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("negative hosted_macos_concurrency_limit should be accepted as a disable sentinel, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "hosted_macos_concurrency_limit must not be negative") {
-		t.Errorf("error = %q, want hosted_macos_concurrency_limit validation", err.Error())
+	cfg.applyDefaults()
+	if cfg.HostedMacOSConcurrencyLimit != -1 {
+		t.Errorf("applyDefaults changed negative limit to %d, want it left as -1", cfg.HostedMacOSConcurrencyLimit)
 	}
 }
 

@@ -75,7 +75,10 @@ type Config struct {
 	// concurrent-job limit. The /capacity endpoint reports hosted_free=true while
 	// fewer than this many hosted macOS jobs are in progress, so a CI consumer can
 	// release a queued job to hosted only when hosted has headroom. Zero or unset
-	// defaults to defaultHostedMacOSConcurrencyLimit.
+	// defaults to defaultHostedMacOSConcurrencyLimit. A negative value disables the
+	// gate: /capacity then always reports hosted_free=true (the limit <= 0 branch in
+	// the server). Only an explicit zero is defaulted, so negative survives as the
+	// disable sentinel, mirroring the unset-vs-zero handling of Tart.FastPull.
 	HostedMacOSConcurrencyLimit int `toml:"hosted_macos_concurrency_limit"`
 
 	// App identifies the GitHub App and where its private key lives.
@@ -308,9 +311,6 @@ func (c *Config) validate() error {
 	}
 	if c.StallTimeout < 0 {
 		return fmt.Errorf("config: stall_timeout must not be negative")
-	}
-	if c.HostedMacOSConcurrencyLimit < 0 {
-		return fmt.Errorf("config: hosted_macos_concurrency_limit must not be negative")
 	}
 	if !safeCirrusImageTag(c.Tart.BaseImage) {
 		return fmt.Errorf("config: tart.base_image must be a ghcr.io/cirruslabs/macos-*-xcode:* tag")
