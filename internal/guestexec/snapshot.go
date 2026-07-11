@@ -94,7 +94,16 @@ func (r *Registry) Freeze() (*Snapshot, error) {
 		running := execState.running
 		execState.mu.Unlock()
 		if running {
+			// Completion barrier: stop the capture goroutines, then wait for the
+			// supervisor to settle. If a reap was already in flight, its
+			// readers.Wait now returns because the captures stopped, so it runs
+			// through completeExecution before supervised closes. The snapshot is
+			// then of an execution that is either cleanly running (no exit
+			// observed) or fully completed (its terminal already in events), never
+			// mid-reap. An idle supervisor settles at once through stopped, so this
+			// never waits on an exit that has not arrived.
 			freezeCapture(execState)
+			<-execState.supervised
 		}
 		execState.mu.Lock()
 		snapshot.Executions = append(snapshot.Executions, snapshotExecutionLocked(execState))
@@ -255,6 +264,7 @@ func (r *Registry) restoreExecution(
 		readers:          nil,
 		stdoutReader:     nil,
 		stderrReader:     nil,
+		supervised:       make(chan struct{}),
 	}
 
 	if !execState.running {

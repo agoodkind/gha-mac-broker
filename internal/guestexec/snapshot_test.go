@@ -148,15 +148,20 @@ func TestFreezeRestoreRoundTripsInFlightExecution(t *testing.T) {
 // keeps its data.
 func TestFreezeRestorePreservesEvictedLogChunkAsNil(t *testing.T) {
 	registry := New(Options{Retention: time.Minute, HeartbeatInterval: time.Hour})
+	// A completed execution is enough to exercise snapshot serialization of an
+	// evicted chunk, and it needs no supervisor goroutine, so Freeze takes it
+	// without the running-path completion barrier.
 	execState := &execution{
-		id:         "evict",
-		slot:       3,
-		phase:      "running",
-		running:    true,
-		notify:     make(chan struct{}),
-		done:       make(chan struct{}),
-		exitReport: make(chan ExitReport, 1),
-		stopped:    make(chan struct{}),
+		id:          "evict",
+		slot:        3,
+		phase:       "completed",
+		running:     false,
+		completedAt: time.Now(),
+		notify:      make(chan struct{}),
+		done:        make(chan struct{}),
+		exitReport:  make(chan ExitReport, 1),
+		stopped:     make(chan struct{}),
+		supervised:  make(chan struct{}),
 	}
 	execState.appendEventLocked(PhaseChange{Phase: "running"})
 	overCapChunks := (maxRetainedLogBytes / outputReadBufferSize) + 8
@@ -169,18 +174,18 @@ func TestFreezeRestorePreservesEvictedLogChunkAsNil(t *testing.T) {
 	}
 	marker := []byte("LIVE_MARKER")
 	execState.appendEventLocked(LogChunk{Stream: StreamStdout, Data: marker})
+	markerIndex := len(execState.events) - 1
+	execState.appendEventLocked(PhaseChange{Phase: "completed"})
+	execState.appendEventLocked(TerminalResult{ExitCode: 0})
 
 	registry.mu.Lock()
 	registry.executions[execState.id] = execState
-	registry.slots[execState.slot] = execState.id
-	registry.activeCount++
 	registry.mu.Unlock()
 
 	firstChunk, ok := execState.events[1].Payload.(LogChunk)
 	if !ok || firstChunk.Data != nil {
 		t.Fatalf("events[1] = %+v, want an evicted LogChunk with nil data", execState.events[1].Payload)
 	}
-	markerIndex := len(execState.events) - 1
 
 	snapshot, err := registry.Freeze()
 	if err != nil {
@@ -256,6 +261,77 @@ func TestRestoreReArmsRetentionFromCompletedAt(t *testing.T) {
 	}
 }
 
+// TestFreezeDuringInFlightReapSnapshotsCompleted proves the completion barrier.
+// The exit report is delivered while the capture pipes are still open, so the
+// supervisor consumes it and blocks in readers.Wait with exitReported set but no
+// terminal emitted. Freeze must stop the captures, let that in-flight reap run to
+// completion, and snapshot a completed execution. Without the barrier the
+// snapshot could capture exitReported=true with running=true and no terminal,
+// which Restore can never complete (a re-delivered report is dropped as stale),
+// hanging the execution and blocking drain forever.
+func TestFreezeDuringInFlightReapSnapshotsCompleted(t *testing.T) {
+	registry := New(Options{Retention: time.Minute, HeartbeatInterval: time.Hour})
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	defer func() { _ = stdoutReader.Close() }()
+	defer func() { _ = stderrReader.Close() }()
+	defer func() { _ = stdoutWriter.Close() }()
+	defer func() { _ = stderrWriter.Close() }()
+
+	const pid = 5555
+	spec := ExecSpec{ExecutionID: "reap-race", Slot: 1, Command: "/bin/true"}
+	if _, err := registry.Register(spec, pid, pid, stdoutReader, stderrReader); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// The pipes stay open, so the captures block on Read and the reap blocks in
+	// readers.Wait once it consumes this report.
+	registry.ReportExit(pid, 0, "")
+	waitForExitReported(t, registry, spec.ExecutionID)
+
+	snapshot, err := registry.Freeze()
+	if err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+	if len(snapshot.Executions) != 1 {
+		t.Fatalf("snapshot executions = %d, want 1", len(snapshot.Executions))
+	}
+	frozen := snapshot.Executions[0]
+	if frozen.Running {
+		t.Fatal("snapshot execution is still running; the barrier did not wait for the in-flight reap")
+	}
+	if terminals := countTerminals(frozen.Events); terminals != 1 {
+		t.Fatalf("snapshot terminal events = %d, want exactly 1", terminals)
+	}
+
+	restored := New(Options{})
+	if err := restored.Restore(snapshot, nil, nil); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	events, unsubscribe, err := restored.Subscribe(spec.ExecutionID, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer unsubscribe()
+	collected := collectThroughTerminal(t, events)
+	if result := terminalResult(t, collected); result.ExitCode != 0 {
+		t.Fatalf("restored terminal exit code = %d, want 0", result.ExitCode)
+	}
+	if terminals := terminalCountOf(t, restored, spec.ExecutionID); terminals != 1 {
+		t.Fatalf("restored terminal events = %d, want exactly 1", terminals)
+	}
+	if state := restored.Drain(); !state.Idle || state.ActiveExecutions != 0 {
+		t.Fatalf("restored drain = %+v, want idle with no active executions", state)
+	}
+}
+
 func assertPhaseOrder(t *testing.T, events []Event) {
 	t.Helper()
 	runningAt := -1
@@ -310,4 +386,36 @@ func eventPayloadAt(t *testing.T, registry *Registry, executionID string, index 
 		t.Fatalf("event index %d out of range (len %d)", index, len(execState.events))
 	}
 	return execState.events[index].Payload
+}
+
+func waitForExitReported(t *testing.T, registry *Registry, executionID string) {
+	t.Helper()
+	deadline := time.Now().Add(testTimeout)
+	for {
+		registry.mu.Lock()
+		execState, found := registry.executions[executionID]
+		registry.mu.Unlock()
+		if found {
+			execState.mu.Lock()
+			reported := execState.exitReported
+			execState.mu.Unlock()
+			if reported {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("exit report was not observed before deadline")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func countTerminals(events []Event) int {
+	count := 0
+	for _, event := range events {
+		if _, ok := event.Payload.(TerminalResult); ok {
+			count++
+		}
+	}
+	return count
 }

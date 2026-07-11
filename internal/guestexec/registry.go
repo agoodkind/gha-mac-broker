@@ -88,6 +88,11 @@ type execution struct {
 	readers      *sync.WaitGroup
 	stdoutReader io.ReadCloser
 	stderrReader io.ReadCloser
+	// supervised is closed when the supervisor goroutine returns, whether it
+	// reaped the execution to completion or stopped for a freeze. Freeze awaits it
+	// so a snapshot is never taken while a reap is mid-flight, which would capture
+	// an unrestorable exitReported-but-still-running state.
+	supervised chan struct{}
 }
 
 // New returns an empty process registry.
@@ -252,6 +257,7 @@ func (r *Registry) Register(
 		readers:          readers,
 		stdoutReader:     stdoutR,
 		stderrReader:     stderrR,
+		supervised:       make(chan struct{}),
 	}
 	execState.appendEvent(PhaseChange{Phase: "running"})
 	r.executions[spec.ExecutionID] = execState
@@ -410,22 +416,38 @@ func (r *Registry) discardLaunched(launched *LaunchedProcess) {
 	})
 }
 
-// executionByPIDLocked returns the execution that owns pid, or nil. processID is
-// set once at Register before the execution is published, so reading it under
-// r.mu is race-free.
+// executionByPIDLocked returns the execution that owns pid, preferring a live
+// (running, not yet reaped) one. processID is set once at Register before the
+// execution is published, so reading it under r.mu is race-free. The preference
+// routes a report to the live execution when a recycled pid also matches a
+// retained completed execution still inside its retention window; the reap-order
+// of that live execution's state is read under its own mutex.
 func (r *Registry) executionByPIDLocked(pid int) *execution {
+	var fallback *execution
 	for _, execState := range r.executions {
-		if execState.processID == pid {
+		if execState.processID != pid {
+			continue
+		}
+		execState.mu.Lock()
+		live := execState.running && !execState.reaped
+		execState.mu.Unlock()
+		if live {
 			return execState
 		}
+		if fallback == nil {
+			fallback = execState
+		}
 	}
-	return nil
+	return fallback
 }
 
 // superviseExecution awaits the caller's exit report, then completes the
 // execution. Freeze releases it early through stopped so the next worker
-// generation, not this goroutine, drives the execution to completion.
+// generation, not this goroutine, drives the execution to completion. Closing
+// supervised on return lets Freeze know the goroutine has settled, so a snapshot
+// never lands in the middle of a reap.
 func (r *Registry) superviseExecution(execState *execution) {
+	defer close(execState.supervised)
 	select {
 	case report := <-execState.exitReport:
 		r.reapAndComplete(execState, report)
