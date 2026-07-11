@@ -352,6 +352,38 @@ func TestBrewRefreshWriteRefusesSymlinkMarker(t *testing.T) {
 	}
 }
 
+func TestBrewMarkerRefusesSymlinkViaONoFollow(t *testing.T) {
+	dir := t.TempDir()
+	markerPath := filepath.Join(dir, "marker")
+	victim := filepath.Join(dir, "victim")
+	// Plant a symlink at the marker path pointing at a not-yet-existing victim, so
+	// a followed open would create the victim through the link.
+	if err := os.Symlink(victim, markerPath); err != nil {
+		t.Fatalf("plant symlink: %v", err)
+	}
+	executor := &runnerExecutor{markerPath: markerPath}
+
+	// The presence check must refuse the symlink (not report absent) and must not
+	// follow it.
+	if !executor.markerPresent() {
+		t.Fatalf("markerPresent = false on a symlink, want refuse")
+	}
+
+	// The write must be refused atomically at open time: no victim is created
+	// through the link, and the symlink is left in place rather than replaced.
+	executor.writeBootRefreshMarker(context.Background())
+	if _, err := os.Stat(victim); !os.IsNotExist(err) {
+		t.Fatalf("victim stat err = %v, want the write refused (no create through the symlink)", err)
+	}
+	info, err := os.Lstat(markerPath)
+	if err != nil {
+		t.Fatalf("lstat marker: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("marker mode = %v, want the symlink refused and left in place", info.Mode())
+	}
+}
+
 func TestBrewRefreshSkippedWhenBrewMissing(t *testing.T) {
 	baseHome := t.TempDir()
 	executor, stub := newTestExecutor(t, baseHome)

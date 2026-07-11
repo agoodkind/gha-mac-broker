@@ -2,6 +2,7 @@ package guestagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"goodkind.io/gha-mac-broker/internal/guestexec"
 )
@@ -350,14 +353,22 @@ func (e *runnerExecutor) clearStaleMarker() {
 	})
 }
 
-// markerPresent reports whether a real refresh marker exists. A symlink at the
-// marker path is not trusted, so a race cannot redirect a later read through it.
+// markerPresent reports whether a real refresh marker exists. It opens with
+// O_NOFOLLOW so a symlink squatting the world-writable marker path is refused
+// atomically at open time rather than followed to a victim or mistaken for a
+// real marker. Only a genuine absence (ENOENT) counts as "no marker"; a symlink
+// refusal (ELOOP) or any other error is treated as refuse, so the code neither
+// trusts a suspicious path nor proceeds to write there.
 func (e *runnerExecutor) markerPresent() bool {
-	info, err := os.Lstat(e.markerPath)
-	if err != nil {
+	fd, err := unix.Open(e.markerPath, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err == nil {
+		_ = unix.Close(fd)
+		return true
+	}
+	if errors.Is(err, unix.ENOENT) {
 		return false
 	}
-	return info.Mode()&os.ModeSymlink == 0
+	return true
 }
 
 // refreshHomebrewIndex runs brew update, retrying only on lock contention and
@@ -381,18 +392,22 @@ func (e *runnerExecutor) refreshHomebrewIndex(ctx context.Context) {
 	}
 }
 
-// writeBootRefreshMarker truncate-creates the marker, refusing to write through
-// a symlink so a race cannot redirect the write to an arbitrary file.
+// writeBootRefreshMarker truncate-creates the marker. O_NOFOLLOW refuses a
+// symlink atomically at open time, so a race that plants a symlink at the
+// world-writable marker path between the presence check and this write cannot
+// redirect the write to an arbitrary file; the open returns ELOOP and no marker
+// is written, so a later job refreshes itself.
 func (e *runnerExecutor) writeBootRefreshMarker(ctx context.Context) {
-	if info, err := os.Lstat(e.markerPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return
-	}
-	file, err := os.OpenFile(e.markerPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, markerFilePerm)
+	fd, err := unix.Open(
+		e.markerPath,
+		unix.O_CREAT|unix.O_TRUNC|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+		markerFilePerm,
+	)
 	if err != nil {
-		slog.WarnContext(ctx, "guest brew boot refresh marker write failed", "path", e.markerPath, "err", err)
+		slog.WarnContext(ctx, "guest brew boot refresh marker write refused or failed", "path", e.markerPath, "err", err)
 		return
 	}
-	_ = file.Close()
+	_ = unix.Close(fd)
 }
 
 // brewOnPath reports whether brew is on PATH.

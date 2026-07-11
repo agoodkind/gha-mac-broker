@@ -5,6 +5,7 @@ package guestagent
 import (
 	"context"
 	"net/http"
+	"sync"
 
 	"connectrpc.com/connect"
 	"goodkind.io/gha-mac-broker/internal/guestexec"
@@ -56,6 +57,11 @@ type Handler struct {
 	goldenFingerprint string
 	childLauncher     ChildLauncher
 	specBuilder       SpecBuilder
+	// slotLocksMu guards slotLocks; each slot lock serializes admission, per-slot
+	// prep, and start for one slot, so two concurrent RunJobs for the same slot
+	// cannot both run destructive prepareSlot before either records the execution.
+	slotLocksMu sync.Mutex
+	slotLocks   map[uint32]*sync.Mutex
 }
 
 var _ guestprotoconnect.GuestAgentServiceHandler = (*Handler)(nil)
@@ -95,7 +101,23 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 		goldenFingerprint: options.GoldenFingerprint,
 		childLauncher:     options.ChildLauncher,
 		specBuilder:       specBuilder,
+		slotLocksMu:       sync.Mutex{},
+		slotLocks:         make(map[uint32]*sync.Mutex),
 	}
+}
+
+// slotLock returns the lock that serializes admission, prep, and start for slot,
+// creating it on first use. The returned lock is stable for the slot's lifetime,
+// so every RunJob for that slot contends on the same lock.
+func (handler *Handler) slotLock(slot uint32) *sync.Mutex {
+	handler.slotLocksMu.Lock()
+	defer handler.slotLocksMu.Unlock()
+	lock, found := handler.slotLocks[slot]
+	if !found {
+		lock = &sync.Mutex{}
+		handler.slotLocks[slot] = lock
+	}
+	return lock
 }
 
 // NewHTTPHandler mounts a guest-agent service on the generated ConnectRPC path.
@@ -141,6 +163,13 @@ func (handler *Handler) RunJob(
 		JitConfig:   request.Msg.GetJitConfig(),
 		Env:         copyEnvironment(request.Msg.GetEnv()),
 	}
+	// Serialize admission, prep, and start per slot for the whole critical section,
+	// so two concurrent RunJobs for the same slot cannot both pass admission and
+	// both run destructive prepareSlot before either records the execution. The
+	// lock is released on every return path, and never held across the job run.
+	slotLock := handler.slotLock(jobRequest.Slot)
+	slotLock.Lock()
+	defer slotLock.Unlock()
 	// Peek admission before any destructive per-slot prep. Build runs prepareSlot,
 	// which rm -rf's and re-clones the slot's runner dir, HOME, and keychain, so an
 	// idempotent retry of a live execution or a job routed to a busy slot must be
