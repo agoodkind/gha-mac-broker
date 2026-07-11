@@ -5,17 +5,21 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"goodkind.io/gha-mac-broker/internal/golden"
 )
 
-// fixtureRunnerTarball builds a gzip tar stream that resembles the actions/runner
-// release layout: an executable run.sh, a nested regular file, and a symlink.
-func fixtureRunnerTarball(t *testing.T) io.ReadCloser {
+// fixtureRunnerTarballBytes builds a gzip tar archive that resembles the
+// actions/runner release layout: an executable run.sh, a nested regular file, and
+// a relative symlink that stays inside the runner directory.
+func fixtureRunnerTarballBytes(t *testing.T) []byte {
 	t.Helper()
 	var buffer bytes.Buffer
 	gzipWriter := gzip.NewWriter(&buffer)
@@ -46,7 +50,19 @@ func fixtureRunnerTarball(t *testing.T) io.ReadCloser {
 	if err := gzipWriter.Close(); err != nil {
 		t.Fatalf("close gzip: %v", err)
 	}
-	return io.NopCloser(bytes.NewReader(buffer.Bytes()))
+	return buffer.Bytes()
+}
+
+// fixtureRunnerTarball returns the fixture archive as a readable stream.
+func fixtureRunnerTarball(t *testing.T) io.ReadCloser {
+	t.Helper()
+	return io.NopCloser(bytes.NewReader(fixtureRunnerTarballBytes(t)))
+}
+
+// sha256Hex returns the hex sha256 of content, matching the provisioner's digest.
+func sha256Hex(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
 }
 
 func TestExtractRunnerTarballLandsExecutableEntrypoint(t *testing.T) {
@@ -130,14 +146,16 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 		runnerDir:       runnerDir,
 	}
 
+	tarballBytes := fixtureRunnerTarballBytes(t)
 	signed := 0
 	req := provisionRequest{
 		runnerVersion: "2.335.1",
+		runnerDigest:  sha256Hex(tarballBytes),
 		binarySource:  binarySource,
 		fingerprint:   "deadbeef",
 		paths:         paths,
 		download: func(_ context.Context, _ string) (io.ReadCloser, error) {
-			return fixtureRunnerTarball(t), nil
+			return io.NopCloser(bytes.NewReader(tarballBytes)), nil
 		},
 		sign: func(_ context.Context, path string) error {
 			signed++
@@ -194,6 +212,61 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 	}
 	if _, err := os.Stat(watchdogPlist); !os.IsNotExist(err) {
 		t.Fatalf("watchdog plist still present, stat err = %v", err)
+	}
+}
+
+func TestExtractRunnerTarballRejectsEscapingSymlink(t *testing.T) {
+	root := t.TempDir()
+	destDir := filepath.Join(root, "actions-runner")
+	outsideFile := filepath.Join(root, "outside", "x.plist")
+
+	var buffer bytes.Buffer
+	gzipWriter := gzip.NewWriter(&buffer)
+	tarWriter := tar.NewWriter(gzipWriter)
+	// A symlink whose relative target escapes the runner dir, followed by a regular
+	// file that would write through it into the escaped location.
+	symlink := &tar.Header{Name: "evil", Linkname: "../outside", Typeflag: tar.TypeSymlink}
+	if err := tarWriter.WriteHeader(symlink); err != nil {
+		t.Fatalf("write symlink header: %v", err)
+	}
+	through := &tar.Header{Name: "evil/x.plist", Mode: 0o644, Size: 3, Typeflag: tar.TypeReg}
+	if err := tarWriter.WriteHeader(through); err != nil {
+		t.Fatalf("write regular header: %v", err)
+	}
+	if _, err := tarWriter.Write([]byte("bad")); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+	_ = tarWriter.Close()
+	_ = gzipWriter.Close()
+
+	err := extractRunnerTarball(context.Background(), bytes.NewReader(buffer.Bytes()), destDir)
+	if err == nil {
+		t.Fatal("extractRunnerTarball accepted an escaping symlink, want rejection")
+	}
+	if _, statErr := os.Lstat(filepath.Join(destDir, "evil")); !os.IsNotExist(statErr) {
+		t.Fatalf("escaping symlink was created, stat err = %v", statErr)
+	}
+	if _, statErr := os.Stat(outsideFile); !os.IsNotExist(statErr) {
+		t.Fatalf("file written outside runner dir, stat err = %v", statErr)
+	}
+}
+
+func TestInstallRunnerRejectsDigestMismatch(t *testing.T) {
+	tarballBytes := fixtureRunnerTarballBytes(t)
+	runnerDir := filepath.Join(t.TempDir(), "actions-runner")
+	download := func(_ context.Context, _ string) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(tarballBytes)), nil
+	}
+
+	err := installRunner(context.Background(), download, "2.335.1", "0000expecteddoesnotmatch", runnerDir)
+	if err == nil {
+		t.Fatal("installRunner accepted a runner tarball whose digest did not match, want rejection")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("installRunner error = %q, want a digest mismatch message", err.Error())
+	}
+	if _, statErr := os.Stat(filepath.Join(runnerDir, "run.sh")); !os.IsNotExist(statErr) {
+		t.Fatalf("runner was extracted despite digest mismatch, stat err = %v", statErr)
 	}
 }
 

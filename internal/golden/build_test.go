@@ -228,7 +228,7 @@ func TestProvisionLandsProvisionerViaDiscreteArgv(t *testing.T) {
 	b := New(s)
 	mountBinary := tartSharedMountRoot + "/" + provisionMountName + "/" + provisionBinaryName
 
-	if err := b.provision(context.Background(), "vm", "2.99.0", mountBinary, "fp123"); err != nil {
+	if err := b.provision(context.Background(), "vm", "2.99.0", "runnerdigest99", mountBinary, "fp123"); err != nil {
 		t.Fatalf("provision: %v", err)
 	}
 
@@ -249,6 +249,7 @@ func TestProvisionLandsProvisionerViaDiscreteArgv(t *testing.T) {
 	joined := strings.Join(provisionCall, " ")
 	for _, want := range []string{
 		"-runner-version 2.99.0",
+		"-runner-digest runnerdigest99",
 		"-binary " + mountBinary,
 		"-runner-dir /Users/admin/actions-runner",
 		"-fingerprint fp123",

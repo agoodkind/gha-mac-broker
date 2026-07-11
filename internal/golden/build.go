@@ -225,7 +225,7 @@ func ResolveRunnerVersion(ctx context.Context) (string, error) {
 func (b *Builder) Build(ctx context.Context, opts Options) error {
 	slog.InfoContext(ctx, "building golden", "base", opts.BaseImage, "golden", opts.GoldenName, "runner", opts.RunnerVersion)
 
-	scratchDir, mountBinary, fingerprint, err := b.stageProvisionInputs(ctx, opts)
+	scratchDir, mountBinary, fingerprint, runnerDigest, err := b.stageProvisionInputs(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -247,7 +247,7 @@ func (b *Builder) Build(ctx context.Context, opts Options) error {
 		return err
 	}
 
-	if err := b.provision(ctx, opts.BuildVM, opts.RunnerVersion, mountBinary, fingerprint); err != nil {
+	if err := b.provision(ctx, opts.BuildVM, opts.RunnerVersion, runnerDigest, mountBinary, fingerprint); err != nil {
 		_ = boot.Process.Kill()
 		b.teardown(ctx, opts.BuildVM)
 		return err
@@ -272,34 +272,34 @@ func (b *Builder) Build(ctx context.Context, opts Options) error {
 // base ref, runner version, runner-tarball digest, baked-binary digest, and each
 // baked payload digest. The fingerprint is a pure function of these inputs, so it
 // is unit-testable without a VM.
-func (b *Builder) stageProvisionInputs(ctx context.Context, opts Options) (scratchDir, mountBinary, fingerprint string, err error) {
+func (b *Builder) stageProvisionInputs(ctx context.Context, opts Options) (scratchDir, mountBinary, fingerprint, runnerDigest string, err error) {
 	binaryPath := opts.BinaryPath
 	if binaryPath == "" {
 		exe, exeErr := os.Executable()
 		if exeErr != nil {
 			slog.ErrorContext(ctx, "resolve executable for golden bake failed", "err", exeErr)
-			return "", "", "", fmt.Errorf("golden: resolve executable: %w", exeErr)
+			return "", "", "", "", fmt.Errorf("golden: resolve executable: %w", exeErr)
 		}
 		binaryPath = exe
 	}
 	scratchDir, err = os.MkdirTemp("", "gha-golden-provision-")
 	if err != nil {
-		return "", "", "", fmt.Errorf("golden: create provision scratch dir: %w", err)
+		return "", "", "", "", fmt.Errorf("golden: create provision scratch dir: %w", err)
 	}
 	scratchBinary := filepath.Join(scratchDir, provisionBinaryName)
 	if err := copyFileMode(ctx, binaryPath, scratchBinary, 0o755); err != nil {
 		_ = os.RemoveAll(scratchDir)
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	tarballDigest, err := b.runnerDigest(ctx, opts.RunnerVersion)
 	if err != nil {
 		_ = os.RemoveAll(scratchDir)
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	binaryDigest, err := sha256File(ctx, scratchBinary)
 	if err != nil {
 		_ = os.RemoveAll(scratchDir)
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	fingerprint = Fingerprint(FingerprintInputs{
 		BaseImageRef:        opts.BaseImage,
@@ -311,7 +311,7 @@ func (b *Builder) stageProvisionInputs(ctx context.Context, opts Options) (scrat
 		},
 	})
 	mountBinary = tartSharedMountRoot + "/" + provisionMountName + "/" + provisionBinaryName
-	return scratchDir, mountBinary, fingerprint, nil
+	return scratchDir, mountBinary, fingerprint, tarballDigest, nil
 }
 
 // provision lands the all-Go provisioner into the booted build VM and runs it.
@@ -319,7 +319,7 @@ func (b *Builder) stageProvisionInputs(ctx context.Context, opts Options) (scrat
 // and it is ad-hoc signed before it runs, all via discrete-argv tart exec with no
 // shell. The provisioner then installs the runner, bakes the binary and launchd
 // unit, persists the fingerprint, and deletes the retired watchdog.
-func (b *Builder) provision(ctx context.Context, name, runnerVersion, mountBinary, fingerprint string) error {
+func (b *Builder) provision(ctx context.Context, name, runnerVersion, runnerDigest, mountBinary, fingerprint string) error {
 	homeOut, err := b.vm.Exec(ctx, name, "printenv", "HOME")
 	if err != nil {
 		slog.ErrorContext(ctx, "resolve guest home failed", "err", err, "vm", name)
@@ -338,6 +338,7 @@ func (b *Builder) provision(ctx context.Context, name, runnerVersion, mountBinar
 		{
 			"sudo", localProvisionerPath, "golden-provision",
 			"-runner-version", runnerVersion,
+			"-runner-digest", runnerDigest,
 			"-binary", mountBinary,
 			"-runner-dir", runnerDir,
 			"-fingerprint", fingerprint,
