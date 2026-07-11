@@ -4,7 +4,6 @@ package guestagent
 
 import (
 	"context"
-	"errors"
 	"net/http"
 
 	"connectrpc.com/connect"
@@ -129,14 +128,39 @@ func (handler *Handler) RunJob(
 	return connect.NewResponse(response), nil
 }
 
-// JobStatus is wired in the next slice so this package can satisfy the generated
-// handler interface before status streaming lands.
+// JobStatus streams replayed and live execution events until a terminal result,
+// stream cancellation, or registry close.
 func (handler *Handler) JobStatus(
-	_ context.Context,
-	_ *connect.Request[guestproto.JobStatusRequest],
-	_ *connect.ServerStream[guestproto.JobStatusEvent],
+	ctx context.Context,
+	request *connect.Request[guestproto.JobStatusRequest],
+	stream *connect.ServerStream[guestproto.JobStatusEvent],
 ) error {
-	return connect.NewError(connect.CodeUnimplemented, errors.New("guestagent: job status is not implemented"))
+	events, unsubscribe, err := handler.registry.Subscribe(
+		request.Msg.GetExecutionId(),
+		request.Msg.GetFromSequence(),
+	)
+	if err != nil {
+		return mapRegistryError(err)
+	}
+	defer unsubscribe()
+
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return nil
+			}
+			protoEvent, terminal := eventToProto(event)
+			if sendErr := stream.Send(protoEvent); sendErr != nil {
+				return sendErr
+			}
+			if terminal {
+				return nil
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
 
 // Reattach returns active and retained executions with their last sequence.
