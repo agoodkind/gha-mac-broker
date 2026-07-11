@@ -48,6 +48,10 @@ func TestRunJobRemoteCommandUsesSlotHomeAndTMPDIR(t *testing.T) {
 		`export TMPDIR="$base_home/tmp-1"`,
 		`export HOME="$base_home/slot-home-1"`,
 		`mkdir -p "$HOME"`,
+		`slot_keychain="$HOME/Library/Keychains/login.keychain-db"`,
+		`security create-keychain -p "" "$slot_keychain"`,
+		`security default-keychain -s "$slot_keychain"`,
+		`security unlock-keychain -p "" "$slot_keychain"`,
 		"export GIT_CONFIG_COUNT=1",
 		"export GIT_CONFIG_KEY_0=credential.helper",
 		"export GIT_CONFIG_VALUE_0=",
@@ -62,6 +66,13 @@ func TestRunJobRemoteCommandUsesSlotHomeAndTMPDIR(t *testing.T) {
 	cdIndex := strings.Index(command, `cd "$runner_home"`)
 	if homeIndex < 0 || cdIndex < 0 || homeIndex > cdIndex {
 		t.Fatalf("slot command = %q, want HOME exported before cd into runner home", command)
+	}
+	// The isolated slot HOME needs a default keychain, set after HOME is exported
+	// and before the runner starts, so signing steps do not fail with "A default
+	// keychain could not be found".
+	keychainIndex := strings.Index(command, `security default-keychain -s "$slot_keychain"`)
+	if keychainIndex < homeIndex || keychainIndex > cdIndex {
+		t.Fatalf("slot command = %q, want default keychain set after HOME and before cd", command)
 	}
 	if strings.Contains(command, "cd ~/actions-runner &&") {
 		t.Fatalf("slot command = %q, want no legacy runner home", command)

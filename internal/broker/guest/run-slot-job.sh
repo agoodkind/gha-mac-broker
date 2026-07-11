@@ -19,5 +19,36 @@ mkdir -p "$TMPDIR"
 export HOME="$base_home/slot-home-{{SLOT_INDEX}}"
 mkdir -p "$HOME"
 
+# The isolated slot $HOME has no login keychain, so signing steps fail with
+# "A default keychain could not be found" (security cms -D on provisioning
+# profiles, codesign). Hosted runners ship a default login keychain; create one
+# per slot $HOME. Per-slot $HOME keeps this default per-slot, so co-tenant slots
+# never race on a shared default keychain. Best effort: a failure warns but does
+# not abort the job, which then fails on signing as it does today.
+setup_slot_keychain() {
+    local slot_keychain="$HOME/Library/Keychains/login.keychain-db"
+    mkdir -p "$HOME/Library/Keychains"
+    if ! security show-keychain-info "$slot_keychain" >/dev/null 2>&1; then
+        security create-keychain -p "" "$slot_keychain" || return 1
+    fi
+    security default-keychain -s "$slot_keychain" || return 1
+    # Prepend the slot keychain to the user search list while preserving the
+    # existing entries. The System keychain carries the trust anchors codesign
+    # and notarization need, so replacing the list with only the slot keychain
+    # would break the signing trust chain. Drop any prior copy of the slot
+    # keychain first so a re-run does not duplicate it.
+    local existing_keychains
+    existing_keychains=$(security list-keychains -d user \
+        | sed -e 's/^[[:space:]]*//' -e 's/"//g' \
+        | grep -vxF "$slot_keychain" || true)
+    # shellcheck disable=SC2086 # intentional word-split: one keychain path per argument
+    security list-keychains -d user -s "$slot_keychain" $existing_keychains || return 1
+    security unlock-keychain -p "" "$slot_keychain" || return 1
+    security set-keychain-settings "$slot_keychain" || return 1
+}
+if ! setup_slot_keychain; then
+    printf 'warning: slot keychain setup failed; signing steps may fail\n' >&2
+fi
+
 cd "$runner_home"
 ./run.sh --jitconfig {{JIT_CONFIG}}
