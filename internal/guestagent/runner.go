@@ -2,7 +2,6 @@ package guestagent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -354,21 +353,23 @@ func (e *runnerExecutor) clearStaleMarker() {
 }
 
 // markerPresent reports whether a real refresh marker exists. It opens with
-// O_NOFOLLOW so a symlink squatting the world-writable marker path is refused
-// atomically at open time rather than followed to a victim or mistaken for a
-// real marker. Only a genuine absence (ENOENT) counts as "no marker"; a symlink
-// refusal (ELOOP) or any other error is treated as refuse, so the code neither
-// trusts a suspicious path nor proceeds to write there.
+// O_NOFOLLOW|O_NONBLOCK so a symlink is not followed and a FIFO cannot block the
+// open, then fstats the descriptor so only a regular file counts as a real
+// marker. A symlink, FIFO, or any other non-regular occupant is not a valid
+// marker, so this returns false and the refresh proceeds; the O_EXCL|O_NOFOLLOW
+// write then refuses the occupant without truncating or following it, so an
+// attacker cannot suppress the refresh by squatting the world-writable path.
 func (e *runnerExecutor) markerPresent() bool {
-	fd, err := unix.Open(e.markerPath, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err == nil {
-		_ = unix.Close(fd)
-		return true
-	}
-	if errors.Is(err, unix.ENOENT) {
+	fd, err := unix.Open(e.markerPath, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
 		return false
 	}
-	return true
+	defer func() { _ = unix.Close(fd) }()
+	var stat unix.Stat_t
+	if fstatErr := unix.Fstat(fd, &stat); fstatErr != nil {
+		return false
+	}
+	return stat.Mode&unix.S_IFMT == unix.S_IFREG
 }
 
 // refreshHomebrewIndex runs brew update, retrying only on lock contention and
@@ -392,15 +393,16 @@ func (e *runnerExecutor) refreshHomebrewIndex(ctx context.Context) {
 	}
 }
 
-// writeBootRefreshMarker truncate-creates the marker. O_NOFOLLOW refuses a
-// symlink atomically at open time, so a race that plants a symlink at the
-// world-writable marker path between the presence check and this write cannot
-// redirect the write to an arbitrary file; the open returns ELOOP and no marker
-// is written, so a later job refreshes itself.
+// writeBootRefreshMarker creates the marker only when the path is absent.
+// O_NOFOLLOW refuses a symlink and O_EXCL refuses any pre-existing path, so a
+// race that plants a symlink, FIFO, or regular file at the world-writable marker
+// path between the presence check and this write cannot redirect the write or be
+// truncated: the open fails and no marker is written, so a later job refreshes
+// itself.
 func (e *runnerExecutor) writeBootRefreshMarker(ctx context.Context) {
 	fd, err := unix.Open(
 		e.markerPath,
-		unix.O_CREAT|unix.O_TRUNC|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+		unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC,
 		markerFilePerm,
 	)
 	if err != nil {

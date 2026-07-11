@@ -8,6 +8,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"goodkind.io/gha-mac-broker/internal/guestexec"
 )
@@ -363,10 +366,10 @@ func TestBrewMarkerRefusesSymlinkViaONoFollow(t *testing.T) {
 	}
 	executor := &runnerExecutor{markerPath: markerPath}
 
-	// The presence check must refuse the symlink (not report absent) and must not
-	// follow it.
-	if !executor.markerPresent() {
-		t.Fatalf("markerPresent = false on a symlink, want refuse")
+	// The presence check must not follow the symlink; a symlink is not a valid
+	// regular marker, so it reports not-present and the write is left to refuse it.
+	if executor.markerPresent() {
+		t.Fatalf("markerPresent = true on a symlink, want not a valid marker")
 	}
 
 	// The write must be refused atomically at open time: no victim is created
@@ -381,6 +384,72 @@ func TestBrewMarkerRefusesSymlinkViaONoFollow(t *testing.T) {
 	}
 	if info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("marker mode = %v, want the symlink refused and left in place", info.Mode())
+	}
+}
+
+func TestBrewMarkerRefusesFifoWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	markerPath := filepath.Join(dir, "marker")
+	if err := unix.Mkfifo(markerPath, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	executor := &runnerExecutor{markerPath: markerPath}
+
+	// markerPresent must not block on the FIFO (O_NONBLOCK) and must reject it: a
+	// FIFO is not a regular marker, so it reports not-present without blocking.
+	presence := make(chan bool, 1)
+	go func() { presence <- executor.markerPresent() }()
+	select {
+	case got := <-presence:
+		if got {
+			t.Fatalf("markerPresent = true on a FIFO, want not a valid marker")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("markerPresent blocked on a FIFO; want a non-blocking rejection")
+	}
+
+	// writeBootRefreshMarker must not block and must refuse to create over the FIFO,
+	// leaving the FIFO in place.
+	written := make(chan struct{}, 1)
+	go func() {
+		executor.writeBootRefreshMarker(context.Background())
+		written <- struct{}{}
+	}()
+	select {
+	case <-written:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writeBootRefreshMarker blocked on a FIFO; want a non-blocking refuse")
+	}
+	info, err := os.Lstat(markerPath)
+	if err != nil {
+		t.Fatalf("lstat marker: %v", err)
+	}
+	if info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("marker mode = %v, want the FIFO refused and left in place", info.Mode())
+	}
+}
+
+func TestBrewMarkerWriteDoesNotTruncateExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	markerPath := filepath.Join(dir, "marker")
+	const original = "raced-in content\n"
+	if err := os.WriteFile(markerPath, []byte(original), 0o600); err != nil {
+		t.Fatalf("write pre-existing file: %v", err)
+	}
+	executor := &runnerExecutor{markerPath: markerPath}
+
+	// A pre-existing regular file counts as a present marker, so the write is a
+	// no-op that must never truncate the raced-in file (O_EXCL, no O_TRUNC).
+	if !executor.markerPresent() {
+		t.Fatalf("markerPresent = false on an existing regular file, want present")
+	}
+	executor.writeBootRefreshMarker(context.Background())
+	got, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	if string(got) != original {
+		t.Fatalf("marker content = %q, want the raced-in file left untruncated %q", string(got), original)
 	}
 }
 

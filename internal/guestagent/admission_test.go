@@ -14,14 +14,19 @@ import (
 	"goodkind.io/gha-mac-broker/internal/guestproto"
 )
 
-// countingSpecBuilder counts Build calls and returns a launchable spec, so a test
-// can assert destructive prep ran at most once across concurrent RunJobs.
-type countingSpecBuilder struct {
-	builds atomic.Int32
+// blockingSpecBuilder reports each Build call on started and blocks it until
+// release closes, so a test can hold one RunJob inside its critical section (and
+// thus holding the slot lock) while it drives a second RunJob for the same slot.
+type blockingSpecBuilder struct {
+	builds  atomic.Int32
+	started chan string
+	release chan struct{}
 }
 
-func (b *countingSpecBuilder) Build(_ context.Context, request JobRequest) (guestexec.ExecSpec, error) {
+func (b *blockingSpecBuilder) Build(_ context.Context, request JobRequest) (guestexec.ExecSpec, error) {
 	b.builds.Add(1)
+	b.started <- request.ExecutionID
+	<-b.release
 	return guestexec.ExecSpec{
 		ExecutionID: request.ExecutionID,
 		Slot:        request.Slot,
@@ -58,63 +63,114 @@ func (l *fakeSlotLauncher) Run(spec guestexec.ExecSpec) (guestexec.Outcome, erro
 
 const fakeSlotPID = 999999
 
-// TestRunJobSerializesConcurrentSameSlot proves the per-slot lock closes the
-// concurrent-same-slot window: two RunJobs racing on one idle slot never both run
-// prepareSlot; exactly one is admitted and launches, and the other is refused
-// without any destructive prep.
+// TestRunJobSerializesConcurrentSameSlot deterministically proves the per-slot
+// lock: while a first RunJob is held inside Build (so it holds the slot lock), a
+// second RunJob for the same slot with a different execution id cannot reach
+// Build. Only after the first releases and records its execution does the second
+// proceed, peek admission on the now-busy slot, and return CONFLICT without ever
+// running Build. Without the slot lock the second would peek the still-idle slot
+// and Build concurrently, which the started-channel assertion catches.
 func TestRunJobSerializesConcurrentSameSlot(t *testing.T) {
-	const iterations = 50
-	ids := []string{"job-a", "job-b"}
-	for iteration := 0; iteration < iterations; iteration++ {
-		registry := guestexec.New(guestexec.Options{Retention: time.Minute, HeartbeatInterval: time.Hour})
-		builder := &countingSpecBuilder{}
-		launcher := &fakeSlotLauncher{registry: registry, launches: atomic.Int32{}}
-		handler := New(registry, Options{SlotCount: 1, SpecBuilder: builder, ChildLauncher: launcher})
-
-		outcomes := make([]guestproto.RunJobResponse_Outcome, len(ids))
-		var waitGroup sync.WaitGroup
-		waitGroup.Add(len(ids))
-		for index := range ids {
-			go func(index int) {
-				defer waitGroup.Done()
-				response, err := handler.RunJob(context.Background(), connect.NewRequest(&guestproto.RunJobRequest{
-					ExecutionId: ids[index],
-					Slot:        0,
-					JitConfig:   "jit",
-				}))
-				if err != nil {
-					t.Errorf("iteration %d RunJob %s: %v", iteration, ids[index], err)
-					return
-				}
-				outcomes[index] = response.Msg.GetOutcome()
-			}(index)
-		}
-		waitGroup.Wait()
-
-		accepted := 0
-		refused := 0
-		for _, outcome := range outcomes {
-			switch outcome {
-			case guestproto.RunJobResponse_ACCEPTED:
-				accepted++
-			case guestproto.RunJobResponse_CONFLICT, guestproto.RunJobResponse_ALREADY_RUNNING:
-				refused++
-			default:
-				t.Fatalf("iteration %d unexpected outcome %v", iteration, outcome)
-			}
-		}
-		if accepted != 1 || refused != 1 {
-			t.Fatalf("iteration %d outcomes = %v, want exactly one accepted and one refused", iteration, outcomes)
-		}
-		if got := builder.builds.Load(); got != 1 {
-			t.Fatalf("iteration %d prepareSlot builds = %d, want exactly 1", iteration, got)
-		}
-		if got := launcher.launches.Load(); got != 1 {
-			t.Fatalf("iteration %d launches = %d, want exactly 1", iteration, got)
-		}
-		// Free the slot's fake execution so its supervisor goroutine finishes.
-		registry.ReportExit(fakeSlotPID, 0, "")
+	registry := guestexec.New(guestexec.Options{Retention: time.Minute, HeartbeatInterval: time.Hour})
+	builder := &blockingSpecBuilder{
+		builds:  atomic.Int32{},
+		started: make(chan string, 2),
+		release: make(chan struct{}),
 	}
+	launcher := &fakeSlotLauncher{registry: registry, launches: atomic.Int32{}}
+	handler := New(registry, Options{SlotCount: 1, SpecBuilder: builder, ChildLauncher: launcher})
+
+	runJob := func(executionID string) (guestproto.RunJobResponse_Outcome, error) {
+		response, err := handler.RunJob(context.Background(), connect.NewRequest(&guestproto.RunJobRequest{
+			ExecutionId: executionID,
+			Slot:        0,
+			JitConfig:   "jit",
+		}))
+		if err != nil {
+			return guestproto.RunJobResponse_OUTCOME_UNSPECIFIED, err
+		}
+		return response.Msg.GetOutcome(), nil
+	}
+
+	firstResult := make(chan guestproto.RunJobResponse_Outcome, 1)
+	firstErr := make(chan error, 1)
+	go func() {
+		outcome, err := runJob("job-a")
+		if err != nil {
+			firstErr <- err
+			return
+		}
+		firstResult <- outcome
+	}()
+
+	// The first request is now inside Build, holding the slot lock.
+	select {
+	case id := <-builder.started:
+		if id != "job-a" {
+			t.Fatalf("first Build execution id = %q, want job-a", id)
+		}
+	case err := <-firstErr:
+		t.Fatalf("first RunJob error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not reach Build")
+	}
+
+	secondResult := make(chan guestproto.RunJobResponse_Outcome, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		outcome, err := runJob("job-b")
+		if err != nil {
+			secondErr <- err
+			return
+		}
+		secondResult <- outcome
+	}()
+
+	// While the first holds the slot lock, the second must block on that lock and
+	// never reach Build. Without the lock it would Build the same slot concurrently.
+	select {
+	case id := <-builder.started:
+		t.Fatalf("second Build ran (id=%q) while the first held the slot lock; serialization missing", id)
+	case outcome := <-secondResult:
+		t.Fatalf("second returned %v before the first released; want it to block on the slot lock", outcome)
+	case err := <-secondErr:
+		t.Fatalf("second RunJob error before release: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Release the first: it records its execution and returns ACCEPTED.
+	close(builder.release)
+	select {
+	case outcome := <-firstResult:
+		if outcome != guestproto.RunJobResponse_ACCEPTED {
+			t.Fatalf("first outcome = %v, want ACCEPTED", outcome)
+		}
+	case err := <-firstErr:
+		t.Fatalf("first RunJob error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not complete after release")
+	}
+
+	// The second now proceeds, peeks the busy slot, and returns CONFLICT with no Build.
+	select {
+	case outcome := <-secondResult:
+		if outcome != guestproto.RunJobResponse_CONFLICT {
+			t.Fatalf("second outcome = %v, want CONFLICT", outcome)
+		}
+	case err := <-secondErr:
+		t.Fatalf("second RunJob error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("second request did not complete after the first released")
+	}
+
+	if got := builder.builds.Load(); got != 1 {
+		t.Fatalf("Build calls = %d, want exactly 1 (second refused at admission, no prep)", got)
+	}
+	if got := launcher.launches.Load(); got != 1 {
+		t.Fatalf("launches = %d, want exactly 1", got)
+	}
+	// Free the slot's fake execution so its supervisor goroutine finishes.
+	registry.ReportExit(fakeSlotPID, 0, "")
 }
 
 // registerRunningSlot occupies a slot with a running execution whose process id
