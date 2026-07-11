@@ -131,5 +131,3 @@ type DrainState struct {
 	ActiveExecutions uint32
 	Done             <-chan struct{}
 }
-
-var _, _ = configureProcessGroup, waitUntilExited
