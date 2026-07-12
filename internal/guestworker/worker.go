@@ -99,6 +99,10 @@ type worker struct {
 
 	reloadMu sync.Mutex
 	replaced bool
+	// pendingExecutable holds the binary an UpdateAgent RPC asked the worker to
+	// reload onto. It is read and cleared under reloadMu by the next handoff, so a
+	// plain reload with it empty stays on the running binary via os.Executable.
+	pendingExecutable string
 }
 
 // Run is the guest-worker entry point. It rebuilds its listener and registry
@@ -125,25 +129,26 @@ func Run(ctx context.Context) error {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	w := &worker{
-		registry:         registry,
-		controlSocket:    cfg.controlSocket,
-		generation:       cfg.generation,
-		log:              log,
-		tracker:          tracker,
-		cancelRun:        cancelRun,
-		pollCancel:       nil,
-		pollDone:         nil,
-		pollFn:           nil,
-		backoff:          pollBackoff,
-		degradeThreshold: degradeFailureThreshold,
-		reloadMu:         sync.Mutex{},
-		replaced:         false,
+		registry:          registry,
+		controlSocket:     cfg.controlSocket,
+		generation:        cfg.generation,
+		log:               log,
+		tracker:           tracker,
+		cancelRun:         cancelRun,
+		pollCancel:        nil,
+		pollDone:          nil,
+		pollFn:            nil,
+		backoff:           pollBackoff,
+		degradeThreshold:  degradeFailureThreshold,
+		reloadMu:          sync.Mutex{},
+		replaced:          false,
+		pendingExecutable: "",
 	}
 	w.pollFn = func() ([]guestexec.ExitReport, error) {
 		return guestsupervisor.PollExits(w.controlSocket, w.generation, pollTimeout)
 	}
 
-	handler := buildAgentHandler(cfg, registry, tracker)
+	handler := buildAgentHandler(cfg, w)
 
 	// Install the reload signal handler before attaching, so once the supervisor
 	// marks this worker current a reload signal is always handled here rather than
@@ -267,10 +272,19 @@ func (w *worker) handOff(ctx context.Context, snapshot *guestexec.Snapshot) (int
 		w.log.WarnContext(ctx, "guest worker resolve executable failed", "err", err)
 		return 0, fmt.Errorf("guestworker: resolve executable: %w", err)
 	}
+	arguments := append([]string(nil), os.Args...)
+	// A prior UpdateAgent handoff records a pending binary under reloadMu, which
+	// reload holds across this handoff, so swap onto it and clear it here. A plain
+	// reload leaves it empty and stays on the running binary.
+	if w.pendingExecutable != "" {
+		executablePath = w.pendingExecutable
+		arguments = []string{executablePath, "guest-worker"}
+		w.pendingExecutable = ""
+	}
 	newPID, err := guestsupervisor.RequestReplacement(
 		w.controlSocket,
 		executablePath,
-		append([]string(nil), os.Args...),
+		arguments,
 		os.Environ(),
 		snapshotFile,
 		readWrite,
@@ -287,6 +301,35 @@ func (w *worker) handOff(ctx context.Context, snapshot *guestexec.Snapshot) (int
 		return 0, fmt.Errorf("guestworker: wait for replacement readiness: %w", err)
 	}
 	return newPID, nil
+}
+
+// triggerAgentUpdate records the verified new binary and raises SIGHUP so the
+// worker's own reload path swaps onto it through the durable supervisor handoff.
+// It reuses the exact reload flow, so an agent update never disturbs a running
+// job and never reimplements the swap.
+func (w *worker) triggerAgentUpdate(newBinaryPath string) error {
+	// Hold reloadMu across the pending-path record and the SIGHUP so two
+	// concurrent UpdateAgent RPCs cannot overwrite each other's pendingExecutable
+	// and have a coalesced SIGHUP hand off only one requested version.
+	w.reloadMu.Lock()
+	defer w.reloadMu.Unlock()
+	if w.replaced {
+		w.log.Warn("guest worker update reload refused; already replaced", "path", newBinaryPath)
+		return fmt.Errorf("guestworker: worker already replaced; update reload not permitted")
+	}
+	if w.pendingExecutable != "" && w.pendingExecutable != newBinaryPath {
+		w.log.Warn("guest worker update reload refused; another update already pending",
+			"pending", w.pendingExecutable, "path", newBinaryPath)
+		return fmt.Errorf("guestworker: update reload already pending for %q", w.pendingExecutable)
+	}
+	w.pendingExecutable = newBinaryPath
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		w.pendingExecutable = ""
+		w.log.Warn("guest worker update reload signal failed", "path", newBinaryPath, "err", err)
+		return fmt.Errorf("guestworker: signal update reload: %w", err)
+	}
+	w.log.Info("guest worker update reload signaled", "path", newBinaryPath)
+	return nil
 }
 
 // resumeServing rolls a failed reload back to live serving: Thaw resumes capture
@@ -374,22 +417,38 @@ func (w *worker) degradeUnreachable() {
 
 // buildAgentHandler wires the guest-agent HTTP handler over the registry with a
 // supervisor-backed launcher, so the durable supervisor forks and waits each
-// runner. A nil specBuilderOverride selects the production runner executor; a
+// runner, plus an update reloader that drives the same reload path onto a new
+// binary. A nil specBuilderOverride selects the production runner executor; a
 // test sets it to a shell passthrough builder.
-func buildAgentHandler(cfg config, registry *guestexec.Registry, tracker *pidTracker) http.Handler {
+func buildAgentHandler(cfg config, w *worker) http.Handler {
 	launcher := &supervisorLauncher{
-		registry:      registry,
+		registry:      w.registry,
 		controlSocket: cfg.controlSocket,
-		tracker:       tracker,
+		tracker:       w.tracker,
 	}
-	return guestagent.NewHTTPHandler(registry, guestagent.Options{
+	return guestagent.NewHTTPHandler(w.registry, guestagent.Options{
 		SlotCount:         cfg.slotCount,
 		BootID:            "",
 		AgentBuild:        "",
 		GoldenFingerprint: "",
 		ChildLauncher:     launcher,
 		SpecBuilder:       specBuilderOverride,
+		Reloader:          &agentReloader{worker: w},
+		InstallDir:        "",
+		UpdatePublicKey:   nil,
 	})
+}
+
+// agentReloader adapts the worker's update trigger to the guest-agent
+// AgentReloader interface, so UpdateAgent reuses the PR3 reload path rather than
+// reimplementing the durable snapshot handoff.
+type agentReloader struct {
+	worker *worker
+}
+
+// Reload records the new binary and asks the worker to swap onto it.
+func (reloader *agentReloader) Reload(_ context.Context, newBinaryPath string) error {
+	return reloader.worker.triggerAgentUpdate(newBinaryPath)
 }
 
 // supervisorLauncher records an execution by asking the supervisor to fork the

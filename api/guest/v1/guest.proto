@@ -11,6 +11,7 @@ service GuestAgentService {
   rpc Reattach(ReattachRequest) returns (ReattachResponse);
   rpc Drain(DrainRequest) returns (DrainResponse);
   rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  rpc UpdateAgent(stream UpdateAgentRequest) returns (UpdateAgentResponse);
 }
 
 message HelloRequest {}
@@ -124,3 +125,28 @@ message CancelJobRequest {
 }
 
 message CancelJobResponse {}
+
+// UpdateAgentRequest streams a replacement guest binary to a running agent. The
+// caller sends exactly one header first, then the binary bytes as data chunks.
+message UpdateAgentRequest {
+  oneof chunk {
+    UpdateAgentHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+// UpdateAgentHeader declares the incoming binary and the detached ed25519
+// signature the guest verifies before it trusts the bytes. The signature is
+// over the tuple (version || big-endian uint64 size || sha256), and the host
+// holds the private key whose public half is baked into the guest binary.
+message UpdateAgentHeader {
+  string version = 1;
+  uint64 size = 2;
+  bytes sha256 = 3;
+  bytes ed25519_signature = 4;
+}
+
+// UpdateAgentResponse reports the version the guest accepted and placed.
+message UpdateAgentResponse {
+  string accepted_version = 1;
+}
