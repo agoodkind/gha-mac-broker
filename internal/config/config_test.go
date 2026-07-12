@@ -351,3 +351,82 @@ private_key_path = "/tmp/key.pem"
 		t.Errorf("error = %q, want stall_timeout validation", err.Error())
 	}
 }
+
+func TestLoadMetricsDefaults(t *testing.T) {
+	path := writeConfig(t, `
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[tart]
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if time.Duration(cfg.Metrics.Interval) != 60*time.Second {
+		t.Errorf("default metrics interval = %s, want 60s", time.Duration(cfg.Metrics.Interval))
+	}
+	if cfg.Metrics.DiskPath != "/" {
+		t.Errorf("default metrics disk_path = %q, want /", cfg.Metrics.DiskPath)
+	}
+	if cfg.Metrics.Enabled == nil {
+		t.Fatal("default metrics enabled should be set")
+	}
+	if !*cfg.Metrics.Enabled {
+		t.Error("default metrics enabled should be true")
+	}
+}
+
+func TestLoadMetricsConfig(t *testing.T) {
+	path := writeConfig(t, `
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[metrics]
+enabled = false
+interval = "30s"
+disk_path = "/data"
+
+[tart]
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if time.Duration(cfg.Metrics.Interval) != 30*time.Second {
+		t.Errorf("metrics interval = %s, want 30s", time.Duration(cfg.Metrics.Interval))
+	}
+	if cfg.Metrics.DiskPath != "/data" {
+		t.Errorf("metrics disk_path = %q, want /data", cfg.Metrics.DiskPath)
+	}
+	if cfg.Metrics.Enabled == nil {
+		t.Fatal("metrics enabled should be set")
+	}
+	if *cfg.Metrics.Enabled {
+		t.Error("metrics enabled should be false")
+	}
+}
+
+func TestLoadRejectsNegativeMetricsInterval(t *testing.T) {
+	path := writeConfig(t, `
+[app]
+app_id = "12345"
+private_key_path = "/tmp/key.pem"
+
+[metrics]
+interval = "-1m"
+
+[tart]
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for negative metrics interval")
+	}
+	if !strings.Contains(err.Error(), "metrics.interval must not be negative") {
+		t.Errorf("error = %q, want metrics.interval validation", err.Error())
+	}
+}

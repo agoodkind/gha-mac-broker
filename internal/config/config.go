@@ -27,6 +27,7 @@ const (
 	defaultRunnerCount                = 3
 	defaultJobsPerVM                  = 1
 	defaultMaintenanceIntervalSeconds = 3600
+	defaultMetricsInterval            = 60 * time.Second
 	cirrusImagePrefix                 = "ghcr.io/cirruslabs/"
 	// defaultFastPullParallel is the skopeo layer-copy concurrency used when
 	// fast_pull_parallel is unset. ghcr throttles each connection, so more
@@ -89,6 +90,9 @@ type Config struct {
 
 	// Maintenance configures the optional host maintenance launchd timer.
 	Maintenance MaintenanceConfig `toml:"maintenance"`
+
+	// Metrics configures periodic host-stats sampling.
+	Metrics MetricsConfig `toml:"metrics"`
 
 	// Labels are the runner labels every JIT runner registers with. The
 	// self-hosted job in CI targets one of these.
@@ -156,6 +160,16 @@ type MaintenanceConfig struct {
 	Command string `toml:"command"`
 	// IntervalSeconds is the launchd StartInterval value in seconds.
 	IntervalSeconds int `toml:"interval_seconds"`
+}
+
+// MetricsConfig configures periodic host-stats sampling.
+type MetricsConfig struct {
+	// Enabled controls whether metrics collection is active. Nil means enabled.
+	Enabled *bool `toml:"enabled"`
+	// Interval is the sampling period. Zero or unset defaults to defaultMetricsInterval.
+	Interval Duration `toml:"interval"`
+	// DiskPath is the root path to measure for disk metrics. Empty defaults to "/".
+	DiskPath string `toml:"disk_path"`
 }
 
 // ImageMapping maps a declared macOS and Xcode pair to an approved Cirrus tag.
@@ -275,6 +289,16 @@ func (c *Config) applyDefaults() {
 	if c.Maintenance.IntervalSeconds <= 0 {
 		c.Maintenance.IntervalSeconds = defaultMaintenanceIntervalSeconds
 	}
+	if c.Metrics.Interval == 0 {
+		c.Metrics.Interval = Duration(defaultMetricsInterval)
+	}
+	if c.Metrics.DiskPath == "" {
+		c.Metrics.DiskPath = "/"
+	}
+	if c.Metrics.Enabled == nil {
+		c.Metrics.Enabled = new(bool)
+		*c.Metrics.Enabled = true
+	}
 	if len(c.Labels) == 0 {
 		c.Labels = []string{"self-hosted", "macOS", "ARM64", "agk-local-macos-26"}
 	}
@@ -311,6 +335,9 @@ func (c *Config) validate() error {
 	}
 	if c.StallTimeout < 0 {
 		return fmt.Errorf("config: stall_timeout must not be negative")
+	}
+	if c.Metrics.Interval < 0 {
+		return fmt.Errorf("config: metrics.interval must not be negative")
 	}
 	if !safeCirrusImageTag(c.Tart.BaseImage) {
 		return fmt.Errorf("config: tart.base_image must be a ghcr.io/cirruslabs/macos-*-xcode:* tag")
