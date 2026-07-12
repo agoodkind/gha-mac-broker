@@ -45,6 +45,9 @@ const (
 	EnvSlots = "GHA_GUEST_SLOTS"
 	// EnvToken is the boot-scoped bearer token shared with the RPC transport.
 	EnvToken = "GHA_GUEST_TOKEN" // #nosec G101 -- environment variable name only.
+	// EnvGoldenFingerprint carries the baked golden fingerprint the supervisor
+	// read at startup, so the worker reports it via Hello.
+	EnvGoldenFingerprint = "GHA_GUEST_GOLDEN_FINGERPRINT"
 )
 
 const (

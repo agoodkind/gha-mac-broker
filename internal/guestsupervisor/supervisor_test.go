@@ -197,6 +197,28 @@ func TestStartChildForksWaitsAndBuffersExit(t *testing.T) {
 	}
 }
 
+// TestAssembleEnvCarriesGoldenFingerprint proves the supervisor passes the baked
+// golden fingerprint to each worker through the environment, so the worker can
+// report it via Hello.
+func TestAssembleEnvCarriesGoldenFingerprint(t *testing.T) {
+	supervisor := New(Options{GoldenFingerprint: "fp-abc123", SlotCount: 1})
+	env, err := supervisor.assembleEnv(nil, 1, firstWorkerFDBase, nil, -1, -1)
+	if err != nil {
+		t.Fatalf("assembleEnv: %v", err)
+	}
+	want := EnvGoldenFingerprint + "=fp-abc123"
+	found := false
+	for _, entry := range env {
+		if entry == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("worker env %v missing %q", env, want)
+	}
+}
+
 func replacePayload(t *testing.T) (*os.File, *os.File) {
 	t.Helper()
 	snapshotFile, err := os.CreateTemp(t.TempDir(), "snap-*")

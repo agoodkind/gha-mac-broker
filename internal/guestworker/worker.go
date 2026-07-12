@@ -69,14 +69,15 @@ type pipeFD struct {
 }
 
 type config struct {
-	controlSocket string
-	listenerFD    int
-	readyFD       int
-	snapshotFD    int
-	generation    uint64
-	slotCount     uint32
-	token         string
-	pipes         []pipeFD
+	controlSocket     string
+	listenerFD        int
+	readyFD           int
+	snapshotFD        int
+	generation        uint64
+	slotCount         uint32
+	token             string
+	goldenFingerprint string
+	pipes             []pipeFD
 }
 
 type worker struct {
@@ -430,7 +431,7 @@ func buildAgentHandler(cfg config, w *worker) http.Handler {
 		SlotCount:         cfg.slotCount,
 		BootID:            "",
 		AgentBuild:        "",
-		GoldenFingerprint: "",
+		GoldenFingerprint: cfg.goldenFingerprint,
 		ChildLauncher:     launcher,
 		SpecBuilder:       specBuilderOverride,
 		Reloader:          &agentReloader{worker: w},
@@ -590,14 +591,15 @@ func loadConfig() (config, error) {
 		return zero, err
 	}
 	return config{
-		controlSocket: controlSocket,
-		listenerFD:    listenerFD,
-		readyFD:       readyFD,
-		snapshotFD:    snapshotFD,
-		generation:    generation,
-		slotCount:     slotCount,
-		token:         token,
-		pipes:         pipes,
+		controlSocket:     controlSocket,
+		listenerFD:        listenerFD,
+		readyFD:           readyFD,
+		snapshotFD:        snapshotFD,
+		generation:        generation,
+		slotCount:         slotCount,
+		token:             token,
+		goldenFingerprint: os.Getenv(guestsupervisor.EnvGoldenFingerprint),
+		pipes:             pipes,
 	}, nil
 }
 
