@@ -26,12 +26,22 @@ const (
 
 var processBootID = generateBootID()
 
+// ChildLauncher launches a runner outside the worker process and records it in
+// the worker's registry, returning the admission outcome. The guest-worker
+// supplies a supervisor-backed launcher so the durable supervisor stays the
+// runner's parent; when it is nil the handler forks in-process through the
+// registry, preserving the single-process guest-agent path.
+type ChildLauncher interface {
+	Run(spec guestexec.ExecSpec) (guestexec.Outcome, error)
+}
+
 // Options configures the Phase 0 guest-agent service.
 type Options struct {
 	SlotCount         uint32
 	BootID            string
 	AgentBuild        string
 	GoldenFingerprint string
+	ChildLauncher     ChildLauncher
 }
 
 // Handler implements GuestAgentService over a guest execution registry.
@@ -41,6 +51,7 @@ type Handler struct {
 	bootID            string
 	agentBuild        string
 	goldenFingerprint string
+	childLauncher     ChildLauncher
 }
 
 var _ guestprotoconnect.GuestAgentServiceHandler = (*Handler)(nil)
@@ -74,6 +85,7 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 		bootID:            bootID,
 		agentBuild:        agentBuild,
 		goldenFingerprint: options.GoldenFingerprint,
+		childLauncher:     options.ChildLauncher,
 	}
 }
 
@@ -120,12 +132,22 @@ func (handler *Handler) RunJob(
 		Args:        []string{"-c", phase0Script(request.Msg.GetJitConfig())},
 		Env:         copyEnvironment(request.Msg.GetEnv()),
 	}
-	outcome, err := handler.registry.Start(spec)
+	outcome, err := handler.startExecution(spec)
 	if err != nil {
 		return nil, mapRegistryError(err)
 	}
 	response := &guestproto.RunJobResponse{Outcome: outcomeToProto(outcome)}
 	return connect.NewResponse(response), nil
+}
+
+// startExecution routes an execution to the supervisor-backed launcher when one
+// is configured, so the durable supervisor forks and waits the runner. Without a
+// launcher it forks in-process through the registry.
+func (handler *Handler) startExecution(spec guestexec.ExecSpec) (guestexec.Outcome, error) {
+	if handler.childLauncher != nil {
+		return handler.childLauncher.Run(spec)
+	}
+	return handler.registry.Start(spec)
 }
 
 // JobStatus streams replayed and live execution events until a terminal result,

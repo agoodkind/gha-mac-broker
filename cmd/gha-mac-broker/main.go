@@ -13,7 +13,9 @@
 //	install            scaffold config and secrets, build golden, install the service
 //	uninstall          remove the installed service unit
 //	update             check, apply, or show release update state
-//	guest-agent        run the Phase 0 guest-side execution agent
+//	guest-agent        alias that runs the guest supervisor
+//	guest-supervisor   run the durable guest-side supervisor of runner processes
+//	guest-worker       run one swappable guest-worker generation (supervisor spawns it)
 package main
 
 import (
@@ -43,7 +45,6 @@ import (
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/hostedload"
-	"goodkind.io/gha-mac-broker/internal/hoststats"
 	"goodkind.io/gha-mac-broker/internal/install"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
 	"goodkind.io/gha-mac-broker/internal/server"
@@ -68,6 +69,8 @@ const (
 	commandUninstall   commandName = "uninstall"
 	commandUpdate      commandName = "update"
 	commandGuestAgent  commandName = "guest-agent"
+	commandGuestSuper  commandName = "guest-supervisor"
+	commandGuestWorker commandName = "guest-worker"
 
 	brokerBinaryName = "gha-mac-broker"
 )
@@ -136,6 +139,10 @@ func main() {
 		err = runUpdate(ctx, args)
 	case commandGuestAgent:
 		err = runGuestAgent(ctx, args)
+	case commandGuestSuper:
+		err = runGuestSupervisor(ctx, args)
+	case commandGuestWorker:
+		err = runGuestWorker(ctx, args)
 	default:
 		usage()
 		os.Exit(2)
@@ -147,7 +154,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|status|build-golden|install|uninstall|update|guest-agent> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|status|build-golden|install|uninstall|update|guest-agent|guest-supervisor|guest-worker> [flags]")
 }
 
 func writeUserLine(writer io.Writer, line string) {
@@ -822,84 +829,6 @@ func configInitialModTime(ctx context.Context, path string) time.Time {
 		return time.Time{}
 	}
 	return info.ModTime()
-}
-
-// metricsOptions derives hoststats.Options from the config's Metrics block.
-func metricsOptions(cfg *config.Config) hoststats.Options {
-	return hoststats.Options{
-		Enabled:  cfg.Metrics.Enabled != nil && *cfg.Metrics.Enabled,
-		Interval: time.Duration(cfg.Metrics.Interval),
-	}
-}
-
-// newHostStatsSampler builds the host-stats sampler that reads real host
-// metrics through gopsutil and correlates them with p's pool inventory. The
-// caller starts its loop with Sampler.Start and applies config reloads with
-// Sampler.Reconfigure.
-func newHostStatsSampler(cfg *config.Config, p *runnerpool.Pool) *hoststats.Sampler {
-	reader := hoststats.NewGopsutilReader(cfg.Metrics.DiskPath)
-	inventory := func(ctx context.Context) hoststats.Inventory {
-		snap, _ := p.Status(ctx)
-		return hoststats.Inventory{
-			RunnerCount: snap.RunnerCount,
-			Idle:        snap.Idle,
-			Busy:        snap.Busy,
-			Queued:      snap.Queued,
-		}
-	}
-	return hoststats.New(reader, inventory, time.Now, metricsOptions(cfg))
-}
-
-// startBrokerConfigReloadWatcher starts the config-file poll-watcher and wires
-// its apply callback to applyReloadedConfig with the daemon's live components.
-func startBrokerConfigReloadWatcher(ctx context.Context, configPath string, initialModTime time.Time, binder *broker.Binder, p *runnerpool.Pool, srv *server.Server, sampler *hoststats.Sampler) {
-	startConfigReloadWatcher(ctx, configReloadWatcherOptions{
-		path:           configPath,
-		initialModTime: initialModTime,
-		apply: func(reloadCtx context.Context, reloadedConfig *config.Config) error {
-			return applyReloadedConfig(reloadCtx, reloadedConfig, binder, p, srv, sampler)
-		},
-	})
-}
-
-func applyReloadedConfig(ctx context.Context, cfg *config.Config, binder *broker.Binder, p *runnerpool.Pool, srv *server.Server, sampler *hoststats.Sampler) error {
-	secret, err := cfg.ReadWebhookSecret()
-	if err != nil {
-		slog.ErrorContext(ctx, "config reload read webhook secret failed", "err", err)
-		return fmt.Errorf("read webhook secret: %w", err)
-	}
-	capacityToken, err := cfg.ReadCapacityToken()
-	if err != nil {
-		slog.ErrorContext(ctx, "config reload read capacity token failed", "err", err)
-		return fmt.Errorf("read capacity token: %w", err)
-	}
-	webhookCIDRs, err := cfg.ReadWebhookCIDRs()
-	if err != nil {
-		slog.ErrorContext(ctx, "config reload read webhook CIDRs failed", "err", err)
-		return fmt.Errorf("read webhook CIDRs: %w", err)
-	}
-	binder.Reconfigure(cfg)
-	p.Reconfigure(runnerPoolOptionsFromConfig(cfg, "", nil))
-	srv.Reconfigure(secret, cfg, capacityToken, webhookCIDRs)
-	sampler.Reconfigure(metricsOptions(cfg))
-	appliedRunnerCount := p.Snapshot().RunnerCount
-	if cfg.RunnerCount != appliedRunnerCount {
-		slog.InfoContext(
-			ctx,
-			"config reload applied",
-			"runner_count",
-			appliedRunnerCount,
-			"requested_runner_count",
-			cfg.RunnerCount,
-			"runner_count_note",
-			"restart required",
-			"jobs_per_vm",
-			cfg.JobsPerVM,
-		)
-		return nil
-	}
-	slog.InfoContext(ctx, "config reload applied", "runner_count", appliedRunnerCount, "jobs_per_vm", cfg.JobsPerVM)
-	return nil
 }
 
 func newRunToken(ctx context.Context) (string, error) {
