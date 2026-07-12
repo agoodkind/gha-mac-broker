@@ -12,12 +12,39 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const maxTeeTailBytes = 64 * 1024
+
+// Per-operation deadlines bound the short-lived tart calls so a wedged
+// subprocess cannot block a caller forever. They are generous relative to real
+// operation time: clone is minute-scale, teardown and list are second-scale. The
+// detached boot is deliberately excluded; it is the VM's lifetime process.
+const (
+	// cloneDeadline bounds a copy-on-write `tart clone` of a golden image.
+	cloneDeadline = 10 * time.Minute
+	// stopDeadline bounds a graceful `tart stop`.
+	stopDeadline = 2 * time.Minute
+	// deleteDeadline bounds a `tart delete`.
+	deleteDeadline = 2 * time.Minute
+	// listDeadline bounds a `tart list`.
+	listDeadline = 30 * time.Second
+	// ipWaitSeconds is the `--wait` window passed to `tart ip`, the seconds tart
+	// blocks for the guest to acquire a NAT lease.
+	ipWaitSeconds = 30
+	// ipDeadline bounds `tart ip`. It exceeds ipWaitSeconds so the process, not
+	// the context, owns the normal wait and the deadline is only a backstop.
+	ipDeadline = 45 * time.Second
+	// killGrace is how long a bounded tart process group has to exit after
+	// SIGTERM before it is force-killed with SIGKILL.
+	killGrace = 5 * time.Second
+)
 
 // CommandRunner runs `tart <args...>` and returns combined stdout. It is a field
 // so tests can stub the CLI.
@@ -42,8 +69,9 @@ func New(bin string) *Tart {
 	return &Tart{bin: bin, run: execRunner, runTee: execRunnerTee}
 }
 
-// command builds a context-bound [exec.Cmd] for tart execs. detachedCommand is
-// the deliberately detached path for warm VMs that outlive broker cancellation.
+// command builds a context-bound [exec.Cmd] for the foreground boot path, where
+// the caller's context cancellation tears the boot down. detachedCommand is the
+// deliberately detached path for warm VMs that outlive broker cancellation.
 func command(ctx context.Context, bin string, args ...string) *exec.Cmd {
 	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", strings.Join(args, " "))
 	return exec.CommandContext(ctx, bin, args...)
@@ -51,18 +79,73 @@ func command(ctx context.Context, bin string, args ...string) *exec.Cmd {
 
 func detachedCommand(ctx context.Context, bin string, args ...string) *exec.Cmd {
 	slog.DebugContext(ctx, "tart detached command built", "bin", bin, "args", strings.Join(args, " "))
-	// Detached tart runs must survive broker context cancellation.
+	// The detached tart run is the VM's long-lived hypervisor process, so it must
+	// survive broker context cancellation and carry no wall-clock ceiling. It dies
+	// only at teardown (Process.Kill plus tart stop and delete); a boot that never
+	// readies is caught by the caller's bounded readiness wait.
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), bin, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	return cmd
 }
 
+// runProcessGroup starts cmd in its own process group, then waits for it. If ctx
+// is cancelled or its deadline fires first, the whole group is signalled
+// (SIGTERM, then SIGKILL after killGrace) so a wedged tart and every child it
+// spawned die together rather than orphaning under the reconcile loop.
+func runProcessGroup(ctx context.Context, cmd *exec.Cmd) error {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	// The command carries ctx (built with CommandContext), but cancellation is
+	// owned here. A no-op Cancel with the default zero WaitDelay stops os/exec
+	// from single-child killing on ctx.Done, so the SIGTERM grace and SIGKILL
+	// below reach the whole process group instead of racing a leader-only kill.
+	cmd.Cancel = func() error { return nil }
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("tart: start: %w", err)
+	}
+	// With Setpgid and an unset Pgid, the child leads a new group whose id equals
+	// its pid, so negating the pid addresses the whole group.
+	pgid := cmd.Process.Pid
+	waitErr := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err := fmt.Errorf("panic: %v", r)
+				slog.ErrorContext(ctx, "tart wait goroutine panic recovered", "err", err)
+				waitErr <- err
+			}
+		}()
+		waitErr <- cmd.Wait()
+	}()
+	select {
+	case err := <-waitErr:
+		return err
+	case <-ctx.Done():
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		leaderExited := false
+		select {
+		case <-waitErr:
+			leaderExited = true
+		case <-time.After(killGrace):
+		}
+		// Sweep any group member that ignored SIGTERM, then reap the leader.
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		if !leaderExited {
+			<-waitErr
+		}
+		return fmt.Errorf("tart: bounded run: %w", ctx.Err())
+	}
+}
+
 func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error) {
-	cmd := command(ctx, bin, args...)
+	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", strings.Join(args, " "))
+	cmd := exec.CommandContext(ctx, bin, args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
+	if err := runProcessGroup(ctx, cmd); err != nil {
 		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", strings.Join(args, " "))
 		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out.String()))
 	}
@@ -103,7 +186,8 @@ func (b *tailBuffer) Bytes() []byte {
 }
 
 func execRunnerTee(ctx context.Context, bin string, sink io.Writer, args ...string) ([]byte, error) {
-	cmd := command(ctx, bin, args...)
+	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", strings.Join(args, " "))
+	cmd := exec.CommandContext(ctx, bin, args...)
 	out := newTailBuffer(maxTeeTailBytes)
 	writer := io.Writer(out)
 	if sink != nil {
@@ -111,7 +195,7 @@ func execRunnerTee(ctx context.Context, bin string, sink io.Writer, args ...stri
 	}
 	cmd.Stdout = writer
 	cmd.Stderr = writer
-	if err := cmd.Run(); err != nil {
+	if err := runProcessGroup(ctx, cmd); err != nil {
 		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", strings.Join(args, " "))
 		tail := string(out.Bytes())
 		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(tail))
@@ -147,6 +231,8 @@ func (t *Tart) List(ctx context.Context) ([]string, error) {
 
 // ListVMs returns the VM names and states visible to tart.
 func (t *Tart) ListVMs(ctx context.Context) ([]VM, error) {
+	ctx, cancel := context.WithTimeout(ctx, listDeadline)
+	defer cancel()
 	out, err := t.run(ctx, t.bin, "list", "--format", "json")
 	if err != nil {
 		return nil, err
@@ -167,6 +253,8 @@ func (t *Tart) ListVMs(ctx context.Context) ([]VM, error) {
 
 // Clone makes a copy-on-write clone of source under name.
 func (t *Tart) Clone(ctx context.Context, source, name string, insecure bool) error {
+	ctx, cancel := context.WithTimeout(ctx, cloneDeadline)
+	defer cancel()
 	args := []string{"clone"}
 	if insecure {
 		args = append(args, "--insecure")
@@ -174,6 +262,23 @@ func (t *Tart) Clone(ctx context.Context, source, name string, insecure bool) er
 	args = append(args, source, name)
 	_, err := t.run(ctx, t.bin, args...)
 	return err
+}
+
+// IP resolves the VM's NAT address via `tart ip <name> --wait`. It returns an
+// error if tart yields output that is not a valid IP. The host uses this to dial
+// the guest agent.
+func (t *Tart) IP(ctx context.Context, name string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, ipDeadline)
+	defer cancel()
+	out, err := t.run(ctx, t.bin, "ip", name, "--wait", strconv.Itoa(ipWaitSeconds))
+	if err != nil {
+		return "", err
+	}
+	addr := strings.TrimSpace(string(out))
+	if net.ParseIP(addr) == nil {
+		return "", fmt.Errorf("tart: ip %s returned %q, not a valid IP", name, addr)
+	}
+	return addr, nil
 }
 
 // Exec runs a command inside a booted VM over the guest agent's vsock channel
@@ -193,12 +298,16 @@ func (t *Tart) ExecTee(ctx context.Context, name string, sink io.Writer, argv ..
 
 // Stop gracefully stops a running VM.
 func (t *Tart) Stop(ctx context.Context, name string) error {
+	ctx, cancel := context.WithTimeout(ctx, stopDeadline)
+	defer cancel()
 	_, err := t.run(ctx, t.bin, "stop", name)
 	return err
 }
 
 // Delete removes a VM. It is safe to call on an already-stopped VM.
 func (t *Tart) Delete(ctx context.Context, name string) error {
+	ctx, cancel := context.WithTimeout(ctx, deleteDeadline)
+	defer cancel()
 	_, err := t.run(ctx, t.bin, "delete", name)
 	return err
 }
@@ -234,12 +343,8 @@ func (t *Tart) BootCommand(ctx context.Context, name string, opts BootOptions) *
 	for _, d := range opts.Dirs {
 		args = append(args, "--dir", d.Name+":"+d.Path)
 	}
-	commandCtx := ctx
 	if opts.Detach {
-		commandCtx = context.WithoutCancel(ctx)
+		return detachedCommand(ctx, t.bin, args...)
 	}
-	if opts.Detach {
-		return detachedCommand(commandCtx, t.bin, args...)
-	}
-	return command(commandCtx, t.bin, args...)
+	return command(ctx, t.bin, args...)
 }

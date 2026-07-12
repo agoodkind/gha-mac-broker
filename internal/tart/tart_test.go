@@ -4,13 +4,54 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
+
+// spawnChildEnv, when set on the re-executed test binary, makes it act as a
+// process-group kill fixture: it starts a long-lived grandchild, prints the
+// grandchild pid, then sleeps. runProcessGroup must kill the whole group.
+const spawnChildEnv = "TART_TEST_SPAWN_CHILD"
+
+func TestMain(m *testing.M) {
+	if os.Getenv(spawnChildEnv) == "1" {
+		runSpawnChildFixture()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+func runSpawnChildFixture() {
+	child := exec.Command("sleep", "300")
+	if err := child.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Println(child.Process.Pid)
+	_ = os.Stdout.Sync()
+	time.Sleep(300 * time.Second)
+	os.Exit(0)
+}
+
+func processGone(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return syscall.Kill(pid, 0) != nil
+}
 
 func TestLifecycleCommands(t *testing.T) {
 	var calls [][]string
@@ -221,5 +262,64 @@ func TestBootCommandDetachCreatesOwnSession(t *testing.T) {
 	}
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("detached command from canceled broker context failed: %v", err)
+	}
+}
+
+func TestRunProcessGroupKillsGroupOnDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0])
+	cmd.Env = append(os.Environ(), spawnChildEnv+"=1")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	start := time.Now()
+	err := runProcessGroup(ctx, cmd)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	// The child sleeps 300s, so any prompt return proves it was killed, not waited.
+	if elapsed > killGrace+2*time.Second {
+		t.Fatalf("runProcessGroup took %v, want a prompt group kill", elapsed)
+	}
+	grandchild, perr := strconv.Atoi(strings.TrimSpace(out.String()))
+	if perr != nil {
+		t.Fatalf("grandchild pid not reported: %q (%v)", out.String(), perr)
+	}
+	// Killing only the direct child would orphan the grandchild; the group kill
+	// must take it down too.
+	if !processGone(grandchild, 3*time.Second) {
+		t.Fatalf("grandchild %d survived the group kill", grandchild)
+	}
+}
+
+func TestIPParsesValidAddress(t *testing.T) {
+	tt := New("tart")
+	tt.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		want := []string{"ip", "warm-1", "--wait", strconv.Itoa(ipWaitSeconds)}
+		if !slices.Equal(args, want) {
+			t.Fatalf("ip args = %v, want %v", args, want)
+		}
+		return []byte("192.168.64.7\n"), nil
+	}
+	got, err := tt.IP(context.Background(), "warm-1")
+	if err != nil {
+		t.Fatalf("IP: %v", err)
+	}
+	if got != "192.168.64.7" {
+		t.Fatalf("ip = %q, want 192.168.64.7", got)
+	}
+}
+
+func TestIPRejectsNonAddress(t *testing.T) {
+	tt := New("tart")
+	tt.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		return []byte("not-an-ip\n"), nil
+	}
+	if _, err := tt.IP(context.Background(), "warm-1"); err == nil {
+		t.Fatal("IP should reject a non-IP result")
 	}
 }
