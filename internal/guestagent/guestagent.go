@@ -340,10 +340,14 @@ func (handler *Handler) CancelJob(
 // ConfigureSlots applies a host-requested slot count. The worker's own slot
 // count is fixed at start, so the handler asks the supervisor to reconfigure and
 // replace the worker; a subsequent Hello (after the replacement is current)
-// advertises the applied slots. It returns the applied count and the slot
-// inventory the guest will expose. A shrink below a running slot is rejected as a
+// advertises the applied slots. A shrink below a running slot is rejected as a
 // failed precondition, so the host leaves that VM as is rather than orphaning a
 // job.
+//
+// The returned slot_count and slots are the INTENDED (requested) inventory,
+// computed before the replacement worker is serving, not the currently-serving
+// set. The reload is asynchronous, so a consumer that needs the live inventory
+// must re-Hello; the host does. Do not trust the returned slots as live.
 func (handler *Handler) ConfigureSlots(
 	ctx context.Context,
 	request *connect.Request[guestproto.ConfigureSlotsRequest],

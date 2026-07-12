@@ -491,34 +491,47 @@ func ConfigureSlots(socketPath string, slotCount uint32) (uint32, error) {
 }
 
 // handleSetSlots applies a host-requested slot count. It is a no-op when the
-// count already matches, and it rejects a shrink that would strand a running
-// slot rather than orphan a job. Otherwise it updates the slot count and signals
-// the current worker to reload, so the next worker generation inherits the new
-// count through assembleEnv and its snapshot handoff preserves any running
-// execution. It reports the applied count.
+// count the live worker is already serving matches, and it rejects a shrink that
+// would strand a running slot rather than orphan a job. Otherwise it updates the
+// desired count and signals the current worker to reload, so the next worker
+// generation is spawned with the new count and its snapshot handoff preserves any
+// running execution. The serving count is committed only when that generation
+// attaches, so a failed-and-rolled-back reload leaves the served count at the old
+// value and a later ConfigureSlots re-drives rather than short-circuiting. It
+// reports the requested (intended) count; the host re-Hellos for the live truth.
 func (s *Supervisor) handleSetSlots(conn *net.UnixConn, request controlRequest) {
 	requested := request.SlotCount
 	if requested == 0 {
 		s.replyError(conn, fmt.Errorf("set_slots requires a positive slot count"))
 		return
 	}
-	current := s.slotCount.Load()
-	if requested == current {
+	// Compare against the count actually being served, not the desired target, so
+	// a retry after a failed reload (desired == requested but serving still old)
+	// re-drives the reload instead of a spurious no-op.
+	serving := s.servingSlotCount.Load()
+	if requested == serving {
 		response := newControlResponse()
-		response.SlotCount = current
+		response.SlotCount = serving
 		s.reply(conn, response, nil)
 		return
 	}
 
 	s.mu.Lock()
-	if requested < current {
+	if requested < serving {
+		// The shrink busy-check runs under s.mu against the supervisor's running
+		// children, but the worker admits RunJob against its own fixed slot count
+		// with no cross-check, so a RunJob for a slot index >= requested admitted
+		// between this store and the reload could strand. That TOCTOU is unreachable
+		// under a single host with a constant jobs_per_vm view (the only set_slots
+		// writer), which never both shrinks and admits a high slot at once. A future
+		// multi-writer or per-VM variable slot count must revisit this.
 		if busySlot, busy := s.maxRunningSlotAtOrAboveLocked(requested); busy {
 			s.mu.Unlock()
 			s.replyError(conn, fmt.Errorf("set_slots rejected: slot %d is running, cannot shrink to %d slots", busySlot, requested))
 			return
 		}
 	}
-	s.slotCount.Store(requested)
+	s.desiredSlotCount.Store(requested)
 	workerPID := 0
 	if handle, ok := s.workers[s.currentGeneration]; ok && handle.cmd.Process != nil {
 		workerPID = handle.cmd.Process.Pid
@@ -526,9 +539,10 @@ func (s *Supervisor) handleSetSlots(conn *net.UnixConn, request controlRequest) 
 	s.mu.Unlock()
 
 	// Signal the current worker to reload. Its SIGHUP handler drives the PR3
-	// snapshot handoff, so the replacement generation reads the updated slot count
-	// while any running execution restores onto it. A zero pid means no worker is
-	// current yet (only in a control-only test), so there is nothing to reload.
+	// snapshot handoff, so the replacement generation reads the updated desired
+	// count while any running execution restores onto it. A zero pid means no
+	// worker is current yet (only in a control-only test), so there is nothing to
+	// reload.
 	if workerPID > 0 {
 		if err := syscall.Kill(workerPID, syscall.SIGHUP); err != nil {
 			s.log.Warn("guest supervisor set_slots reload signal failed", "pid", workerPID, "err", err)

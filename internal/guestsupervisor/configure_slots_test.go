@@ -6,9 +6,10 @@ import (
 	"testing"
 )
 
-// TestSetSlotsGrowUpdatesCount proves a grow request updates the supervisor slot
-// count and returns the applied value, so the next worker generation inherits it.
-func TestSetSlotsGrowUpdatesCount(t *testing.T) {
+// TestSetSlotsGrowUpdatesDesiredCount proves a grow request updates the desired
+// count the next worker generation is spawned with and returns the requested
+// value. Without a worker to attach, the serving count stays at the old value.
+func TestSetSlotsGrowUpdatesDesiredCount(t *testing.T) {
 	supervisor := New(Options{SlotCount: 1})
 	socketPath := startControlOnly(t, supervisor)
 
@@ -19,14 +20,17 @@ func TestSetSlotsGrowUpdatesCount(t *testing.T) {
 	if applied != 2 {
 		t.Fatalf("applied = %d, want 2", applied)
 	}
-	if got := supervisor.slotCount.Load(); got != 2 {
-		t.Fatalf("supervisor slot count = %d, want 2", got)
+	if got := supervisor.desiredSlotCount.Load(); got != 2 {
+		t.Fatalf("desired slot count = %d, want 2", got)
+	}
+	if got := supervisor.servingSlotCount.Load(); got != 1 {
+		t.Fatalf("serving slot count = %d, want 1 until a worker attaches", got)
 	}
 }
 
-// TestSetSlotsNoOpWhenEqual proves a request for the current count is idempotent:
-// it returns the current count and leaves it unchanged.
-func TestSetSlotsNoOpWhenEqual(t *testing.T) {
+// TestSetSlotsNoOpWhenEqualServing proves a request for the count already being
+// served is idempotent: it returns that count and leaves both counts unchanged.
+func TestSetSlotsNoOpWhenEqualServing(t *testing.T) {
 	supervisor := New(Options{SlotCount: 2})
 	socketPath := startControlOnly(t, supervisor)
 
@@ -37,8 +41,11 @@ func TestSetSlotsNoOpWhenEqual(t *testing.T) {
 	if applied != 2 {
 		t.Fatalf("applied = %d, want 2", applied)
 	}
-	if got := supervisor.slotCount.Load(); got != 2 {
-		t.Fatalf("supervisor slot count = %d, want 2", got)
+	if got := supervisor.servingSlotCount.Load(); got != 2 {
+		t.Fatalf("serving slot count = %d, want 2", got)
+	}
+	if got := supervisor.desiredSlotCount.Load(); got != 2 {
+		t.Fatalf("desired slot count = %d, want 2", got)
 	}
 }
 
@@ -51,8 +58,8 @@ func TestSetSlotsRejectsZero(t *testing.T) {
 	if _, err := ConfigureSlots(socketPath, 0); err == nil {
 		t.Fatal("ConfigureSlots(0) = nil, want rejection")
 	}
-	if got := supervisor.slotCount.Load(); got != 1 {
-		t.Fatalf("supervisor slot count = %d, want 1 unchanged", got)
+	if got := supervisor.desiredSlotCount.Load(); got != 1 {
+		t.Fatalf("desired slot count = %d, want 1 unchanged", got)
 	}
 }
 
@@ -71,8 +78,8 @@ func TestSetSlotsShrinkBelowBusyRejected(t *testing.T) {
 	if _, err := ConfigureSlots(socketPath, 1); err == nil {
 		t.Fatal("ConfigureSlots shrink below busy slot = nil, want rejection")
 	}
-	if got := supervisor.slotCount.Load(); got != 2 {
-		t.Fatalf("supervisor slot count = %d, want 2 unchanged after a rejected shrink", got)
+	if got := supervisor.desiredSlotCount.Load(); got != 2 {
+		t.Fatalf("desired slot count = %d, want 2 unchanged after a rejected shrink", got)
 	}
 }
 
@@ -94,7 +101,7 @@ func TestSetSlotsShrinkAboveBusyAllowed(t *testing.T) {
 	if applied != 2 {
 		t.Fatalf("applied = %d, want 2", applied)
 	}
-	if got := supervisor.slotCount.Load(); got != 2 {
-		t.Fatalf("supervisor slot count = %d, want 2", got)
+	if got := supervisor.desiredSlotCount.Load(); got != 2 {
+		t.Fatalf("desired slot count = %d, want 2", got)
 	}
 }

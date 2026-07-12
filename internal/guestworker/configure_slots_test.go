@@ -86,6 +86,19 @@ func waitHelloSlots(t *testing.T, addr string, want uint32) {
 	}
 }
 
+// helloAdvertises reports whether a single Hello currently shows exactly count
+// slots. It is non-fatal so a poll loop can retry.
+func helloAdvertises(addr string, count uint32) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	client := guestclient.New(ctx, addr, harnessToken)
+	hello, err := client.Hello(ctx)
+	if err != nil {
+		return false
+	}
+	return slotsCover(hello.GetSlots(), count)
+}
+
 func slotsCover(slots []*guestproto.SlotInfo, count uint32) bool {
 	if uint32(len(slots)) != count {
 		return false
@@ -206,6 +219,64 @@ func TestConfigureSlotsGrowsWhileJobRunning(t *testing.T) {
 	if result.GetExitCode() != 0 {
 		t.Fatalf("terminal exit code = %d, want 0; message = %q", result.GetExitCode(), result.GetMessage())
 	}
+}
+
+// TestConfigureSlotsRedrivesAfterFailedReload proves the supervisor never
+// durably reports a slot count the live worker is not serving. When the reload
+// ConfigureSlots triggers fails and the worker rolls back, the served count stays
+// at the old value, and a subsequent ConfigureSlots re-drives the reload rather
+// than short-circuiting as a no-op, healing to the requested count.
+func TestConfigureSlotsRedrivesAfterFailedReload(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), harnessTimeout)
+	defer cancel()
+	h := startHarnessSlots(t, 1)
+	gen1PID := h.supervisor.CurrentWorkerPID()
+
+	// Arm the next worker spawn to crash before it can attach, so the reload the
+	// first ConfigureSlots triggers fails and the worker rolls back to one slot.
+	spawnsBefore := h.spawnCount.Load()
+	h.failNext.Store(true)
+
+	firstClient := guestclient.New(ctx, h.addr, harnessToken)
+	if _, err := firstClient.ConfigureSlots(ctx, 2); err != nil {
+		t.Fatalf("first ConfigureSlots(2): %v", err)
+	}
+
+	// The failed replacement is spawned, then the old worker rolls back and keeps
+	// serving exactly one slot; the served count did not durably jump to two.
+	waitSpawnCount(t, h, spawnsBefore+1)
+	waitHelloSlots(t, h.addr, 1)
+	if pid := h.supervisor.CurrentWorkerPID(); pid != gen1PID {
+		t.Fatalf("current worker changed after a failed reload: was %d, now %d", gen1PID, pid)
+	}
+
+	// A retry must re-drive the reload rather than no-op, because the compare is
+	// against the served count (still one), not the stored desired (two). Loop
+	// because the rollback may still be settling to steady when the first retry
+	// fires. Use a fresh client and tolerate a transient error each attempt, so an
+	// RPC that lands on a draining generation redials the current worker.
+	deadline := time.Now().Add(harnessTimeout)
+	healed := false
+	for time.Now().Before(deadline) {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, 3*time.Second)
+		retryClient := guestclient.New(attemptCtx, h.addr, harnessToken)
+		_, err := retryClient.ConfigureSlots(attemptCtx, 2)
+		attemptCancel()
+		if err == nil && helloAdvertises(h.addr, 2) {
+			healed = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !healed {
+		t.Fatal("retry did not re-drive the reload to two slots before deadline")
+	}
+
+	// The healed guest is a fresh generation serving both slots.
+	if pid := h.supervisor.CurrentWorkerPID(); pid == gen1PID {
+		t.Fatalf("worker did not replace on the re-drive: still %d", pid)
+	}
+	waitHelloSlots(t, h.addr, 2)
 }
 
 // TestConfigureSlotsShrinkBelowBusyRejected proves a shrink below a running slot
