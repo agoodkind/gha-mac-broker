@@ -52,16 +52,16 @@ func (p *Pool) installAdoptedWorkersLocked(adopted []broker.AdoptedVM) {
 				boundAt = now
 			}
 			state.slots[binding.SlotIndex] = slotState{
-				boundAt:         boundAt,
-				busy:            true,
-				jobID:           binding.JobID,
-				runID:           binding.RunID,
-				jobCancel:       nil,
-				cpuStalledSince: time.Time{},
-				stallWarnedAt:   time.Time{},
-				reapWarnedAt:    time.Time{},
-				adopted:         true,
-				lastErr:         nil,
+				boundAt:      boundAt,
+				busy:         true,
+				jobID:        binding.JobID,
+				runID:        binding.RunID,
+				executionID:  binding.ExecutionID,
+				resumeCursor: binding.ResumeCursor,
+				jobCancel:    nil,
+				reapWarnedAt: time.Time{},
+				adopted:      true,
+				lastErr:      nil,
 			}
 			state.idleSince = time.Time{}
 		}

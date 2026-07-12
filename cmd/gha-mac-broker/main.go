@@ -799,7 +799,7 @@ func runServe(ctx context.Context, args []string) error {
 type runnerPoolBinder interface {
 	runnerpool.Warmer
 	runnerpool.Runner
-	runnerpool.ActiveJobProber
+	runnerpool.SlotProber
 }
 
 func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBinder, github runnerpool.RunnerLister) (*runnerpool.Pool, error) {
@@ -819,8 +819,6 @@ func runnerPoolOptionsFromConfig(cfg *config.Config, runToken string, now func()
 		MaxAge:         time.Duration(cfg.MaxAge),
 		MaxBind:        time.Duration(cfg.MaxBind),
 		PickupTimeout:  time.Duration(cfg.PickupTimeout),
-		StallTimeout:   time.Duration(cfg.StallTimeout),
-		StallReap:      cfg.StallReap,
 		RunToken:       runToken,
 		WarmRetryDelay: 0,
 		Now:            now,

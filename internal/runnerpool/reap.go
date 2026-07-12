@@ -19,53 +19,59 @@ type busyCandidate struct {
 	now       time.Time
 }
 
+// reap messages name the reason a busy slot was recycled.
+const (
+	reapPastMaxBindMessage = "runnerpool reaping worker (past max_bind ceiling)"
+	reapNoActiveJobMessage = "runnerpool reaping worker (no active job process)"
+)
+
+// runningProbe caches one VM's running-slot map for a single reconcile pass, so
+// the reap loop makes at most one Reattach call per VM.
+type runningProbe struct {
+	running map[int]bool
+	err     error
+}
+
+// reapBusyWorkers recycles busy slots that have blown past a deadline. MaxBind is
+// an absolute ceiling: a slot bound past it is recycled regardless of running
+// state, so a hung-but-alive runner the guest still reports as running cannot
+// hold its slot forever. Within MaxBind, a slot past the pickup timeout is
+// recycled only when its guest execution is not running, read at most once per
+// VM per pass; a probe error within MaxBind is treated as a possibly-transient
+// blip and the slot is kept until the ceiling.
 func (p *Pool) reapBusyWorkers(ctx context.Context) {
 	candidates := p.busyCandidates()
 	options := p.optionsSnapshot()
+	probes := make(map[string]runningProbe)
 	for _, candidate := range candidates {
 		bindAge := candidate.now.Sub(candidate.boundAt)
 		pastMaxBind := options.MaxBind > 0 && bindAge >= options.MaxBind
-		pastPickupTimeout := options.PickupTimeout > 0 && bindAge >= options.PickupTimeout
-		if !pastMaxBind && !pastPickupTimeout {
+		if pastMaxBind {
+			// The absolute MaxBind ceiling is enforced even without a prober.
+			p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, reapPastMaxBindMessage)
 			continue
 		}
 		if p.prober == nil {
 			continue
 		}
-		active, err := p.prober.HasActiveJob(ctx, candidate.vm, candidate.slotIndex, candidate.slotCount)
-		if err != nil {
-			p.handleActiveJobProbeError(ctx, candidate, bindAge, pastMaxBind, err)
-			continue
-		}
-		if !active {
-			p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, "runnerpool reaping worker (no active job process)")
-			continue
-		}
+		pastPickupTimeout := options.PickupTimeout > 0 && bindAge >= options.PickupTimeout
 		if !pastPickupTimeout {
 			continue
 		}
-		cpuActivity, err := p.prober.SlotCPUActivity(ctx, candidate.vm, candidate.slotIndex, candidate.slotCount)
-		if err != nil {
-			slog.WarnContext(ctx, "runnerpool slot cpu activity probe failed", "err", err, "vm", candidate.vm.Name, "slot", candidate.slotIndex)
+		probe, ok := probes[candidate.vm.Name]
+		if !ok {
+			running, err := p.prober.RunningSlots(ctx, candidate.vm)
+			probe = runningProbe{running: running, err: err}
+			probes[candidate.vm.Name] = probe
+		}
+		if probe.err != nil {
+			slog.WarnContext(ctx, "runnerpool running slots probe failed", "err", probe.err, "vm", candidate.vm.Name, "slot", candidate.slotIndex)
 			continue
 		}
-		if cpuActivity < 0 {
-			continue
+		if !probe.running[candidate.slotIndex] {
+			p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, reapNoActiveJobMessage)
 		}
-		cpuStalledSince, ok := p.observeSlotCPU(candidate, cpuActivity, candidate.now)
-		if !ok || cpuStalledSince.IsZero() {
-			continue
-		}
-		p.maybeWarnStalledBusyWorker(ctx, candidate, bindAge, cpuStalledSince, cpuActivity)
 	}
-}
-
-func (p *Pool) handleActiveJobProbeError(ctx context.Context, candidate busyCandidate, bindAge time.Duration, pastMaxBind bool, err error) {
-	slog.WarnContext(ctx, "runnerpool active job probe failed", "err", err, "vm", candidate.vm.Name, "slot", candidate.slotIndex)
-	if !pastMaxBind {
-		return
-	}
-	p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, "runnerpool reaping worker (probe error past max_bind)")
 }
 
 func (p *Pool) warnAndRequestBusyRecycle(ctx context.Context, candidate busyCandidate, bindAge time.Duration, message string) {
@@ -74,83 +80,6 @@ func (p *Pool) warnAndRequestBusyRecycle(ctx context.Context, candidate busyCand
 	}
 	slog.WarnContext(ctx, message, "vm", candidate.vm.Name, "run_id", candidate.runID, "job_id", candidate.jobID, "slot", candidate.slotIndex, "bind_age_seconds", int64(bindAge.Seconds()))
 	p.requestBusyRecycle(candidate)
-}
-
-func (p *Pool) maybeWarnStalledBusyWorker(ctx context.Context, candidate busyCandidate, bindAge time.Duration, cpuStalledSince time.Time, cpuActivity float64) {
-	stallTimeout, stallReap := p.stallReapOptionsSnapshot()
-	stalledFor := candidate.now.Sub(cpuStalledSince)
-	if stalledFor < stallTimeout {
-		return
-	}
-	if !p.claimSlotStallWarning(candidate) {
-		return
-	}
-	slog.WarnContext(ctx, "runnerpool worker stalled (no cpu progress)", "vm", candidate.vm.Name, "run_id", candidate.runID, "job_id", candidate.jobID, "slot", candidate.slotIndex, "bind_age_seconds", int64(bindAge.Seconds()), "stalled_for_seconds", int64(stalledFor.Seconds()), "cpu_percent", cpuActivity)
-	if !stallReap {
-		return
-	}
-	p.requestBusyRecycle(candidate)
-}
-
-func (p *Pool) stallReapOptionsSnapshot() (time.Duration, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.options.StallTimeout, p.options.StallReap
-}
-
-func (p *Pool) observeSlotCPU(candidate busyCandidate, cpuActivity float64, now time.Time) (time.Time, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if candidate.index < 0 || candidate.index >= len(p.states) {
-		return time.Time{}, false
-	}
-	state := &p.states[candidate.index]
-	if state.vm == nil ||
-		state.vm.Name != candidate.vm.Name ||
-		candidate.slotIndex < 0 ||
-		candidate.slotIndex >= len(state.slots) {
-		return time.Time{}, false
-	}
-	slot := &state.slots[candidate.slotIndex]
-	if !slot.busy ||
-		slot.jobID != candidate.jobID ||
-		slot.runID != candidate.runID ||
-		!slot.boundAt.Equal(candidate.boundAt) {
-		return time.Time{}, false
-	}
-	if cpuActivity >= stallCPUThresholdPercent {
-		slot.cpuStalledSince = time.Time{}
-		return slot.cpuStalledSince, true
-	}
-	if slot.cpuStalledSince.IsZero() {
-		slot.cpuStalledSince = now
-	}
-	return slot.cpuStalledSince, true
-}
-
-func (p *Pool) claimSlotStallWarning(candidate busyCandidate) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if candidate.index < 0 || candidate.index >= len(p.states) {
-		return false
-	}
-	state := &p.states[candidate.index]
-	if state.vm == nil ||
-		state.vm.Name != candidate.vm.Name ||
-		candidate.slotIndex < 0 ||
-		candidate.slotIndex >= len(state.slots) {
-		return false
-	}
-	slot := &state.slots[candidate.slotIndex]
-	if !slot.busy ||
-		slot.jobID != candidate.jobID ||
-		slot.runID != candidate.runID ||
-		!slot.boundAt.Equal(candidate.boundAt) ||
-		slot.stallWarnedAt.Equal(candidate.boundAt) {
-		return false
-	}
-	slot.stallWarnedAt = candidate.boundAt
-	return true
 }
 
 func (p *Pool) claimSlotReapWarning(candidate busyCandidate) bool {

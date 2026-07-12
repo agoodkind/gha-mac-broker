@@ -10,36 +10,41 @@ import (
 
 type statusProbeTarget struct {
 	viewIndex int
-	slotIndex int
 	slotCount int
+	busySlots []int
 	vm        *broker.WarmVM
 }
 
-// Status returns a pool snapshot plus per-worker views. Active-job probes run
-// after the pool lock is released so a slow guest probe cannot block workers.
+// Status returns a pool snapshot plus per-worker views. The running-slots probe
+// runs after the pool lock is released, one Reattach call per VM, so a slow
+// guest cannot block workers.
 func (p *Pool) Status(ctx context.Context) (Snapshot, []WorkerView) {
 	p.mu.Lock()
 	snapshot := p.snapshotLocked()
 	now := p.options.Now()
 	views := make([]WorkerView, 0, len(p.states))
-	probeTargets := make([]statusProbeTarget, 0, len(p.states)*p.options.JobsPerVM)
+	probeTargets := make([]statusProbeTarget, 0, len(p.states))
 	for index, state := range p.states {
 		view := workerView(index, state, now)
 		views = append(views, view)
 		if p.prober == nil || state.vm == nil {
 			continue
 		}
+		busySlots := make([]int, 0, len(state.slots))
 		for slotIndex, slot := range state.slots {
-			if !slot.busy {
-				continue
+			if slot.busy {
+				busySlots = append(busySlots, slotIndex)
 			}
-			probeTargets = append(probeTargets, statusProbeTarget{
-				viewIndex: index,
-				slotIndex: slotIndex,
-				slotCount: len(state.slots),
-				vm:        state.vm,
-			})
 		}
+		if len(busySlots) == 0 {
+			continue
+		}
+		probeTargets = append(probeTargets, statusProbeTarget{
+			viewIndex: index,
+			slotCount: len(state.slots),
+			busySlots: busySlots,
+			vm:        state.vm,
+		})
 	}
 	prober := p.prober
 	p.mu.Unlock()
@@ -48,18 +53,20 @@ func (p *Pool) Status(ctx context.Context) (Snapshot, []WorkerView) {
 		return snapshot, views
 	}
 	for _, target := range probeTargets {
-		active, err := prober.HasActiveJob(ctx, target.vm, target.slotIndex, target.slotCount)
+		running, err := prober.RunningSlots(ctx, target.vm)
 		if err != nil {
-			slog.WarnContext(ctx, "runnerpool active job probe failed", "err", err, "vm", target.vm.Name, "slot", target.slotIndex)
+			slog.WarnContext(ctx, "runnerpool running slots probe failed", "err", err, "vm", target.vm.Name)
 			continue
 		}
-		activeJob := active
-		if target.slotCount <= 1 {
-			views[target.viewIndex].ActiveJob = &activeJob
-			continue
-		}
-		if target.slotIndex >= 0 && target.slotIndex < len(views[target.viewIndex].Slots) {
-			views[target.viewIndex].Slots[target.slotIndex].ActiveJob = &activeJob
+		for _, slotIndex := range target.busySlots {
+			active := running[slotIndex]
+			if target.slotCount <= 1 {
+				views[target.viewIndex].ActiveJob = &active
+				continue
+			}
+			if slotIndex >= 0 && slotIndex < len(views[target.viewIndex].Slots) {
+				views[target.viewIndex].Slots[slotIndex].ActiveJob = &active
+			}
 		}
 	}
 	return snapshot, views
@@ -178,7 +185,9 @@ func resetSlots(slots []slotState) {
 	for index := range slots {
 		cancel := slots[index].jobCancel
 		if cancel != nil {
-			cancel()
+			// A worker reset is a plain cancellation, so the drain detaches without
+			// killing the guest job; a later Reattach re-adopts it.
+			cancel(nil)
 		}
 		slots[index] = emptySlotState()
 	}
@@ -186,15 +195,15 @@ func resetSlots(slots []slotState) {
 
 func emptySlotState() slotState {
 	return slotState{
-		boundAt:         time.Time{},
-		busy:            false,
-		jobID:           0,
-		runID:           0,
-		jobCancel:       nil,
-		cpuStalledSince: time.Time{},
-		stallWarnedAt:   time.Time{},
-		reapWarnedAt:    time.Time{},
-		adopted:         false,
-		lastErr:         nil,
+		boundAt:      time.Time{},
+		busy:         false,
+		jobID:        0,
+		runID:        0,
+		executionID:  "",
+		resumeCursor: 0,
+		jobCancel:    nil,
+		reapWarnedAt: time.Time{},
+		adopted:      false,
+		lastErr:      nil,
 	}
 }

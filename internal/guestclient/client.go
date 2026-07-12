@@ -89,6 +89,19 @@ func (client *Client) Reattach(ctx context.Context) (*guestproto.ReattachRespons
 	return response.Msg, nil
 }
 
+// Drain refuses future executions and reports whether the agent is idle.
+func (client *Client) Drain(ctx context.Context) (*guestproto.DrainResponse, error) {
+	response, err := client.service.Drain(
+		ctx,
+		connect.NewRequest(&guestproto.DrainRequest{}),
+	)
+	if err != nil {
+		slog.WarnContext(ctx, "guestclient drain failed", "err", err)
+		return nil, fmt.Errorf("guestclient drain: %w", err)
+	}
+	return response.Msg, nil
+}
+
 // CancelJob requests cancellation for one guest execution.
 func (client *Client) CancelJob(ctx context.Context, executionID string) error {
 	_, err := client.service.CancelJob(

@@ -31,9 +31,15 @@ func runGuestSupervisor(ctx context.Context, args []string) error {
 		slog.ErrorContext(ctx, "guest-supervisor flag parse failed", "err", err)
 		return fmt.Errorf("guest-supervisor flags: %w", err)
 	}
-	token := os.Getenv(guestAgentCredentialEnv)
-	if token == "" {
-		return fmt.Errorf("guest-supervisor requires %s", guestAgentCredentialEnv)
+	// Resolve the boot-scoped token: an env token wins, otherwise reuse an existing
+	// token file this boot or mint a fresh one. Reusing across process restarts
+	// keeps the credential stable so a KeepAlive respawn does not invalidate the
+	// token the broker cached. The golden's baked launchd unit (KeepAlive, no env
+	// token) boots cleanly instead of crashlooping. The host reads the file over
+	// the tart-exec control channel and dials the guest agent with it.
+	token, err := guestsupervisor.EnsureBootToken(os.Getenv(guestAgentCredentialEnv), guestsupervisor.TokenPath)
+	if err != nil {
+		return fmt.Errorf("guest-supervisor resolve token: %w", err)
 	}
 	if *slotCount == 0 {
 		return fmt.Errorf("guest-supervisor requires at least one slot")

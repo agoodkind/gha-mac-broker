@@ -57,19 +57,24 @@ type Config struct {
 	// disables age recycling; the value is honored verbatim, not defaulted.
 	MaxAge Duration `toml:"max_age"`
 
-	// MaxBind is the maximum time a busy worker may stay bound before a dead
-	// job probe can recycle it. Zero or unset uses the runner pool default.
+	// MaxBind is the absolute bind ceiling: a busy worker bound longer than this
+	// is recycled regardless of whether its guest execution still reports running,
+	// so a hung-but-alive runner cannot hold a slot forever. Keep it above the
+	// longest legitimate job (GitHub caps jobs at 6h). Zero or unset uses the
+	// runner pool default, which already exceeds 6h.
 	MaxBind Duration `toml:"max_bind"`
 
 	// PickupTimeout is the time a busy worker may stay bound before a no-active
 	// job probe can recycle it. Zero or unset uses the runner pool default.
 	PickupTimeout Duration `toml:"pickup_timeout"`
 
-	// StallTimeout is the low CPU duration after which a live job is logged as
-	// stalled. Zero or unset uses the runner pool default.
+	// StallTimeout is deprecated and no longer consulted: the CPU-stall probe was
+	// removed when job execution moved to the guest agent, and MaxBind is now the
+	// absolute bind ceiling that recycles a hung-but-alive runner. The field is
+	// still accepted so existing configs parse.
 	StallTimeout Duration `toml:"stall_timeout"`
 
-	// StallReap allows a stalled busy worker to be recycled after logging.
+	// StallReap is deprecated and no longer consulted. See StallTimeout.
 	StallReap bool `toml:"stall_reap"`
 
 	// HostedMacOSConcurrencyLimit is the account-wide GitHub-hosted macOS
