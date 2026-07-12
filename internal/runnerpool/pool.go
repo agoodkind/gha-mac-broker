@@ -327,8 +327,12 @@ func (p *Pool) Start(ctx context.Context) {
 	})
 }
 
-// StartReconcile launches periodic idle worker reconciliation.
-func (p *Pool) StartReconcile(ctx context.Context, interval time.Duration) {
+// StartReconcile launches periodic idle worker reconciliation. onCycle, when set,
+// is called after each reconcile pass returns, so a caller can stamp a
+// liveness heartbeat that a supervisor reads to detect a stalled reconcile loop.
+// A reconcile that wedges never returns, so onCycle is not called and the
+// heartbeat goes stale, which is the signal a watchdog acts on.
+func (p *Pool) StartReconcile(ctx context.Context, interval time.Duration, onCycle func()) {
 	if interval <= 0 {
 		interval = defaultReconcileInterval
 	}
@@ -345,6 +349,9 @@ func (p *Pool) StartReconcile(ctx context.Context, interval time.Duration) {
 			case <-ticker.C:
 				if err := p.Reconcile(ctx); err != nil {
 					slog.WarnContext(ctx, "runnerpool reconcile failed", "err", err)
+				}
+				if onCycle != nil {
+					onCycle()
 				}
 			}
 		}
