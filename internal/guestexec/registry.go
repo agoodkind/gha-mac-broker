@@ -6,11 +6,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+
+	"goodkind.io/gha-mac-broker/internal/clock"
 )
 
 const (
@@ -30,7 +31,18 @@ var (
 	ErrExecutionNotFound = errors.New("guestexec: execution not found")
 )
 
-// Registry owns process lifetimes, retained event logs, slots, and drain state.
+// deadlineReader is satisfied by pipe read ends (*os.File) whose blocked Read a
+// past deadline can interrupt without consuming bytes. Freeze uses it to stop a
+// capture goroutine at a read boundary so the next worker generation resumes
+// from the same offset.
+type deadlineReader interface {
+	SetReadDeadline(time.Time) error
+}
+
+// Registry owns retained event logs, slots, and drain state. It records
+// executions the caller has already spawned, captures their piped output, and
+// completes them when the caller reports the process exit. It never forks or
+// waits a process itself.
 type Registry struct {
 	mu                sync.Mutex
 	executions        map[string]*execution
@@ -41,6 +53,7 @@ type Registry struct {
 	activeCount       uint32
 	drained           chan struct{}
 	drainedClosed     bool
+	clock             clock.Clock
 }
 
 type execution struct {
@@ -48,8 +61,8 @@ type execution struct {
 	id               string
 	slot             uint32
 	meta             JobMeta
-	command          *exec.Cmd
 	processID        int
+	pgid             int
 	phase            string
 	running          bool
 	reaped           bool
@@ -57,8 +70,29 @@ type execution struct {
 	events           []Event
 	retainedLogBytes int
 	logCapCursor     int
+	completedAt      time.Time
+	exitReported     bool
+	exitCode         int
+	exitMsg          string
 	notify           chan struct{}
 	done             chan struct{}
+	// exitReport carries the caller's waitpid result to the supervisor
+	// goroutine. It is buffered by one and delivered at most once, so a
+	// duplicate report never blocks and never drives a second completion.
+	exitReport chan ExitReport
+	reapOnce   sync.Once
+	// stopped is closed only by Freeze. It releases the capture, heartbeat, and
+	// supervisor goroutines at a boundary so the next worker generation can take
+	// over the execution without those goroutines racing it.
+	stopped      chan struct{}
+	readers      *sync.WaitGroup
+	stdoutReader io.ReadCloser
+	stderrReader io.ReadCloser
+	// supervised is closed when the supervisor goroutine returns, whether it
+	// reaped the execution to completion or stopped for a freeze. Freeze awaits it
+	// so a snapshot is never taken while a reap is mid-flight, which would capture
+	// an unrestorable exitReported-but-still-running state.
+	supervised chan struct{}
 }
 
 // New returns an empty process registry.
@@ -81,6 +115,7 @@ func New(options Options) *Registry {
 		activeCount:       uint32(0),
 		drained:           make(chan struct{}),
 		drainedClosed:     false,
+		clock:             clock.System(),
 	}
 	slog.Debug("guest execution registry created",
 		"retention", retention,
@@ -89,8 +124,95 @@ func New(options Options) *Registry {
 	return registry
 }
 
-// Start launches a fresh execution or reports the idempotent outcome.
+// Start launches a fresh execution or reports the idempotent outcome. It is a
+// convenience for the in-package guest-agent path: it forks the process with
+// Launch, hands the read ends to Register, and runs a supervisor goroutine that
+// waits the child and reports its exit. In PR3 the guest-supervisor process owns
+// the fork and waitpid and calls Register and ReportExit directly.
 func (r *Registry) Start(spec ExecSpec) (Outcome, error) {
+	if spec.ExecutionID == "" {
+		return OutcomeUnspecified, fmt.Errorf("guestexec: execution ID is required")
+	}
+	if spec.Command == "" {
+		return OutcomeUnspecified, fmt.Errorf("guestexec: command is required")
+	}
+	if !filepath.IsAbs(spec.Command) {
+		return OutcomeUnspecified, fmt.Errorf("guestexec: command path must be absolute")
+	}
+
+	// Check admission before forking, so a draining registry or an idempotent
+	// duplicate never spawns a child that would run its command before Register
+	// rejected it. Register re-checks under the lock, so a concurrent race that
+	// slips past this peek is still caught and the loser is discarded.
+	r.mu.Lock()
+	preOutcome, proceed, preErr := r.checkAdmissionLocked(spec)
+	r.mu.Unlock()
+	if !proceed {
+		return preOutcome, preErr
+	}
+
+	launched, err := Launch(spec)
+	if err != nil {
+		return OutcomeUnspecified, err
+	}
+	outcome, registerErr := r.Register(spec, launched.PID, launched.PGID, launched.Stdout, launched.Stderr)
+	if registerErr != nil || outcome != OutcomeAccepted {
+		r.discardLaunched(launched)
+		return outcome, registerErr
+	}
+
+	goSafe("start supervisor", func() {
+		observeErr := waitUntilExited(launched.PID)
+		waitErr := launched.Command.Wait()
+		exitCode := int(processExitCode(launched.Command.ProcessState))
+		message := ""
+		if joined := errors.Join(observeErr, waitErr); joined != nil {
+			message = joined.Error()
+		}
+		r.ReportExit(launched.PID, exitCode, message)
+	})
+	return OutcomeAccepted, nil
+}
+
+// checkAdmissionLocked reports the outcome of admitting spec and whether the
+// caller should proceed to record it. It must run under r.mu. proceed is true
+// only for OutcomeAccepted; every other outcome carries the reason a new
+// execution is refused, matching the pre-refactor Start semantics.
+func (r *Registry) checkAdmissionLocked(spec ExecSpec) (Outcome, bool, error) {
+	if r.draining {
+		return OutcomeUnspecified, false, ErrDraining
+	}
+	if existing, found := r.executions[spec.ExecutionID]; found {
+		existing.mu.Lock()
+		sameSlot := existing.slot == spec.Slot
+		running := existing.running
+		existing.mu.Unlock()
+		if !sameSlot {
+			return OutcomeConflict, false, nil
+		}
+		if running {
+			return OutcomeAlreadyRunning, false, nil
+		}
+		return OutcomeAlreadyCompleted, false, nil
+	}
+	if _, occupied := r.slots[spec.Slot]; occupied {
+		return OutcomeConflict, false, nil
+	}
+	return OutcomeAccepted, true, nil
+}
+
+// Register records a caller-spawned execution and starts capturing its output.
+// It keeps the idempotency and one-execution-per-slot semantics of Start: a
+// duplicate execution ID reports the existing outcome, and a taken slot
+// conflicts. The caller has already forked the process in its own group and
+// passes the pid, pgid, and pipe read ends; Register never opens the process.
+func (r *Registry) Register(
+	spec ExecSpec,
+	pid int,
+	pgid int,
+	stdoutR io.ReadCloser,
+	stderrR io.ReadCloser,
+) (Outcome, error) {
 	if spec.ExecutionID == "" {
 		return OutcomeUnspecified, fmt.Errorf("guestexec: execution ID is required")
 	}
@@ -103,68 +225,19 @@ func (r *Registry) Start(spec ExecSpec) (Outcome, error) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.draining {
-		return OutcomeUnspecified, ErrDraining
-	}
-	if existing, found := r.executions[spec.ExecutionID]; found {
-		existing.mu.Lock()
-		sameSlot := existing.slot == spec.Slot
-		running := existing.running
-		existing.mu.Unlock()
-		if !sameSlot {
-			return OutcomeConflict, nil
-		}
-		if running {
-			return OutcomeAlreadyRunning, nil
-		}
-		return OutcomeAlreadyCompleted, nil
-	}
-	if _, occupied := r.slots[spec.Slot]; occupied {
-		return OutcomeConflict, nil
+	if outcome, proceed, admitErr := r.checkAdmissionLocked(spec); !proceed {
+		return outcome, admitErr
 	}
 
-	stdoutReader, stdoutWriter, err := os.Pipe()
-	if err != nil {
-		slog.Error("guest execution stdout pipe creation failed", "err", err)
-		return OutcomeUnspecified, fmt.Errorf("guestexec: create stdout pipe: %w", err)
-	}
-	stderrReader, stderrWriter, err := os.Pipe()
-	if err != nil {
-		_ = stdoutReader.Close()
-		_ = stdoutWriter.Close()
-		slog.Error("guest execution stderr pipe creation failed", "err", err)
-		return OutcomeUnspecified, fmt.Errorf("guestexec: create stderr pipe: %w", err)
-	}
-	closePipes := func() {
-		_ = stdoutReader.Close()
-		_ = stdoutWriter.Close()
-		_ = stderrReader.Close()
-		_ = stderrWriter.Close()
-	}
-
-	command := new(exec.Cmd)
-	command.Path = spec.Command
-	command.Args = append([]string{spec.Command}, spec.Args...)
-	command.Dir = spec.WorkingDir
-	command.Env = mergedEnvironment(spec.Env)
-	command.Stdout = stdoutWriter
-	command.Stderr = stderrWriter
-	configureProcessGroup(command)
-	if err := command.Start(); err != nil {
-		closePipes()
-		slog.Error("guest execution process start failed", "err", err, "execution_id", spec.ExecutionID)
-		return OutcomeUnspecified, fmt.Errorf("guestexec: start %q: %w", spec.Command, err)
-	}
-	_ = stdoutWriter.Close()
-	_ = stderrWriter.Close()
-
+	readers := &sync.WaitGroup{}
+	readers.Add(2)
 	execState := &execution{
 		mu:               sync.Mutex{},
 		id:               spec.ExecutionID,
 		slot:             spec.Slot,
 		meta:             spec.Meta,
-		command:          command,
-		processID:        command.Process.Pid,
+		processID:        pid,
+		pgid:             pgid,
 		phase:            "running",
 		running:          true,
 		reaped:           false,
@@ -172,21 +245,61 @@ func (r *Registry) Start(spec ExecSpec) (Outcome, error) {
 		events:           nil,
 		retainedLogBytes: 0,
 		logCapCursor:     0,
+		completedAt:      time.Time{},
+		exitReported:     false,
+		exitCode:         0,
+		exitMsg:          "",
 		notify:           make(chan struct{}),
 		done:             make(chan struct{}),
+		exitReport:       make(chan ExitReport, 1),
+		reapOnce:         sync.Once{},
+		stopped:          make(chan struct{}),
+		readers:          readers,
+		stdoutReader:     stdoutR,
+		stderrReader:     stderrR,
+		supervised:       make(chan struct{}),
 	}
 	execState.appendEvent(PhaseChange{Phase: "running"})
 	r.executions[spec.ExecutionID] = execState
 	r.slots[spec.Slot] = spec.ExecutionID
 	r.activeCount++
 
-	goSafe("execution reaper", func() {
-		r.runExecution(execState, stdoutReader, stderrReader)
+	goSafe("stdout capture", func() {
+		captureOutput(execState, StreamStdout, stdoutR, readers, execState.stopped)
+	})
+	goSafe("stderr capture", func() {
+		captureOutput(execState, StreamStderr, stderrR, readers, execState.stopped)
 	})
 	goSafe("execution heartbeat", func() {
 		r.emitHeartbeats(execState)
 	})
+	goSafe("execution supervisor", func() {
+		r.superviseExecution(execState)
+	})
 	return OutcomeAccepted, nil
+}
+
+// ReportExit delivers a waitpid result to the running execution that owns pid,
+// which drains its output to EOF and emits a single terminal result. It is safe
+// for an unknown, already-reaped, or expired pid: the call is a no-op and never
+// panics, so a duplicate report or a reload-time re-delivery cannot double-emit
+// a terminal.
+func (r *Registry) ReportExit(pid int, exitCode int, message string) {
+	r.mu.Lock()
+	execState := r.executionByPIDLocked(pid)
+	r.mu.Unlock()
+	if execState == nil {
+		return
+	}
+	execState.mu.Lock()
+	stale := execState.exitReported || !execState.running
+	execState.mu.Unlock()
+	if stale {
+		return
+	}
+	execState.reapOnce.Do(func() {
+		execState.exitReport <- ExitReport{PID: pid, ExitCode: exitCode, Message: message}
+	})
 }
 
 // Subscribe replays events with Sequence greater than fromSequence, then follows live events.
@@ -229,8 +342,8 @@ func (r *Registry) Cancel(executionID string) error {
 		execState.mu.Unlock()
 		return nil
 	}
-	processID := execState.processID
-	err := killProcessGroup(processID)
+	pgid := execState.pgid
+	err := killProcessGroup(pgid)
 	if err == nil {
 		execState.cancelled = true
 	}
@@ -290,35 +403,76 @@ func (r *Registry) Drain() DrainState {
 	return state
 }
 
-func (r *Registry) runExecution(
-	execState *execution,
-	stdoutReader *os.File,
-	stderrReader *os.File,
-) {
-	var readers sync.WaitGroup
-	readers.Add(2)
-	goSafe("stdout capture", func() {
-		captureOutput(execState, StreamStdout, stdoutReader, &readers)
+// discardLaunched kills and reaps a process that Start forked but Register did
+// not accept, so an idempotent duplicate or a lost admission race leaves no
+// running child and no leaked pipe.
+func (r *Registry) discardLaunched(launched *LaunchedProcess) {
+	_ = killProcessGroup(launched.PGID)
+	_ = launched.Stdout.Close()
+	_ = launched.Stderr.Close()
+	goSafe("discarded launch reaper", func() {
+		_ = waitUntilExited(launched.PID)
+		_ = launched.Command.Wait()
 	})
-	goSafe("stderr capture", func() {
-		captureOutput(execState, StreamStderr, stderrReader, &readers)
-	})
+}
 
-	observeErr := waitUntilExited(execState.processID)
-	// command.Wait must not run under execState.mu. On the platform where
-	// waitUntilExited is a non-reaping stub, Wait blocks until the child exits,
-	// and the child does not exit until its stdout/stderr pipes drain. The
-	// capture goroutines need execState.mu to append log events, so holding the
-	// mutex across Wait would stall the drain and deadlock on large output.
-	waitErr := execState.command.Wait()
+// executionByPIDLocked returns the execution that owns pid, preferring a live
+// (running, not yet reaped) one. processID is set once at Register before the
+// execution is published, so reading it under r.mu is race-free. The preference
+// routes a report to the live execution when a recycled pid also matches a
+// retained completed execution still inside its retention window; the reap-order
+// of that live execution's state is read under its own mutex.
+func (r *Registry) executionByPIDLocked(pid int) *execution {
+	var fallback *execution
+	for _, execState := range r.executions {
+		if execState.processID != pid {
+			continue
+		}
+		execState.mu.Lock()
+		live := execState.running && !execState.reaped
+		execState.mu.Unlock()
+		if live {
+			return execState
+		}
+		if fallback == nil {
+			fallback = execState
+		}
+	}
+	return fallback
+}
+
+// superviseExecution awaits the caller's exit report, then completes the
+// execution. Freeze releases it early through stopped so the next worker
+// generation, not this goroutine, drives the execution to completion. Closing
+// supervised on return lets Freeze know the goroutine has settled, so a snapshot
+// never lands in the middle of a reap.
+func (r *Registry) superviseExecution(execState *execution) {
+	defer close(execState.supervised)
+	select {
+	case report := <-execState.exitReport:
+		r.reapAndComplete(execState, report)
+	case <-execState.stopped:
+		return
+	}
+}
+
+// reapAndComplete records the reported exit, drains the output pipes to EOF,
+// completes the execution, and arms its retention timer. Draining before the
+// terminal preserves the ordering that every captured LogChunk precedes the
+// completion.
+func (r *Registry) reapAndComplete(execState *execution, report ExitReport) {
 	execState.mu.Lock()
 	execState.reaped = true
+	execState.exitReported = true
+	execState.exitCode = report.ExitCode
+	execState.exitMsg = report.Message
+	readers := execState.readers
 	execState.mu.Unlock()
-	waitErr = errors.Join(observeErr, waitErr)
-	readers.Wait()
-	exitCode := processExitCode(execState.command.ProcessState)
-	r.completeExecution(execState, exitCode, waitErr)
 
+	if readers != nil {
+		readers.Wait()
+	}
+	r.completeExecution(execState)
 	time.AfterFunc(r.retention, func() {
 		r.expire(execState)
 	})
@@ -333,6 +487,8 @@ func (r *Registry) emitHeartbeats(execState *execution) {
 			execState.appendHeartbeat(now)
 		case <-execState.done:
 			return
+		case <-execState.stopped:
+			return
 		}
 	}
 }
@@ -346,19 +502,18 @@ func (r *Registry) expire(execState *execution) {
 	}
 }
 
-func (r *Registry) completeExecution(execState *execution, exitCode int32, waitErr error) {
+func (r *Registry) completeExecution(execState *execution) {
 	r.mu.Lock()
 	execState.mu.Lock()
-	message := ""
+	message := execState.exitMsg
 	if execState.cancelled {
 		message = "execution cancelled"
-	} else if waitErr != nil {
-		message = waitErr.Error()
 	}
 	execState.phase = "completed"
 	execState.running = false
+	execState.completedAt = r.clock.Now()
 	execState.appendEventLocked(PhaseChange{Phase: "completed"})
-	execState.appendEventLocked(TerminalResult{ExitCode: exitCode, Message: message})
+	execState.appendEventLocked(TerminalResult{ExitCode: clampExitCode(execState.exitCode), Message: message})
 	close(execState.done)
 	delete(r.slots, execState.slot)
 	r.activeCount--
@@ -380,19 +535,36 @@ func (r *Registry) closeDrainedLocked() {
 func captureOutput(
 	execState *execution,
 	stream Stream,
-	reader *os.File,
+	reader io.ReadCloser,
 	readers *sync.WaitGroup,
+	stopped <-chan struct{},
 ) {
 	defer readers.Done()
-	defer func() { _ = reader.Close() }()
+	// Clear any past freeze deadline so a read end handed over by Restore resumes
+	// reading instead of tripping the deadline again.
+	if dr, ok := reader.(deadlineReader); ok {
+		_ = dr.SetReadDeadline(time.Time{})
+	}
 	buffer := make([]byte, outputReadBufferSize)
 	for {
+		select {
+		case <-stopped:
+			// Frozen: leave the reader open for the next worker generation.
+			return
+		default:
+		}
 		bytesRead, err := reader.Read(buffer)
 		if bytesRead > 0 {
 			data := append([]byte(nil), buffer[:bytesRead]...)
 			execState.appendEvent(LogChunk{Stream: stream, Data: data})
 		}
 		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				// Freeze interrupted a blocked read without consuming bytes. Leave
+				// the reader open so the next generation resumes from this offset.
+				return
+			}
+			_ = reader.Close()
 			if !errors.Is(err, io.EOF) {
 				execState.appendEvent(LogChunk{
 					Stream: StreamStderr,
@@ -475,6 +647,15 @@ func mergedEnvironment(overrides map[string]string) []string {
 
 func processExitCode(processState *os.ProcessState) int32 {
 	exitCode := processState.ExitCode()
+	if exitCode < 0 || exitCode > maximumProcessExitCode {
+		return -1
+	}
+	return int32(exitCode)
+}
+
+// clampExitCode narrows a reported exit code to the TerminalResult range, so an
+// out-of-range or signal-derived value becomes -1 rather than overflowing.
+func clampExitCode(exitCode int) int32 {
 	if exitCode < 0 || exitCode > maximumProcessExitCode {
 		return -1
 	}
