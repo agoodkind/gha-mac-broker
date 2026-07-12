@@ -728,7 +728,7 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 	hostedTracker := hostedload.NewTracker()
-	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, hostedTracker)
+	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, hostedTracker, nil)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

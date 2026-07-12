@@ -18,6 +18,7 @@ import (
 
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/hostedload"
+	"goodkind.io/gha-mac-broker/internal/hoststats"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
 )
 
@@ -29,6 +30,11 @@ type pooler interface {
 	Ready() bool
 	Status(ctx context.Context) (runnerpool.Snapshot, []runnerpool.WorkerView)
 	CancelRun(jobID int64)
+}
+
+// statsProvider is the subset of hoststats.Sampler used by the server.
+type statsProvider interface {
+	Latest() hoststats.Sample
 }
 
 type webhookAction string
@@ -65,8 +71,9 @@ type capacityResponse struct {
 }
 
 type statusResponse struct {
-	Snapshot runnerpool.Snapshot     `json:"snapshot"`
-	Workers  []runnerpool.WorkerView `json:"workers"`
+	Snapshot  runnerpool.Snapshot     `json:"snapshot"`
+	Workers   []runnerpool.WorkerView `json:"workers"`
+	HostStats hoststats.Sample        `json:"host_stats"`
 }
 
 // Server handles the /webhook, /capacity, /status, and /healthz endpoints.
@@ -79,6 +86,7 @@ type Server struct {
 	cfg           *config.Config
 	pool          pooler
 	hostedTracker *hostedload.Tracker
+	stats         statsProvider
 }
 
 type serverConfig struct {
@@ -89,7 +97,7 @@ type serverConfig struct {
 }
 
 // New builds a Server and registers its routes on an internal mux.
-func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler, hostedTracker *hostedload.Tracker) *Server {
+func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler, hostedTracker *hostedload.Tracker, stats statsProvider) *Server {
 	s := &Server{
 		mux:           http.NewServeMux(),
 		mu:            sync.RWMutex{},
@@ -99,6 +107,7 @@ func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCID
 		cfg:           cfg,
 		pool:          p,
 		hostedTracker: hostedTracker,
+		stats:         stats,
 	}
 	s.mux.HandleFunc("/webhook", s.handleWebhook)
 	s.mux.HandleFunc("/capacity", s.handleCapacity)
@@ -264,11 +273,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.checkBearerToken(w, r) {
 		return
 	}
-	snapshot, workers := s.pool.Status(r.Context())
-	writeJSON(w, statusResponse{
-		Snapshot: snapshot,
-		Workers:  workers,
-	})
+	var resp statusResponse
+	resp.Snapshot, resp.Workers = s.pool.Status(r.Context())
+	if s.stats != nil {
+		resp.HostStats = s.stats.Latest()
+	}
+	writeJSON(w, resp)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
