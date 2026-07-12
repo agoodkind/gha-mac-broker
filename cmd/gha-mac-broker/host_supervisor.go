@@ -86,11 +86,11 @@ func runSupervisor(ctx context.Context, args []string) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := writeSupervisorPIDFile(os.Getpid()); err != nil {
-		slog.WarnContext(ctx, "supervisor pidfile write failed; in-place worker reload signaling disabled", "err", err)
-	}
-	defer removeSupervisorPIDFile()
-
+	// Arm SIGHUP handling before publishing the pidfile. The pidfile is what makes
+	// the supervisor discoverable to reloadOrRestart and deploy, so a reload request
+	// can arrive the instant it is written; if the handler were installed after the
+	// write, a SIGHUP landing in that gap would hit the default disposition and
+	// terminate the supervisor instead of triggering an in-place worker reload.
 	sighup := make(chan os.Signal, 1)
 	signal.Notify(sighup, syscall.SIGHUP)
 	defer signal.Stop(sighup)
@@ -109,6 +109,11 @@ func runSupervisor(ctx context.Context, args []string) error {
 			}
 		}
 	}()
+
+	if err := writeSupervisorPIDFile(os.Getpid()); err != nil {
+		slog.WarnContext(ctx, "supervisor pidfile write failed; in-place worker reload signaling disabled", "err", err)
+	}
+	defer removeSupervisorPIDFile()
 
 	slog.InfoContext(ctx, "host supervisor starting", "addr", tcpListener.Addr().String())
 	if err := supervisor.Run(ctx); err != nil {

@@ -49,7 +49,6 @@ import (
 	"goodkind.io/gha-mac-broker/internal/hostedload"
 	"goodkind.io/gha-mac-broker/internal/install"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
-	"goodkind.io/gha-mac-broker/internal/server"
 	"goodkind.io/gha-mac-broker/internal/skopeo"
 	"goodkind.io/gha-mac-broker/internal/tart"
 	"goodkind.io/gha-mac-broker/internal/updateopts"

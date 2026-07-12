@@ -204,7 +204,11 @@ func (s *Supervisor) supervise(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			s.stopGeneration(s.currentWorkerGeneration())
+			// Give the worker the full graceful stop window before returning. Run's
+			// deferred shutdownWorkers then only escalates to SIGKILL for anything
+			// still alive, which is the intended detach-not-kill behavior on a normal
+			// launchd stop rather than an immediate kill.
+			s.stopAndWaitGeneration(s.currentWorkerGeneration())
 			return nil
 		case exit := <-s.workerExitCh:
 			if fatal, fatalErr := s.handleWorkerExit(exit); fatal {
@@ -575,29 +579,6 @@ func (s *Supervisor) runWatchdog(ctx context.Context) {
 			s.stallCheck(s.now())
 		}
 	}
-}
-
-// stopGeneration signals a worker generation to stop and schedules a forced kill
-// if it does not exit within the stop timeout. The normal wait goroutine delivers
-// the exit to the exit channel, so this never consumes exits itself.
-func (s *Supervisor) stopGeneration(generation uint64) {
-	if generation == 0 {
-		return
-	}
-	s.mu.Lock()
-	handle := s.workers[generation]
-	s.mu.Unlock()
-	if handle == nil || handle.cmd.Process == nil {
-		return
-	}
-	_ = handle.cmd.Process.Signal(syscall.SIGTERM)
-	goSafe(s.log, "worker force kill", func() {
-		select {
-		case <-handle.done:
-		case <-time.After(s.opts.WorkerStopTimeout):
-			_ = handle.cmd.Process.Kill()
-		}
-	})
 }
 
 // stopAndWaitGeneration signals a worker generation to stop and blocks until it has

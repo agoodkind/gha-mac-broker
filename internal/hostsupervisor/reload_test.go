@@ -202,7 +202,7 @@ func (h *harness) waitServing(t *testing.T) int {
 		}
 		pid := h.supervisor.CurrentWorkerPID()
 		if pid > 0 {
-			if _, err := httpGet(h.addr); err == nil {
+			if _, err := httpGet(context.Background(), h.addr); err == nil {
 				return pid
 			}
 		}
@@ -213,12 +213,16 @@ func (h *harness) waitServing(t *testing.T) int {
 	}
 }
 
-func httpGet(addr string) (string, error) {
+func httpGet(ctx context.Context, addr string) (string, error) {
 	client := &http.Client{
 		Transport: &http.Transport{DisableKeepAlives: true},
 		Timeout:   2 * time.Second,
 	}
-	resp, err := client.Get("http://" + addr + "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -237,7 +241,7 @@ func httpGet(addr string) (string, error) {
 func TestReloadKeepsListenerUpAcrossWorkerSwap(t *testing.T) {
 	h := startHarness(t, hostsupervisor.Options{Log: nil})
 
-	firstGen, err := httpGet(h.addr)
+	firstGen, err := httpGet(context.Background(), h.addr)
 	if err != nil {
 		t.Fatalf("first serve: %v", err)
 	}
@@ -262,7 +266,9 @@ func TestReloadKeepsListenerUpAcrossWorkerSwap(t *testing.T) {
 				return
 			default:
 			}
-			conn, err := net.DialTimeout("tcp", h.addr, 2*time.Second)
+			dialCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", h.addr)
+			cancel()
 			if err != nil {
 				if strings.Contains(err.Error(), "refused") {
 					select {
@@ -281,7 +287,7 @@ func TestReloadKeepsListenerUpAcrossWorkerSwap(t *testing.T) {
 
 	deadline := time.Now().Add(harnessTimeout)
 	for {
-		body, err := httpGet(h.addr)
+		body, err := httpGet(context.Background(), h.addr)
 		if err == nil && body == "2" && h.supervisor.CurrentWorkerPID() != firstPID {
 			break
 		}
@@ -385,6 +391,61 @@ func TestReloadStopsOldWorkerBeforeStartingNew(t *testing.T) {
 		if running > 1 {
 			t.Fatalf("events = %v, two workers were live at once", events)
 		}
+	}
+}
+
+// TestShutdownGivesWorkerGracefulStop proves a supervisor shutdown gives the
+// worker the graceful SIGTERM window rather than an immediate SIGKILL: the stub
+// worker records its stop only from the SIGTERM handler, which a SIGKILL-first
+// shutdown could never run, so the recorded stop event is proof the window ran.
+func TestShutdownGivesWorkerGracefulStop(t *testing.T) {
+	eventsPath := filepath.Join(t.TempDir(), "events.log")
+	t.Setenv(workerEventsEnv, eventsPath)
+
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	addr := listener.Addr().String()
+	supervisor := hostsupervisor.New(hostsupervisor.Options{
+		Listener:          listener,
+		WorkerCommand:     reExecWorker,
+		WorkerStopTimeout: 5 * time.Second,
+		Log:               nil,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- supervisor.Run(ctx) }()
+
+	deadline := time.Now().Add(harnessTimeout)
+	for supervisor.CurrentWorkerPID() == 0 {
+		select {
+		case err := <-runErr:
+			t.Fatalf("supervisor exited before serving: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker did not begin serving before deadline")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := httpGet(ctx, addr); err != nil {
+		t.Fatalf("first serve: %v", err)
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("supervisor Run returned error on shutdown: %v", err)
+		}
+	case <-time.After(harnessTimeout):
+		t.Fatal("supervisor did not return after cancel")
+	}
+
+	events := readWorkerEvents(t, eventsPath)
+	if indexOfEvent(events, "stop:1") < 0 {
+		t.Fatalf("events = %v, want stop:1 proving the worker got a graceful SIGTERM window rather than SIGKILL", events)
 	}
 }
 
