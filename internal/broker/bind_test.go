@@ -54,6 +54,7 @@ type stubGuest struct {
 	statusCalls   []uint64
 	reattach      *guestproto.ReattachResponse
 	reattachErr   error
+	cancelErr     error
 	cancelCalls   []string
 	drainCalls    int
 }
@@ -106,8 +107,9 @@ func (g *stubGuest) Drain(_ context.Context) (*guestproto.DrainResponse, error) 
 func (g *stubGuest) CancelJob(_ context.Context, executionID string) error {
 	g.mu.Lock()
 	g.cancelCalls = append(g.cancelCalls, executionID)
+	cancelErr := g.cancelErr
 	g.mu.Unlock()
-	return nil
+	return cancelErr
 }
 
 func (g *stubGuest) statusCallCursors() []uint64 {
@@ -274,6 +276,43 @@ func TestDrainJobRecycleCauseCancelsThenDrainsToTerminal(t *testing.T) {
 	}
 	if cancels := guest.cancelledExecutions(); len(cancels) != 1 || cancels[0] != "owner/repo#42#1001" {
 		t.Fatalf("cancel calls = %v, want [owner/repo#42#1001]", cancels)
+	}
+}
+
+func TestDrainJobBoundsTeardownWhenVMUnreachable(t *testing.T) {
+	restore := drainTimeout
+	drainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { drainTimeout = restore })
+
+	// A dead/unreachable VM: CancelJob and every JobStatus reconnect fail with dial
+	// errors (never a terminal, never NotFound). Without a bound the teardown drain
+	// would spin forever and wedge the slot.
+	guest := &stubGuest{
+		cancelErr: errors.New("dial tcp: connection refused"),
+		statusFactory: []func(uint64) (jobStatusStream, error){
+			func(uint64) (jobStatusStream, error) {
+				return nil, errors.New("dial tcp: connection refused")
+			},
+		},
+	}
+	binder := stubBinder(t, guest)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(errors.New("recycle slot"))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- binder.drainJob(ctx, guest, "owner/repo#42#1001", 0, &WarmVM{Name: "warm-vm-1"}, 0, 1)
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("drainJob = nil, want a bounded teardown-timeout error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainJob did not return; teardown drain is unbounded")
+	}
+	if cancels := guest.cancelledExecutions(); len(cancels) != 1 || cancels[0] != "owner/repo#42#1001" {
+		t.Fatalf("cancel calls = %v, want one CancelJob attempt", cancels)
 	}
 }
 

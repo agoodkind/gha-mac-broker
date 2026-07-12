@@ -20,9 +20,12 @@ const (
 	defaultJobsPerVM         = 1
 	defaultWarmRetryDelay    = 5 * time.Second
 	defaultReconcileInterval = time.Minute
-	defaultMaxBind           = 65 * time.Minute
-	defaultPickupTimeout     = 5 * time.Minute
-	defaultStallTimeout      = 10 * time.Minute
+	// defaultMaxBind is the absolute bind ceiling: a slot bound longer than this
+	// is recycled regardless of whether the guest still reports its execution
+	// running, so a hung-but-alive runner cannot hold a slot forever. It exceeds
+	// GitHub's 6h job ceiling so a healthy long job is never reaped early.
+	defaultMaxBind       = 7 * time.Hour
+	defaultPickupTimeout = 5 * time.Minute
 )
 
 // Job is one queued workflow job accepted from the webhook server.
@@ -41,8 +44,6 @@ type Options struct {
 	MaxAge         time.Duration
 	MaxBind        time.Duration
 	PickupTimeout  time.Duration
-	StallTimeout   time.Duration
-	StallReap      bool
 	RunToken       string
 	WarmRetryDelay time.Duration
 	Now            func() time.Time
@@ -220,8 +221,6 @@ func (p *Pool) Reconfigure(newOptions Options) {
 		MaxAge:         newOptions.MaxAge,
 		MaxBind:        newOptions.MaxBind,
 		PickupTimeout:  newOptions.PickupTimeout,
-		StallTimeout:   newOptions.StallTimeout,
-		StallReap:      newOptions.StallReap,
 		RunToken:       newOptions.RunToken,
 		WarmRetryDelay: newOptions.WarmRetryDelay,
 		Now:            newOptions.Now,
@@ -273,9 +272,6 @@ func normalizeOptions(options Options) Options {
 	}
 	if options.PickupTimeout <= 0 {
 		options.PickupTimeout = defaultPickupTimeout
-	}
-	if options.StallTimeout <= 0 {
-		options.StallTimeout = defaultStallTimeout
 	}
 	if options.Now == nil {
 		options.Now = time.Now

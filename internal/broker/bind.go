@@ -48,8 +48,10 @@ const touchInterval = 10 * time.Second
 // call, so one wedged guest cannot park the whole pass.
 const checkAliveTimeout = 15 * time.Second
 
-// drainTimeout bounds the best-effort guest Drain before a VM teardown.
-const drainTimeout = 30 * time.Second
+// drainTimeout bounds the best-effort guest Drain before a VM teardown and the
+// recycle/cancel teardown drain, so a dead or unreachable VM cannot spin either
+// forever. It is a var so tests can shorten it.
+var drainTimeout = 30 * time.Second
 
 // drainReconnectBackoff paces reconnect attempts when a status stream drops
 // before its terminal event.
@@ -368,11 +370,19 @@ func (b *Binder) drainJob(ctx context.Context, client guestConn, execID string, 
 		return context.Canceled
 	}
 	// A recycle or cancel-run cause: cancel the guest job, then drain it to its
-	// terminal on a detached context for an ordered teardown.
-	if err := client.CancelJob(context.WithoutCancel(ctx), execID); err != nil {
+	// terminal on a detached, time-bounded context. The timeout guarantees a dead
+	// or unreachable VM cannot spin the teardown drain forever, which would leave
+	// the slot goroutine hung and block recycle and VM teardown.
+	teardownCtx, cancelTeardown := context.WithTimeout(context.WithoutCancel(ctx), drainTimeout)
+	defer cancelTeardown()
+	if err := client.CancelJob(teardownCtx, execID); err != nil {
 		slog.WarnContext(ctx, "guest cancel job failed", "err", err, "vm", vm.Name, "execution", execID)
 	}
-	_, drainErr := b.drainToTerminal(context.WithoutCancel(ctx), client, execID, vm, runLog, &cursor)
+	timedOut, drainErr := b.drainToTerminal(teardownCtx, client, execID, vm, runLog, &cursor)
+	if timedOut {
+		slog.WarnContext(ctx, "teardown drain timed out; proceeding with recycle", "vm", vm.Name, "execution", execID)
+		return fmt.Errorf("broker: teardown drain timed out for %s on %s", execID, vm.Name)
+	}
 	return drainErr
 }
 
@@ -828,13 +838,15 @@ func (b *Binder) generateJIT(ctx context.Context, owner, repoName, runnerName st
 // NAT IP, reads the per-boot token over the tart-exec control channel, dials the
 // agent, and confirms Hello answers with a compatible protocol before caching.
 func (b *Binder) resolveGuest(ctx context.Context, vm *WarmVM) (guestConn, error) {
+	// Hold the per-VM lock across the whole resolution, so concurrent callers for
+	// the same VM dial exactly once: the first resolves and caches, the rest see
+	// the cache. Resolution runs single threaded in Warm and Adopt before the VM
+	// is served, so the hot path always hits the cache and never blocks here.
 	vm.guestMu.Lock()
+	defer vm.guestMu.Unlock()
 	if vm.guestConn != nil {
-		client := vm.guestConn
-		vm.guestMu.Unlock()
-		return client, nil
+		return vm.guestConn, nil
 	}
-	vm.guestMu.Unlock()
 
 	ip, err := b.vm.IP(ctx, vm.Name)
 	if err != nil {
@@ -851,12 +863,8 @@ func (b *Binder) resolveGuest(ctx context.Context, vm *WarmVM) (guestConn, error
 		return nil, err
 	}
 
-	vm.guestMu.Lock()
-	defer vm.guestMu.Unlock()
-	if vm.guestConn == nil {
-		vm.guestAddr = address
-		vm.guestConn = client
-	}
+	vm.guestAddr = address
+	vm.guestConn = client
 	return vm.guestConn, nil
 }
 

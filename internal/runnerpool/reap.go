@@ -19,6 +19,12 @@ type busyCandidate struct {
 	now       time.Time
 }
 
+// reap messages name the reason a busy slot was recycled.
+const (
+	reapPastMaxBindMessage = "runnerpool reaping worker (past max_bind ceiling)"
+	reapNoActiveJobMessage = "runnerpool reaping worker (no active job process)"
+)
+
 // runningProbe caches one VM's running-slot map for a single reconcile pass, so
 // the reap loop makes at most one Reattach call per VM.
 type runningProbe struct {
@@ -26,11 +32,13 @@ type runningProbe struct {
 	err     error
 }
 
-// reapBusyWorkers recycles busy slots that have blown past their bind or pickup
-// deadline and whose guest execution is no longer running. It reads the running
-// slots once per VM per pass. A VM that no longer answers past MaxBind is reaped
-// on the probe error; a still-running execution is left alone, since jobs run
-// for hours.
+// reapBusyWorkers recycles busy slots that have blown past a deadline. MaxBind is
+// an absolute ceiling: a slot bound past it is recycled regardless of running
+// state, so a hung-but-alive runner the guest still reports as running cannot
+// hold its slot forever. Within MaxBind, a slot past the pickup timeout is
+// recycled only when its guest execution is not running, read at most once per
+// VM per pass; a probe error within MaxBind is treated as a possibly-transient
+// blip and the slot is kept until the ceiling.
 func (p *Pool) reapBusyWorkers(ctx context.Context) {
 	candidates := p.busyCandidates()
 	options := p.optionsSnapshot()
@@ -41,8 +49,12 @@ func (p *Pool) reapBusyWorkers(ctx context.Context) {
 	for _, candidate := range candidates {
 		bindAge := candidate.now.Sub(candidate.boundAt)
 		pastMaxBind := options.MaxBind > 0 && bindAge >= options.MaxBind
+		if pastMaxBind {
+			p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, reapPastMaxBindMessage)
+			continue
+		}
 		pastPickupTimeout := options.PickupTimeout > 0 && bindAge >= options.PickupTimeout
-		if !pastMaxBind && !pastPickupTimeout {
+		if !pastPickupTimeout {
 			continue
 		}
 		probe, ok := probes[candidate.vm.Name]
@@ -52,21 +64,13 @@ func (p *Pool) reapBusyWorkers(ctx context.Context) {
 			probes[candidate.vm.Name] = probe
 		}
 		if probe.err != nil {
-			p.handleRunningProbeError(ctx, candidate, bindAge, pastMaxBind, probe.err)
+			slog.WarnContext(ctx, "runnerpool running slots probe failed", "err", probe.err, "vm", candidate.vm.Name, "slot", candidate.slotIndex)
 			continue
 		}
 		if !probe.running[candidate.slotIndex] {
-			p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, "runnerpool reaping worker (no active job process)")
+			p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, reapNoActiveJobMessage)
 		}
 	}
-}
-
-func (p *Pool) handleRunningProbeError(ctx context.Context, candidate busyCandidate, bindAge time.Duration, pastMaxBind bool, err error) {
-	slog.WarnContext(ctx, "runnerpool running slots probe failed", "err", err, "vm", candidate.vm.Name, "slot", candidate.slotIndex)
-	if !pastMaxBind {
-		return
-	}
-	p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, "runnerpool reaping worker (probe error past max_bind)")
 }
 
 func (p *Pool) warnAndRequestBusyRecycle(ctx context.Context, candidate busyCandidate, bindAge time.Duration, message string) {

@@ -1006,16 +1006,19 @@ func TestReconcileReapsBusyWorkerAfterPickupTimeoutWithoutRunningExecution(t *te
 	}
 }
 
-func TestReconcileKeepsBusyWorkerWithRunningExecution(t *testing.T) {
+func TestReconcileReapsRunningSlotPastMaxBind(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	clock := newMutableClock(now)
 	options := testOptions(clock, 1)
 	options.PickupTimeout = time.Minute
 	options.MaxBind = 2 * time.Minute
 	prober := newFakeSlotProber()
+	// The guest still reports the execution running, but MaxBind is an absolute
+	// ceiling, so a hung-but-alive runner past MaxBind is reaped anyway.
 	prober.SetRunning("vm-busy", 0, true)
 	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
 	cancelCount := 0
+	logs := captureTestLogs(t)
 
 	pool.mu.Lock()
 	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.MaxBind-time.Second), 0, 42, func(error) {
@@ -1028,8 +1031,45 @@ func TestReconcileKeepsBusyWorkerWithRunningExecution(t *testing.T) {
 	}
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
+	if !pool.states[0].recycle {
+		t.Fatal("running slot past max bind recycle = false, want true (absolute ceiling)")
+	}
+	if cancelCount != 1 {
+		t.Fatalf("cancel count = %d, want 1", cancelCount)
+	}
+	if !strings.Contains(logs.String(), "runnerpool reaping worker (past max_bind ceiling)") {
+		t.Fatalf("logs = %q, want past max_bind ceiling reap warning", logs.String())
+	}
+	// Past MaxBind reaps before probing, so no Reattach call is made.
+	if calls := prober.Calls(); len(calls) != 0 {
+		t.Fatalf("prober calls = %v, want none (ceiling reaps before probing)", calls)
+	}
+}
+
+func TestReconcileKeepsRunningSlotWithinMaxBind(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	prober := newFakeSlotProber()
+	prober.SetRunning("vm-busy", 0, true)
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func(error) {
+		cancelCount++
+	})
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
 	if pool.states[0].recycle {
-		t.Fatal("busy worker recycle = true, want false while running past max bind")
+		t.Fatal("running slot within max bind recycle = true, want false")
 	}
 	if cancelCount != 0 {
 		t.Fatalf("cancel count = %d, want 0", cancelCount)
@@ -1041,7 +1081,7 @@ func TestReconcileReapsOneExpiredSlotWithoutStoppingCotenant(t *testing.T) {
 	clock := newMutableClock(now)
 	options := testOptionsWithSlots(clock, 1, 2)
 	options.PickupTimeout = time.Minute
-	options.MaxBind = 2 * time.Minute
+	options.MaxBind = time.Hour
 	warmer := newFakeWarmer()
 	runner := newBlockingRunner(2)
 	prober := newFakeSlotProber()
@@ -1060,12 +1100,15 @@ func TestReconcileReapsOneExpiredSlotWithoutStoppingCotenant(t *testing.T) {
 	if first.SlotIndex == second.SlotIndex {
 		t.Fatalf("jobs used slot %d twice, want distinct slots", first.SlotIndex)
 	}
+	// Both slots are past the pickup timeout but within MaxBind, so the reap is
+	// decided by the running probe: the expired slot is not running, the cotenant
+	// is. Both share one VM, so RunningSlots is read once.
 	prober.SetRunning(first.VMName, first.SlotIndex, false)
 	prober.SetRunning(first.VMName, second.SlotIndex, true)
 
 	pool.mu.Lock()
-	pool.states[0].slots[first.SlotIndex].boundAt = now.Add(-options.MaxBind - time.Second)
-	pool.states[0].slots[second.SlotIndex].boundAt = now.Add(-30 * time.Second)
+	pool.states[0].slots[first.SlotIndex].boundAt = now.Add(-options.PickupTimeout - time.Second)
+	pool.states[0].slots[second.SlotIndex].boundAt = now.Add(-options.PickupTimeout - time.Second)
 	pool.mu.Unlock()
 
 	if err := pool.Reconcile(ctx); err != nil {
@@ -1082,7 +1125,7 @@ func TestReconcileReapsOneExpiredSlotWithoutStoppingCotenant(t *testing.T) {
 	runner.Release()
 }
 
-func TestReconcileReapsBusyWorkerPastMaxBindWhenProbeErrors(t *testing.T) {
+func TestReconcileReapsPastMaxBindEvenWhenProbeWouldError(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	clock := newMutableClock(now)
 	options := testOptions(clock, 1)
@@ -1106,13 +1149,17 @@ func TestReconcileReapsBusyWorkerPastMaxBindWhenProbeErrors(t *testing.T) {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 	if !pool.states[0].recycle {
-		t.Fatal("busy worker recycle = false, want true on probe error past max bind")
+		t.Fatal("busy worker recycle = false, want true past max bind ceiling")
 	}
 	if cancelCount != 1 {
 		t.Fatalf("cancel count = %d, want 1", cancelCount)
 	}
-	if !strings.Contains(logs.String(), "runnerpool reaping worker (probe error past max_bind)") {
-		t.Fatalf("logs = %q, want probe error reap warning", logs.String())
+	if !strings.Contains(logs.String(), "runnerpool reaping worker (past max_bind ceiling)") {
+		t.Fatalf("logs = %q, want past max_bind ceiling reap warning", logs.String())
+	}
+	// The ceiling reaps before any probe, so the unreachable guest is never called.
+	if calls := prober.Calls(); len(calls) != 0 {
+		t.Fatalf("prober calls = %v, want none past the ceiling", calls)
 	}
 }
 
