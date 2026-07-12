@@ -14,11 +14,10 @@ type Sampler struct {
 	inventory func(context.Context) Inventory
 	now       func() time.Time // clock seam; main injects time.Now, tests inject a fake
 
-	mu        sync.Mutex
-	latest    Sample
-	hasLatest bool
-	enabled   bool
-	interval  time.Duration
+	mu       sync.Mutex
+	latest   Sample
+	enabled  bool
+	interval time.Duration
 }
 
 // New returns a Sampler that reads host stats through reader and pool counts
@@ -61,10 +60,11 @@ func (s *Sampler) currentInterval() time.Duration {
 }
 
 // sampleOnce performs a single observation. When the sampler is disabled it
-// returns immediately without touching latest and without logging. On a
-// Reader error it logs a warning and leaves the last good Sample in place
-// rather than overwriting it with a partial or zero one, so Latest() never
-// regresses to stale-but-wrong data because of a transient read failure.
+// returns immediately without touching latest. On a Reader error it leaves the
+// last good Sample in place rather than overwriting it with a partial or zero
+// one, so Latest() never regresses to stale-but-wrong data because of a
+// transient read failure. The Reader logs which read failed, so sampleOnce
+// does not log the error again.
 func (s *Sampler) sampleOnce(ctx context.Context) {
 	s.mu.Lock()
 	enabled := s.enabled
@@ -75,7 +75,6 @@ func (s *Sampler) sampleOnce(ctx context.Context) {
 
 	h, err := s.reader.Read(ctx)
 	if err != nil {
-		slog.WarnContext(ctx, "host stats read failed; keeping last sample", "err", err)
 		return
 	}
 	inv := s.inventory(ctx)
@@ -83,7 +82,6 @@ func (s *Sampler) sampleOnce(ctx context.Context) {
 
 	s.mu.Lock()
 	s.latest = sample
-	s.hasLatest = true
 	s.mu.Unlock()
 
 	slog.InfoContext(ctx, "host stats sampled",
@@ -99,10 +97,25 @@ func (s *Sampler) sampleOnce(ctx context.Context) {
 	)
 }
 
+// sampleOnceSafe runs sampleOnce and recovers from a panic so one bad
+// observation, such as a gopsutil panic, logs and is skipped rather than
+// killing the sampler goroutine for the life of the daemon.
+func (s *Sampler) sampleOnceSafe(ctx context.Context) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.ErrorContext(ctx, "host stats sample panic recovered; skipping this observation", "err", recovered)
+		}
+	}()
+	s.sampleOnce(ctx)
+}
+
 // Start launches the sampler's ticker goroutine: an immediate first pass,
-// then one sampleOnce per interval until ctx is done. The interval is read
-// fresh on each iteration so a concurrent Reconfigure takes effect without
-// restarting the loop.
+// then one sample per interval until ctx is done. Each observation runs
+// through sampleOnceSafe, so a panic in one sample is logged and skipped and
+// the loop keeps sampling. The goroutine also carries a top-level recover as a
+// backstop for a panic outside the sample path. The interval is read fresh on
+// each iteration so a concurrent Reconfigure takes effect without restarting
+// the loop.
 func (s *Sampler) Start(ctx context.Context) {
 	go func() {
 		defer func() {
@@ -110,7 +123,7 @@ func (s *Sampler) Start(ctx context.Context) {
 				slog.ErrorContext(ctx, "host stats sampler goroutine panic recovered", "err", recovered)
 			}
 		}()
-		s.sampleOnce(ctx)
+		s.sampleOnceSafe(ctx)
 		timer := time.NewTimer(s.currentInterval())
 		defer timer.Stop()
 		for {
@@ -118,7 +131,7 @@ func (s *Sampler) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-timer.C:
-				s.sampleOnce(ctx)
+				s.sampleOnceSafe(ctx)
 				timer.Reset(s.currentInterval())
 			}
 		}

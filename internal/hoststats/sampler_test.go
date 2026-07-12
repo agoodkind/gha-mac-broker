@@ -102,13 +102,13 @@ func TestSamplerSampleOnceReadErrorPreservesLatest(t *testing.T) {
 	}
 }
 
-func TestSamplerSampleOnceReadErrorBeforeAnySampleLeavesHasLatestFalse(t *testing.T) {
+func TestSamplerSampleOnceReadErrorBeforeAnySampleLeavesLatestZero(t *testing.T) {
 	reader := &fakeReader{err: errors.New("boom")}
 	s := New(reader, fakeInventory(Inventory{}), fakeNow(time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)), Options{Enabled: true, Interval: time.Second})
 
 	s.sampleOnce(context.Background())
 
-	if s.hasLatest {
-		t.Fatalf("hasLatest = true after a failed first sample, want false")
+	if got := s.Latest(); got != (Sample{}) {
+		t.Fatalf("Latest() after a failed first sample = %+v, want zero Sample", got)
 	}
 }

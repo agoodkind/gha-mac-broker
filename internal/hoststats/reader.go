@@ -39,31 +39,31 @@ func (r gopsutilReader) Read(ctx context.Context) (Host, error) {
 
 	loadStat, err := load.AvgWithContext(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, "hoststats: read load average failed", "err", err)
+		slog.WarnContext(ctx, "hoststats: read load average failed", "err", err)
 		return Host{}, fmt.Errorf("hoststats: read load average: %w", err)
 	}
 
 	virtualMem, err := mem.VirtualMemoryWithContext(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, "hoststats: read virtual memory failed", "err", err)
+		slog.WarnContext(ctx, "hoststats: read virtual memory failed", "err", err)
 		return Host{}, fmt.Errorf("hoststats: read virtual memory: %w", err)
 	}
 
 	swapMem, err := mem.SwapMemoryWithContext(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, "hoststats: read swap memory failed", "err", err)
+		slog.WarnContext(ctx, "hoststats: read swap memory failed", "err", err)
 		return Host{}, fmt.Errorf("hoststats: read swap memory: %w", err)
 	}
 
 	diskUsage, err := disk.UsageWithContext(ctx, r.diskPath)
 	if err != nil {
-		slog.ErrorContext(ctx, "hoststats: read disk usage failed", "err", err)
+		slog.WarnContext(ctx, "hoststats: read disk usage failed", "err", err)
 		return Host{}, fmt.Errorf("hoststats: read disk usage: %w", err)
 	}
 
 	hostInfo, err := host.InfoWithContext(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, "hoststats: read host info failed", "err", err)
+		slog.WarnContext(ctx, "hoststats: read host info failed", "err", err)
 		return Host{}, fmt.Errorf("hoststats: read host info: %w", err)
 	}
 
@@ -101,11 +101,11 @@ func (r gopsutilReader) Read(ctx context.Context) (Host, error) {
 func (r gopsutilReader) readCPUPercents(ctx context.Context) (userPct, sysPct, idlePct float64, err error) {
 	before, err := cpu.TimesWithContext(ctx, false)
 	if err != nil {
-		slog.ErrorContext(ctx, "hoststats: read cpu times failed", "err", err)
+		slog.WarnContext(ctx, "hoststats: read cpu times failed", "err", err)
 		return 0, 0, 0, fmt.Errorf("hoststats: read cpu times: %w", err)
 	}
 	if len(before) == 0 {
-		slog.ErrorContext(ctx, "hoststats: read cpu times failed", "err", "no cpu stats returned")
+		slog.WarnContext(ctx, "hoststats: read cpu times failed", "err", "no cpu stats returned")
 		return 0, 0, 0, fmt.Errorf("hoststats: read cpu times: no cpu stats returned")
 	}
 
@@ -113,18 +113,18 @@ func (r gopsutilReader) readCPUPercents(ctx context.Context) (userPct, sysPct, i
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		slog.ErrorContext(ctx, "hoststats: read cpu times failed", "err", ctx.Err())
+		slog.WarnContext(ctx, "hoststats: read cpu times failed", "err", ctx.Err())
 		return 0, 0, 0, fmt.Errorf("hoststats: read cpu times: %w", ctx.Err())
 	case <-timer.C:
 	}
 
 	after, err := cpu.TimesWithContext(ctx, false)
 	if err != nil {
-		slog.ErrorContext(ctx, "hoststats: read cpu times failed", "err", err)
+		slog.WarnContext(ctx, "hoststats: read cpu times failed", "err", err)
 		return 0, 0, 0, fmt.Errorf("hoststats: read cpu times: %w", err)
 	}
 	if len(after) == 0 {
-		slog.ErrorContext(ctx, "hoststats: read cpu times failed", "err", "no cpu stats returned")
+		slog.WarnContext(ctx, "hoststats: read cpu times failed", "err", "no cpu stats returned")
 		return 0, 0, 0, fmt.Errorf("hoststats: read cpu times: no cpu stats returned")
 	}
 
