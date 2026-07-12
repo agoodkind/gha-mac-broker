@@ -8,11 +8,14 @@
 //	version            print version and exit
 //	jitconfig          mint a repo-scoped JIT runner config (proves App auth)
 //	bind               clone a warm VM, run one ephemeral job, tear it down
-//	serve              run the HTTP daemon with warm pool and webhook handler
+//	serve              run the single-process HTTP daemon (no supervisor)
+//	supervisor         run the durable host supervisor owning the listener and worker lifecycle
+//	worker             run one swappable host worker generation (supervisor spawns it)
 //	status             print the daemon pool status JSON
 //	install            scaffold config and secrets, build golden, install the service
 //	uninstall          remove the installed service unit
 //	update             check, apply, or show release update state
+//	deploy             pick and apply the least-destructive reconcile action
 //	guest-agent        alias that runs the guest supervisor
 //	guest-supervisor   run the durable guest-side supervisor of runner processes
 //	guest-worker       run one swappable guest-worker generation (supervisor spawns it)
@@ -32,12 +35,10 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"goodkind.io/gha-mac-broker/internal/broker"
@@ -48,7 +49,6 @@ import (
 	"goodkind.io/gha-mac-broker/internal/hostedload"
 	"goodkind.io/gha-mac-broker/internal/install"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
-	"goodkind.io/gha-mac-broker/internal/server"
 	"goodkind.io/gha-mac-broker/internal/skopeo"
 	"goodkind.io/gha-mac-broker/internal/tart"
 	"goodkind.io/gha-mac-broker/internal/updateopts"
@@ -64,11 +64,14 @@ const (
 	commandJITConfig   commandName = "jitconfig"
 	commandBind        commandName = "bind"
 	commandServe       commandName = "serve"
+	commandSupervisor  commandName = "supervisor"
+	commandWorker      commandName = "worker"
 	commandStatus      commandName = "status"
 	commandBuildGolden commandName = "build-golden"
 	commandInstall     commandName = "install"
 	commandUninstall   commandName = "uninstall"
 	commandUpdate      commandName = "update"
+	commandDeploy      commandName = "deploy"
 	commandGuestAgent  commandName = "guest-agent"
 	commandGuestSuper  commandName = "guest-supervisor"
 	commandGuestWorker commandName = "guest-worker"
@@ -90,12 +93,6 @@ const httpTimeout = 30 * time.Second
 
 // shutdownTimeout bounds the graceful HTTP shutdown.
 const shutdownTimeout = 30 * time.Second
-
-// webhookWriteTimeout caps the total per-connection handler time. A Lease
-// call can block until a warming VM is ready (up to 90 s per broker.Warm);
-// 120 s covers one full boot cycle plus processing headroom so a stuck lease
-// cannot pin a connection open indefinitely.
-const webhookWriteTimeout = 120 * time.Second
 
 var (
 	checkUpdate            = selfupdate.Check
@@ -129,6 +126,10 @@ func main() {
 		err = runBind(ctx, args)
 	case commandServe:
 		err = runServe(ctx, args)
+	case commandSupervisor:
+		err = runSupervisor(ctx, args)
+	case commandWorker:
+		err = runWorker(ctx, args)
 	case commandStatus:
 		err = runStatus(ctx, args)
 	case commandBuildGolden:
@@ -139,6 +140,8 @@ func main() {
 		err = runUninstall(ctx, args)
 	case commandUpdate:
 		err = runUpdate(ctx, args)
+	case commandDeploy:
+		err = runDeploy(ctx, args)
 	case commandGuestAgent:
 		err = runGuestAgent(ctx, args)
 	case commandGuestSuper:
@@ -158,7 +161,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|status|build-golden|install|uninstall|update|guest-agent|guest-supervisor|guest-worker|golden-provision> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|supervisor|status|build-golden|install|uninstall|update|deploy|guest-agent|guest-supervisor|guest-worker|golden-provision> [flags]")
 }
 
 func writeUserLine(writer io.Writer, line string) {
@@ -304,9 +307,9 @@ func runUpdateApply(ctx context.Context, args []string, stdout io.Writer, stderr
 		writeUserLine(stdout, "gha-mac-broker: update available but not applied")
 		return nil
 	}
-	restarted, err := restartManagedService(ctx)
+	restarted, err := reloadOrRestart(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, "update apply service restart failed", "err", err)
+		slog.ErrorContext(ctx, "update apply service reconcile failed", "err", err)
 		return fmt.Errorf("update apply restart: %w", err)
 	}
 	if restarted {
@@ -694,108 +697,6 @@ func deleteStaleRunners(ctx context.Context, cfg *config.Config, cleaner staleRu
 	}
 }
 
-// runServe loads config, builds the pool and HTTP server,
-// starts the fill loop, and listens until SIGINT or SIGTERM triggers a
-// graceful shutdown.
-func runServe(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	configPath := fs.String("config", "", "path to broker config TOML (default: XDG path)")
-	if err := fs.Parse(args); err != nil {
-		slog.ErrorContext(ctx, "serve flag parse failed", "err", err)
-		return fmt.Errorf("serve flags: %w", err)
-	}
-	if *configPath == "" {
-		*configPath = config.DefaultConfigPath()
-	}
-
-	initialConfigModTime := configInitialModTime(ctx, *configPath)
-
-	cfg, gh, err := loadDeps(ctx, *configPath)
-	if err != nil {
-		return err
-	}
-
-	secret, err := cfg.ReadWebhookSecret()
-	if err != nil {
-		slog.ErrorContext(ctx, "read webhook secret failed", "err", err)
-		return fmt.Errorf("serve: read webhook secret: %w", err)
-	}
-
-	capacityToken, err := cfg.ReadCapacityToken()
-	if err != nil {
-		slog.ErrorContext(ctx, "read capacity token failed", "err", err)
-		return fmt.Errorf("serve: read capacity token: %w", err)
-	}
-
-	webhookCIDRs, err := cfg.ReadWebhookCIDRs()
-	if err != nil {
-		slog.ErrorContext(ctx, "read webhook CIDRs failed", "err", err)
-		return fmt.Errorf("serve: read webhook CIDRs: %w", err)
-	}
-
-	v := tart.New(cfg.Tart.Binary)
-	binder := broker.New(cfg, gh, v)
-
-	p, err := newRunnerPool(ctx, cfg, binder, gh)
-	if err != nil {
-		return err
-	}
-	hostedTracker := hostedload.NewTracker()
-	sampler := newHostStatsSampler(cfg, p)
-	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, hostedTracker, sampler)
-
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	startServeLoops(ctx, stop, cfg, gh, p)
-	startBrokerConfigReloadWatcher(ctx, *configPath, initialConfigModTime, binder, p, srv, sampler)
-	startHostedLoadReconcile(ctx, gh, hostedTracker, cfg.Labels)
-	sampler.Start(ctx)
-
-	httpSrv := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           srv,
-		ReadHeaderTimeout: httpTimeout,
-		ReadTimeout:       httpTimeout,
-		WriteTimeout:      webhookWriteTimeout,
-	}
-
-	errCh := make(chan error, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "server goroutine panic recovered", "err", fmt.Errorf("panic: %v", r))
-				errCh <- fmt.Errorf("serve: panic: %v", r)
-			}
-		}()
-		slog.InfoContext(ctx, "server listening", "addr", cfg.ListenAddr)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.ErrorContext(ctx, "server error", "err", err)
-			errCh <- fmt.Errorf("serve: listen: %w", err)
-			return
-		}
-		errCh <- nil
-	}()
-
-	select {
-	case <-ctx.Done():
-		slog.InfoContext(ctx, "shutting down", "reason", ctx.Err())
-	case err := <-errCh:
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-
-	shutCtx, shutCancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
-	defer shutCancel()
-	if err := httpSrv.Shutdown(shutCtx); err != nil {
-		slog.WarnContext(shutCtx, "http shutdown error", "err", err)
-	}
-	p.Shutdown(shutCtx)
-	return nil
-}
-
 type runnerPoolBinder interface {
 	runnerpool.Warmer
 	runnerpool.Runner
@@ -843,11 +744,11 @@ func newRunToken(ctx context.Context) (string, error) {
 	return time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:]), nil
 }
 
-func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, p *runnerpool.Pool) {
+func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, p *runnerpool.Pool, onReconcile func()) {
 	startUpdateSchedulerInBackground(ctx, stop, slog.Default())
 	deleteStaleRunners(ctx, cfg, cleaner)
 	p.Start(ctx)
-	p.StartReconcile(ctx, 0)
+	p.StartReconcile(ctx, 0, onReconcile)
 }
 
 // hostedLoadReconcileInterval is how often the in-progress hosted-macOS job
