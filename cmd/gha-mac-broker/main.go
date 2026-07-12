@@ -43,6 +43,7 @@ import (
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/hostedload"
+	"goodkind.io/gha-mac-broker/internal/hoststats"
 	"goodkind.io/gha-mac-broker/internal/install"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
 	"goodkind.io/gha-mac-broker/internal/server"
@@ -728,20 +729,16 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 	hostedTracker := hostedload.NewTracker()
-	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, hostedTracker, nil)
+	sampler := newHostStatsSampler(cfg, p)
+	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, hostedTracker, sampler)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	startServeLoops(ctx, stop, cfg, gh, p)
-	startConfigReloadWatcher(ctx, configReloadWatcherOptions{
-		path:           *configPath,
-		initialModTime: initialConfigModTime,
-		apply: func(reloadCtx context.Context, reloadedConfig *config.Config) error {
-			return applyReloadedConfig(reloadCtx, reloadedConfig, binder, p, srv)
-		},
-	})
+	startBrokerConfigReloadWatcher(ctx, *configPath, initialConfigModTime, binder, p, srv, sampler)
 	startHostedLoadReconcile(ctx, gh, hostedTracker, cfg.Labels)
+	sampler.Start(ctx)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -827,7 +824,45 @@ func configInitialModTime(ctx context.Context, path string) time.Time {
 	return info.ModTime()
 }
 
-func applyReloadedConfig(ctx context.Context, cfg *config.Config, binder *broker.Binder, p *runnerpool.Pool, srv *server.Server) error {
+// metricsOptions derives hoststats.Options from the config's Metrics block.
+func metricsOptions(cfg *config.Config) hoststats.Options {
+	return hoststats.Options{
+		Enabled:  cfg.Metrics.Enabled != nil && *cfg.Metrics.Enabled,
+		Interval: time.Duration(cfg.Metrics.Interval),
+	}
+}
+
+// newHostStatsSampler builds the host-stats sampler that reads real host
+// metrics through gopsutil and correlates them with p's pool inventory. The
+// caller starts its loop with Sampler.Start and applies config reloads with
+// Sampler.Reconfigure.
+func newHostStatsSampler(cfg *config.Config, p *runnerpool.Pool) *hoststats.Sampler {
+	reader := hoststats.NewGopsutilReader(cfg.Metrics.DiskPath)
+	inventory := func(ctx context.Context) hoststats.Inventory {
+		snap, _ := p.Status(ctx)
+		return hoststats.Inventory{
+			RunnerCount: snap.RunnerCount,
+			Idle:        snap.Idle,
+			Busy:        snap.Busy,
+			Queued:      snap.Queued,
+		}
+	}
+	return hoststats.New(reader, inventory, time.Now, metricsOptions(cfg))
+}
+
+// startBrokerConfigReloadWatcher starts the config-file poll-watcher and wires
+// its apply callback to applyReloadedConfig with the daemon's live components.
+func startBrokerConfigReloadWatcher(ctx context.Context, configPath string, initialModTime time.Time, binder *broker.Binder, p *runnerpool.Pool, srv *server.Server, sampler *hoststats.Sampler) {
+	startConfigReloadWatcher(ctx, configReloadWatcherOptions{
+		path:           configPath,
+		initialModTime: initialModTime,
+		apply: func(reloadCtx context.Context, reloadedConfig *config.Config) error {
+			return applyReloadedConfig(reloadCtx, reloadedConfig, binder, p, srv, sampler)
+		},
+	})
+}
+
+func applyReloadedConfig(ctx context.Context, cfg *config.Config, binder *broker.Binder, p *runnerpool.Pool, srv *server.Server, sampler *hoststats.Sampler) error {
 	secret, err := cfg.ReadWebhookSecret()
 	if err != nil {
 		slog.ErrorContext(ctx, "config reload read webhook secret failed", "err", err)
@@ -846,6 +881,7 @@ func applyReloadedConfig(ctx context.Context, cfg *config.Config, binder *broker
 	binder.Reconfigure(cfg)
 	p.Reconfigure(runnerPoolOptionsFromConfig(cfg, "", nil))
 	srv.Reconfigure(secret, cfg, capacityToken, webhookCIDRs)
+	sampler.Reconfigure(metricsOptions(cfg))
 	appliedRunnerCount := p.Snapshot().RunnerCount
 	if cfg.RunnerCount != appliedRunnerCount {
 		slog.InfoContext(
