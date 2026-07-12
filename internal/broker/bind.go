@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +28,6 @@ import (
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
-	"goodkind.io/gha-mac-broker/internal/guestsupervisor"
 	"goodkind.io/gha-mac-broker/internal/tart"
 )
 
@@ -44,9 +42,10 @@ const readinessInterval = 2 * time.Second
 // over the tart-exec channel. The guest watchdog's stale timeout must exceed it.
 const touchInterval = 10 * time.Second
 
-// checkAliveTimeout bounds a warm VM liveness probe and one Reattach reconcile
-// call, so one wedged guest cannot park the whole pass.
-const checkAliveTimeout = 15 * time.Second
+// checkAliveTimeout bounds a warm VM liveness probe, one Reattach reconcile
+// call, and each adoption Reattach, so one wedged guest cannot park the whole
+// pass or block startup adoption. It is a var so tests can shorten it.
+var checkAliveTimeout = 15 * time.Second
 
 // drainTimeout bounds the best-effort guest Drain before a VM teardown and the
 // recycle/cancel teardown drain, so a dead or unreachable VM cannot spin either
@@ -220,7 +219,15 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 	vm := &WarmVM{Name: vmName, Image: image, boot: bootCmd, stopTouch: nil, guestMu: sync.Mutex{}, guestAddr: "", guestConn: nil}
 	// Confirm the guest agent is up and cache its endpoint before serving. This
 	// replaces the old post-boot runner-slot clone as the readiness gate.
-	if _, err := b.guestFor(ctx, vm); err != nil {
+	client, err := b.guestFor(ctx, vm)
+	if err != nil {
+		_ = bootCmd.Process.Kill()
+		b.teardown(ctx, vmName)
+		return nil, err
+	}
+	// Reject a guest that advertises fewer slots than configured, so a later
+	// RunJob never targets a slot the guest does not have.
+	if err := b.verifySlotInventory(ctx, client, vmName, slotCount); err != nil {
 		_ = bootCmd.Process.Kill()
 		b.teardown(ctx, vmName)
 		return nil, err
@@ -228,6 +235,22 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 
 	vm.stopTouch = b.startTouchLoop(ctx, vmName)
 	return vm, nil
+}
+
+// verifySlotInventory rejects a guest whose advertised slot inventory does not
+// cover the configured slot count, so slots 0..slotCount-1 all exist before the
+// VM serves or is adopted.
+func (b *Binder) verifySlotInventory(ctx context.Context, client guestConn, vmName string, slotCount int) error {
+	response, err := client.Hello(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "slot inventory hello failed", "err", err, "vm", vmName)
+		return fmt.Errorf("broker: slot inventory hello on %s: %w", vmName, err)
+	}
+	if len(response.GetSlots()) < slotCount {
+		slog.WarnContext(ctx, "guest advertises too few slots", "vm", vmName, "advertised", len(response.GetSlots()), "want", slotCount)
+		return fmt.Errorf("broker: guest %s advertises %d slots, want at least %d", vmName, len(response.GetSlots()), slotCount)
+	}
+	return nil
 }
 
 func (b *Binder) reapBootCommand(ctx context.Context, vmName string, bootCmd *exec.Cmd) <-chan struct{} {
@@ -649,6 +672,7 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 	}
 	busyCandidates := make([]adoptionCandidate, 0, len(names))
 	idleCandidates := make([]adoptionCandidate, 0, len(names))
+	normalizedSlotCount := normalizeSlotCount(slotCount)
 	for _, name := range names {
 		vm := &WarmVM{Name: name, Image: image, boot: nil, stopTouch: nil, guestMu: sync.Mutex{}, guestAddr: "", guestConn: nil}
 		client, err := b.guestFor(ctx, vm)
@@ -656,14 +680,22 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 			slog.WarnContext(ctx, "skip running vm adoption after guest resolve failure", "err", err, "vm", name)
 			continue
 		}
-		response, err := client.Reattach(ctx)
+		if err := b.verifySlotInventory(ctx, client, name, normalizedSlotCount); err != nil {
+			slog.WarnContext(ctx, "skip running vm adoption after slot inventory check", "err", err, "vm", name)
+			continue
+		}
+		// Bound each adoption Reattach so one unresponsive VM cannot block startup
+		// adoption and every following candidate indefinitely.
+		reattachCtx, cancelReattach := context.WithTimeout(ctx, checkAliveTimeout)
+		response, err := client.Reattach(reattachCtx)
+		cancelReattach()
 		if err != nil {
 			slog.WarnContext(ctx, "skip running vm adoption after reattach failure", "err", err, "vm", name)
 			continue
 		}
 		candidate := adoptionCandidate{
 			vm:    vm,
-			slots: reattachSlots(response, normalizeSlotCount(slotCount)),
+			slots: reattachSlots(response, normalizedSlotCount),
 		}
 		if len(candidate.slots) > 0 {
 			busyCandidates = append(busyCandidates, candidate)
@@ -832,89 +864,6 @@ func (b *Binder) generateJIT(ctx context.Context, owner, repoName, runnerName st
 		return nil, fmt.Errorf("broker: generate jitconfig: %w", err)
 	}
 	return jit, nil
-}
-
-// resolveGuest resolves and caches a VM's guest-agent client. It resolves the
-// NAT IP, reads the per-boot token over the tart-exec control channel, dials the
-// agent, and confirms Hello answers with a compatible protocol before caching.
-func (b *Binder) resolveGuest(ctx context.Context, vm *WarmVM) (guestConn, error) {
-	// Hold the per-VM lock across the whole resolution, so concurrent callers for
-	// the same VM dial exactly once: the first resolves and caches, the rest see
-	// the cache. Resolution runs single threaded in Warm and Adopt before the VM
-	// is served, so the hot path always hits the cache and never blocks here.
-	vm.guestMu.Lock()
-	defer vm.guestMu.Unlock()
-	if vm.guestConn != nil {
-		return vm.guestConn, nil
-	}
-
-	ip, err := b.vm.IP(ctx, vm.Name)
-	if err != nil {
-		slog.WarnContext(ctx, "resolve guest ip failed", "err", err, "vm", vm.Name)
-		return nil, fmt.Errorf("broker: resolve guest ip for %s: %w", vm.Name, err)
-	}
-	address := net.JoinHostPort(ip, guestAgentPort)
-	token, err := b.readGuestToken(ctx, vm.Name)
-	if err != nil {
-		return nil, err
-	}
-	client := b.dialGuest(ctx, address, token)
-	if err := b.waitForGuestHello(ctx, client, vm.Name); err != nil {
-		return nil, err
-	}
-
-	vm.guestAddr = address
-	vm.guestConn = client
-	return vm.guestConn, nil
-}
-
-// readGuestToken reads the per-boot guest token file over the tart-exec channel,
-// retrying within the readiness window because the supervisor writes it shortly
-// after the vsock channel comes up.
-func (b *Binder) readGuestToken(ctx context.Context, vmName string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, readinessTimeout)
-	defer cancel()
-	ticker := time.NewTicker(readinessInterval)
-	defer ticker.Stop()
-	for {
-		out, err := b.vm.Exec(ctx, vmName, "cat", guestsupervisor.TokenPath)
-		if err == nil {
-			token := strings.TrimSpace(string(out))
-			if token != "" {
-				return token, nil
-			}
-		}
-		select {
-		case <-ctx.Done():
-			slog.ErrorContext(ctx, "timed out reading guest token", "err", ctx.Err(), "vm", vmName)
-			return "", fmt.Errorf("broker: read guest token for %s: %w", vmName, ctx.Err())
-		case <-ticker.C:
-		}
-	}
-}
-
-// waitForGuestHello polls the guest agent until Hello answers or the readiness
-// window elapses. A protocol mismatch is terminal and returns immediately.
-func (b *Binder) waitForGuestHello(ctx context.Context, client guestConn, vmName string) error {
-	ctx, cancel := context.WithTimeout(ctx, readinessTimeout)
-	defer cancel()
-	ticker := time.NewTicker(readinessInterval)
-	defer ticker.Stop()
-	for {
-		response, err := client.Hello(ctx)
-		if err == nil {
-			if response.GetProtocolMajor() != hostProtocolMajor {
-				return fmt.Errorf("broker: guest %s speaks protocol %d, want %d", vmName, response.GetProtocolMajor(), hostProtocolMajor)
-			}
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			slog.ErrorContext(ctx, "timed out waiting for guest hello", "err", ctx.Err(), "vm", vmName)
-			return fmt.Errorf("broker: waiting for guest hello on %s: %w", vmName, ctx.Err())
-		case <-ticker.C:
-		}
-	}
 }
 
 // waitForReady polls the guest vsock channel (`tart exec <vm> true`) until it

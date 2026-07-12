@@ -1046,6 +1046,34 @@ func TestReconcileReapsRunningSlotPastMaxBind(t *testing.T) {
 	}
 }
 
+func TestReconcileReapsPastMaxBindWithoutProber(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.MaxBind = 2 * time.Minute
+	// No prober: the absolute MaxBind ceiling must still be enforced.
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
+	cancelCount := 0
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.MaxBind-time.Second), 0, 42, func(error) {
+		cancelCount++
+	})
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if !pool.states[0].recycle {
+		t.Fatal("recycle = false, want true past max bind with a nil prober")
+	}
+	if cancelCount != 1 {
+		t.Fatalf("cancel count = %d, want 1", cancelCount)
+	}
+}
+
 func TestReconcileKeepsRunningSlotWithinMaxBind(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	clock := newMutableClock(now)
@@ -1333,6 +1361,46 @@ func TestStartReAdoptsAndResumesBusySlotAcrossRestart(t *testing.T) {
 		t.Fatalf("warm calls = %d, want 0 while adopted busy vm occupies the slot", got)
 	}
 	runner.Release()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	pool.Shutdown(shutdownCtx)
+}
+
+func TestResumeFailureRecyclesAdoptedVM(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	warmer := newFakeWarmer()
+	warmer.SetAdopted([]broker.AdoptedVM{
+		{
+			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+			Slots: []broker.SlotBinding{
+				{
+					SlotIndex:    0,
+					Repo:         "owner/repo",
+					JobID:        1001,
+					RunID:        42,
+					ExecutionID:  "owner/repo#42#1001",
+					ResumeCursor: 3,
+					BoundAt:      now.Add(-time.Minute),
+				},
+			},
+		},
+	})
+	runner := newFakeRunner(1)
+	runner.runErr = errors.New("resume could not attach")
+	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool.Start(ctx)
+
+	// Resume fails before draining, so the inherited execution may still run; the
+	// VM is recycled (torn down and re-warmed) rather than serving new work.
+	waitFor(t, func() bool { return len(warmer.TornNames()) == 1 })
+	if torn := warmer.TornNames(); torn[0] != "vm-busy" {
+		t.Fatalf("torn VMs = %v, want [vm-busy]", torn)
+	}
+	waitFor(t, func() bool { return len(warmer.WarmNames()) == 1 })
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	pool.Shutdown(shutdownCtx)

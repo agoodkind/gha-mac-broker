@@ -54,10 +54,15 @@ type stubGuest struct {
 	statusCalls   []uint64
 	reattach      *guestproto.ReattachResponse
 	reattachErr   error
+	reattachBlock bool
 	cancelErr     error
 	cancelCalls   []string
 	drainCalls    int
 }
+
+// defaultAdvertisedSlots is how many slots the stub's default Hello advertises,
+// enough to cover the slot counts used across the host-side tests.
+const defaultAdvertisedSlots = 4
 
 func (g *stubGuest) Hello(_ context.Context) (*guestproto.HelloResponse, error) {
 	if g.helloErr != nil {
@@ -66,7 +71,11 @@ func (g *stubGuest) Hello(_ context.Context) (*guestproto.HelloResponse, error) 
 	if g.hello != nil {
 		return g.hello, nil
 	}
-	return &guestproto.HelloResponse{ProtocolMajor: hostProtocolMajor}, nil
+	slots := make([]*guestproto.SlotInfo, defaultAdvertisedSlots)
+	for i := range slots {
+		slots[i] = &guestproto.SlotInfo{Index: uint32(i)} // #nosec G115 -- small loop index.
+	}
+	return &guestproto.HelloResponse{ProtocolMajor: hostProtocolMajor, Slots: slots}, nil
 }
 
 func (g *stubGuest) RunJob(_ context.Context, request *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error) {
@@ -90,7 +99,11 @@ func (g *stubGuest) JobStatus(_ context.Context, _ string, fromSequence uint64) 
 	return g.statusFactory[index](fromSequence)
 }
 
-func (g *stubGuest) Reattach(_ context.Context) (*guestproto.ReattachResponse, error) {
+func (g *stubGuest) Reattach(ctx context.Context) (*guestproto.ReattachResponse, error) {
+	if g.reattachBlock {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if g.reattachErr != nil {
 		return nil, g.reattachErr
 	}
@@ -429,6 +442,65 @@ func TestAdoptMarksRunningExecutionSlotBusyWithResumeCursor(t *testing.T) {
 	}
 	if !slot.ObservedActive {
 		t.Fatalf("adopted slot observed active = false, want true")
+	}
+}
+
+func TestAdoptRejectsGuestAdvertisingTooFewSlots(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	writeListOnlyFakeTart(t, bin, `[{"Name":"pool-a-thin","State":"running"}]`)
+
+	// The guest advertises a single slot, but the pool wants two.
+	guest := &stubGuest{
+		hello: &guestproto.HelloResponse{
+			ProtocolMajor: hostProtocolMajor,
+			Slots:         []*guestproto.SlotInfo{{Index: 0}},
+		},
+		reattach: &guestproto.ReattachResponse{},
+	}
+	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
+	binder := New(cfg, nil, tart.New(bin))
+	binder.guestFor = func(_ context.Context, _ *WarmVM) (guestConn, error) {
+		return guest, nil
+	}
+	adopted, err := binder.Adopt(context.Background(), "image-a", 2, 2)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if len(adopted) != 0 {
+		t.Fatalf("adopted = %+v, want none (guest advertises too few slots)", adopted)
+	}
+}
+
+func TestAdoptSkipsHungReattachWithinBound(t *testing.T) {
+	restore := checkAliveTimeout
+	checkAliveTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { checkAliveTimeout = restore })
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-tart")
+	writeListOnlyFakeTart(t, bin, `[{"Name":"pool-a-hung","State":"running"}]`)
+
+	guest := &stubGuest{reattachBlock: true}
+	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
+	binder := New(cfg, nil, tart.New(bin))
+	binder.guestFor = func(_ context.Context, _ *WarmVM) (guestConn, error) {
+		return guest, nil
+	}
+
+	done := make(chan struct{})
+	var adopted []AdoptedVM
+	go func() {
+		adopted, _ = binder.Adopt(context.Background(), "image-a", 1, 1)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Adopt did not return; adoption Reattach is unbounded")
+	}
+	if len(adopted) != 0 {
+		t.Fatalf("adopted = %+v, want none (hung VM skipped after bounded Reattach)", adopted)
 	}
 }
 

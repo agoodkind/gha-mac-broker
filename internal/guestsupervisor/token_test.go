@@ -45,6 +45,63 @@ func TestWriteTokenFileWritesPrivateFile(t *testing.T) {
 	}
 }
 
+func TestEnsureBootTokenReusesTokenAcrossProcessRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	first, err := EnsureBootToken("", path)
+	if err != nil {
+		t.Fatalf("first EnsureBootToken: %v", err)
+	}
+	if first == "" {
+		t.Fatal("first token = empty, want minted")
+	}
+	// A supervisor process restart within the same boot reads the same file.
+	second, err := EnsureBootToken("", path)
+	if err != nil {
+		t.Fatalf("second EnsureBootToken: %v", err)
+	}
+	if second != first {
+		t.Fatalf("token = %q, want reused %q across process restart", second, first)
+	}
+}
+
+func TestEnsureBootTokenPrefersEnvToken(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path, []byte("stale-token"), tokenFileMode); err != nil {
+		t.Fatalf("seed token file: %v", err)
+	}
+	token, err := EnsureBootToken("env-token", path)
+	if err != nil {
+		t.Fatalf("EnsureBootToken: %v", err)
+	}
+	if token != "env-token" {
+		t.Fatalf("token = %q, want env-token precedence", token)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read token file: %v", err)
+	}
+	if string(content) != "env-token" {
+		t.Fatalf("token file = %q, want env-token written", string(content))
+	}
+}
+
+func TestEnsureBootTokenMintsWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	token, err := EnsureBootToken("", path)
+	if err != nil {
+		t.Fatalf("EnsureBootToken: %v", err)
+	}
+	if token == "" {
+		t.Fatal("token = empty, want a minted token")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("token file not written: %v", err)
+	}
+}
+
 func TestWriteTokenFileTightensLooserExistingFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "token")

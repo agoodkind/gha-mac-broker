@@ -31,20 +31,15 @@ func runGuestSupervisor(ctx context.Context, args []string) error {
 		slog.ErrorContext(ctx, "guest-supervisor flag parse failed", "err", err)
 		return fmt.Errorf("guest-supervisor flags: %w", err)
 	}
-	// Mint a per-boot token when the env token is unset, so the golden's baked
-	// launchd unit (KeepAlive, no env token) boots cleanly instead of crashlooping.
-	// An env-provided token still wins for tests and dev. The host reads the file
-	// over the tart-exec control channel and dials the guest agent with it.
-	token := os.Getenv(guestAgentCredentialEnv)
-	if token == "" {
-		minted, err := guestsupervisor.MintToken()
-		if err != nil {
-			return fmt.Errorf("guest-supervisor mint token: %w", err)
-		}
-		token = minted
-	}
-	if err := guestsupervisor.WriteTokenFile(guestsupervisor.TokenPath, token); err != nil {
-		return fmt.Errorf("guest-supervisor write token: %w", err)
+	// Resolve the boot-scoped token: an env token wins, otherwise reuse an existing
+	// token file this boot or mint a fresh one. Reusing across process restarts
+	// keeps the credential stable so a KeepAlive respawn does not invalidate the
+	// token the broker cached. The golden's baked launchd unit (KeepAlive, no env
+	// token) boots cleanly instead of crashlooping. The host reads the file over
+	// the tart-exec control channel and dials the guest agent with it.
+	token, err := guestsupervisor.EnsureBootToken(os.Getenv(guestAgentCredentialEnv), guestsupervisor.TokenPath)
+	if err != nil {
+		return fmt.Errorf("guest-supervisor resolve token: %w", err)
 	}
 	if *slotCount == 0 {
 		return fmt.Errorf("guest-supervisor requires at least one slot")

@@ -42,15 +42,16 @@ type runningProbe struct {
 func (p *Pool) reapBusyWorkers(ctx context.Context) {
 	candidates := p.busyCandidates()
 	options := p.optionsSnapshot()
-	if p.prober == nil {
-		return
-	}
 	probes := make(map[string]runningProbe)
 	for _, candidate := range candidates {
 		bindAge := candidate.now.Sub(candidate.boundAt)
 		pastMaxBind := options.MaxBind > 0 && bindAge >= options.MaxBind
 		if pastMaxBind {
+			// The absolute MaxBind ceiling is enforced even without a prober.
 			p.warnAndRequestBusyRecycle(ctx, candidate, bindAge, reapPastMaxBindMessage)
+			continue
+		}
+		if p.prober == nil {
 			continue
 		}
 		pastPickupTimeout := options.PickupTimeout > 0 && bindAge >= options.PickupTimeout

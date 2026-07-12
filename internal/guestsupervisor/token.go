@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // TokenPath is the fixed 0600 file the guest-supervisor writes the per-boot
@@ -23,6 +24,42 @@ const tokenFileMode = 0o600
 
 // tokenEntropyBytes is the random length of a minted per-boot token.
 const tokenEntropyBytes = 32
+
+// EnsureBootToken resolves the boot-scoped bearer token and persists it at path,
+// returning the token. An env-provided token wins. Otherwise it reuses an
+// existing valid token at path, so a supervisor process restart within one boot
+// (a KeepAlive respawn or a crash) keeps the same credential the broker cached,
+// and only mints a fresh token on a genuinely fresh boot where path is absent.
+// The write stays atomic at 0600.
+func EnsureBootToken(envToken string, path string) (string, error) {
+	token := envToken
+	if token == "" {
+		if existing := readBootToken(path); existing != "" {
+			slog.Info("guest supervisor reusing boot token", "path", path)
+			token = existing
+		} else {
+			minted, err := MintToken()
+			if err != nil {
+				return "", err
+			}
+			token = minted
+		}
+	}
+	if err := WriteTokenFile(path, token); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// readBootToken returns a trimmed non-empty token from path, or "" when the file
+// is absent, unreadable, or empty.
+func readBootToken(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
 
 // MintToken returns a fresh random hex bearer token for one VM boot.
 func MintToken() (string, error) {
