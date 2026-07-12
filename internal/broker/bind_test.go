@@ -450,13 +450,6 @@ func TestAdoptMarksRunningExecutionSlotBusyWithResumeCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
-	t.Cleanup(func() {
-		for _, adoptedVM := range adopted {
-			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
-				adoptedVM.VM.stopTouch()
-			}
-		}
-	})
 	if len(adopted) != 1 {
 		t.Fatalf("adopted = %+v, want one busy VM", adopted)
 	}

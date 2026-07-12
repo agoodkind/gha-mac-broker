@@ -38,10 +38,6 @@ const readinessTimeout = 90 * time.Second
 // readinessInterval is the poll interval while waiting for readiness.
 const readinessInterval = 2 * time.Second
 
-// touchInterval is how often the broker refreshes each warm VM's liveness file
-// over the tart-exec channel. The guest watchdog's stale timeout must exceed it.
-const touchInterval = 10 * time.Second
-
 // checkAliveTimeout bounds a warm VM liveness probe, one Reattach reconcile
 // call, and each adoption Reattach, so one wedged guest cannot park the whole
 // pass or block startup adoption. It is a var so tests can shorten it.
@@ -55,10 +51,6 @@ var drainTimeout = 30 * time.Second
 // drainReconnectBackoff paces reconnect attempts when a status stream drops
 // before its terminal event.
 const drainReconnectBackoff = time.Second
-
-// heartbeatFile is the guest path the broker touches on a timer; the baked guest
-// watchdog logs when this file goes stale.
-const heartbeatFile = "/tmp/gha-broker.alive"
 
 // guestAgentPort is the fixed TCP port the guest agent listens on inside the VM.
 const guestAgentPort = "53931"
@@ -96,8 +88,6 @@ type WarmVM struct {
 	// Image is the approved Cirrus tag this VM was cloned for.
 	Image string
 	boot  *exec.Cmd
-	// stopTouch ends the per-VM liveness touch loop on teardown.
-	stopTouch context.CancelFunc
 	// guestMu guards the cached guest endpoint fields.
 	guestMu   sync.Mutex
 	guestAddr string
@@ -171,8 +161,8 @@ func (b *Binder) configSnapshot() *config.Config {
 }
 
 // Warm clones the golden image, boots the VM, waits for the tart-exec channel,
-// confirms the guest agent answers Hello (caching its endpoint), and starts the
-// liveness touch loop. On any failure it tears the partial VM down; the caller
+// confirms the guest agent answers Hello (caching its endpoint), and verifies
+// its slot inventory. On any failure it tears the partial VM down; the caller
 // owns teardown only on success.
 func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount int) (*WarmVM, error) {
 	slotCount = normalizeSlotCount(slotCount)
@@ -216,7 +206,7 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 		return nil, err
 	}
 
-	vm := &WarmVM{Name: vmName, Image: image, boot: bootCmd, stopTouch: nil, guestMu: sync.Mutex{}, guestAddr: "", guestConn: nil}
+	vm := &WarmVM{Name: vmName, Image: image, boot: bootCmd, guestMu: sync.Mutex{}, guestAddr: "", guestConn: nil}
 	// Confirm the guest agent is up and cache its endpoint before serving. This
 	// replaces the old post-boot runner-slot clone as the readiness gate.
 	client, err := b.guestFor(ctx, vm)
@@ -233,7 +223,6 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 		return nil, err
 	}
 
-	vm.stopTouch = b.startTouchLoop(ctx, vmName)
 	return vm, nil
 }
 
@@ -276,19 +265,6 @@ func (b *Binder) reapBootCommand(ctx context.Context, vmName string, bootCmd *ex
 		}
 	}()
 	return done
-}
-
-func (b *Binder) startTouchLoop(ctx context.Context, vmName string) context.CancelFunc {
-	touchCtx, stopTouch := context.WithCancel(context.WithoutCancel(ctx))
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.ErrorContext(touchCtx, "touch loop panic recovered", "err", fmt.Errorf("panic: %v", r), "vm", vmName)
-			}
-		}()
-		b.touchLoop(touchCtx, vmName)
-	}()
-	return stopTouch
 }
 
 // RunJob mints a JIT config and runs one ephemeral GitHub Actions job on the
@@ -592,13 +568,10 @@ func safeLogName(name string) string {
 	return replacer.Replace(name)
 }
 
-// Teardown stops the liveness touch loop, best-effort drains the guest agent so
-// in-flight executions get a chance to stop, kills the boot process if running,
-// then stops and deletes the VM. It is best effort; errors are logged at Warn.
+// Teardown best-effort drains the guest agent so in-flight executions get a
+// chance to stop, kills the boot process if running, then stops and deletes the
+// VM. It is best effort; errors are logged at Warn.
 func (b *Binder) Teardown(ctx context.Context, vm *WarmVM) {
-	if vm.stopTouch != nil {
-		vm.stopTouch()
-	}
 	if client, err := b.guestFor(context.WithoutCancel(ctx), vm); err == nil {
 		drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainTimeout)
 		if _, err := client.Drain(drainCtx); err != nil {
@@ -667,8 +640,8 @@ func (b *Binder) List(ctx context.Context) ([]string, error) {
 // Adopt discovers already-running pool VMs and returns the subset this broker
 // should manage. It resolves each VM's guest agent (skipping a VM whose agent is
 // dead or incompatible), reads its running executions via Reattach, and marks a
-// slot busy when a running execution names it. It starts heartbeat refreshes for
-// adopted VMs but does not clone, delete, or rewrite runner-slot directories.
+// slot busy when a running execution names it. It does not clone, delete, or
+// rewrite runner-slot directories.
 func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit int) ([]AdoptedVM, error) {
 	entries, err := b.vm.ListVMs(ctx)
 	if err != nil {
@@ -696,7 +669,7 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 	idleCandidates := make([]adoptionCandidate, 0, len(names))
 	normalizedSlotCount := normalizeSlotCount(slotCount)
 	for _, name := range names {
-		vm := &WarmVM{Name: name, Image: image, boot: nil, stopTouch: nil, guestMu: sync.Mutex{}, guestAddr: "", guestConn: nil}
+		vm := &WarmVM{Name: name, Image: image, boot: nil, guestMu: sync.Mutex{}, guestAddr: "", guestConn: nil}
 		client, err := b.guestFor(ctx, vm)
 		if err != nil {
 			slog.WarnContext(ctx, "skip running vm adoption after guest resolve failure", "err", err, "vm", name)
@@ -744,7 +717,6 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 	}
 	adopted := make([]AdoptedVM, 0, len(selected))
 	for _, candidate := range selected {
-		candidate.vm.stopTouch = b.startTouchLoop(ctx, candidate.vm.Name)
 		adopted = append(adopted, AdoptedVM{
 			VM:    candidate.vm,
 			Slots: candidate.slots,
@@ -904,24 +876,6 @@ func (b *Binder) waitForReady(ctx context.Context, vmName string) error {
 		case <-ctx.Done():
 			slog.ErrorContext(ctx, "timed out waiting for vsock readiness", "err", ctx.Err(), "vm", vmName)
 			return fmt.Errorf("broker: waiting for vsock readiness of %s: %w", vmName, ctx.Err())
-		case <-ticker.C:
-		}
-	}
-}
-
-// touchLoop refreshes the guest liveness file over the tart-exec channel on a
-// timer until the context is canceled. If the broker dies, touches stop and the
-// guest watchdog logs the stale heartbeat without powering off the VM.
-func (b *Binder) touchLoop(ctx context.Context, vmName string) {
-	ticker := time.NewTicker(touchInterval)
-	defer ticker.Stop()
-	for {
-		if _, err := b.vm.Exec(ctx, vmName, "touch", heartbeatFile); err != nil {
-			slog.DebugContext(ctx, "heartbeat touch failed", "err", err, "vm", vmName)
-		}
-		select {
-		case <-ctx.Done():
-			return
 		case <-ticker.C:
 		}
 	}
