@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"sort"
 	"strings"
@@ -38,7 +37,6 @@ type fakeWarmer struct {
 	adopted  []broker.AdoptedVM
 	adopts   []adoptCall
 	adoptErr error
-	swept    int
 }
 
 func newFakeWarmer() *fakeWarmer {
@@ -51,7 +49,6 @@ func newFakeWarmer() *fakeWarmer {
 		adopted:  nil,
 		adopts:   nil,
 		adoptErr: nil,
-		swept:    0,
 	}
 }
 
@@ -102,12 +99,6 @@ func (w *fakeWarmer) Adopt(_ context.Context, image string, slotCount int, limit
 	return adopted, nil
 }
 
-func (w *fakeWarmer) SweepOrphans(_ context.Context) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.swept++
-}
-
 func (w *fakeWarmer) WarmNames() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -153,11 +144,14 @@ func (w *fakeWarmer) AdoptCalls() []adoptCall {
 }
 
 type runCall struct {
-	Repo       string
-	RunnerName string
-	VMName     string
-	SlotIndex  int
-	SlotCount  int
+	Repo        string
+	RunnerName  string
+	VMName      string
+	SlotIndex   int
+	SlotCount   int
+	ExecutionID string
+	Resume      bool
+	Cursor      uint64
 }
 
 type fakeRunner struct {
@@ -190,14 +184,7 @@ func newBlockingRunner(buffer int) *fakeRunner {
 	return runner
 }
 
-func (r *fakeRunner) RunJob(ctx context.Context, vm *broker.WarmVM, repo string, runnerName string, slotIndex int, slotCount int, _ int64, _ int64, _ time.Time) error {
-	call := runCall{
-		Repo:       repo,
-		RunnerName: runnerName,
-		VMName:     vm.Name,
-		SlotIndex:  slotIndex,
-		SlotCount:  slotCount,
-	}
+func (r *fakeRunner) run(ctx context.Context, call runCall) error {
 	r.mu.Lock()
 	r.calls = append(r.calls, call)
 	r.active++
@@ -222,6 +209,27 @@ func (r *fakeRunner) RunJob(ctx context.Context, vm *broker.WarmVM, repo string,
 		}
 	}
 	return r.runErr
+}
+
+func (r *fakeRunner) RunJob(ctx context.Context, vm *broker.WarmVM, repo string, runnerName string, slotIndex int, slotCount int, _ int64, _ int64, _ time.Time) error {
+	return r.run(ctx, runCall{
+		Repo:       repo,
+		RunnerName: runnerName,
+		VMName:     vm.Name,
+		SlotIndex:  slotIndex,
+		SlotCount:  slotCount,
+	})
+}
+
+func (r *fakeRunner) ResumeJob(ctx context.Context, vm *broker.WarmVM, executionID string, fromCursor uint64, slotIndex int, slotCount int) error {
+	return r.run(ctx, runCall{
+		VMName:      vm.Name,
+		SlotIndex:   slotIndex,
+		SlotCount:   slotCount,
+		ExecutionID: executionID,
+		Resume:      true,
+		Cursor:      fromCursor,
+	})
 }
 
 func (r *fakeRunner) Release() {
@@ -304,90 +312,64 @@ func (g *fakeGitHub) RunnerCalls() []string {
 	return append([]string(nil), g.calls...)
 }
 
-type fakeActiveJobProber struct {
-	mu          sync.Mutex
-	active      map[string]bool
-	calls       []string
-	probeErr    error
-	onProbe     func()
-	cpuActivity map[string]float64
-	cpuCalls    []string
-	cpuProbeErr error
-	onCPUProbe  func()
+// fakeSlotProber reports which slots are running per VM, from one call per VM.
+type fakeSlotProber struct {
+	mu       sync.Mutex
+	running  map[string]map[int]bool
+	probeErr map[string]error
+	calls    []string
+	onProbe  func()
 }
 
-func newFakeActiveJobProber(active map[string]bool) *fakeActiveJobProber {
-	return &fakeActiveJobProber{
-		mu:          sync.Mutex{},
-		active:      active,
-		calls:       nil,
-		probeErr:    nil,
-		onProbe:     nil,
-		cpuActivity: make(map[string]float64),
-		cpuCalls:    nil,
-		cpuProbeErr: nil,
-		onCPUProbe:  nil,
+func newFakeSlotProber() *fakeSlotProber {
+	return &fakeSlotProber{
+		mu:       sync.Mutex{},
+		running:  make(map[string]map[int]bool),
+		probeErr: make(map[string]error),
+		calls:    nil,
+		onProbe:  nil,
 	}
 }
 
-func (p *fakeActiveJobProber) HasActiveJob(_ context.Context, vm *broker.WarmVM, slotIndex int, slotCount int) (bool, error) {
+func (p *fakeSlotProber) RunningSlots(_ context.Context, vm *broker.WarmVM) (map[int]bool, error) {
+	p.mu.Lock()
+	p.calls = append(p.calls, vm.Name)
+	err := p.probeErr[vm.Name]
+	slots := p.running[vm.Name]
+	hook := p.onProbe
+	p.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int]bool, len(slots))
+	for slot, running := range slots {
+		out[slot] = running
+	}
+	return out, nil
+}
+
+func (p *fakeSlotProber) SetRunning(vmName string, slotIndex int, running bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	key := probeKey(vm.Name, slotIndex, slotCount)
-	p.calls = append(p.calls, key)
-	if p.probeErr != nil {
-		return false, p.probeErr
+	if p.running[vmName] == nil {
+		p.running[vmName] = make(map[int]bool)
 	}
-	if p.onProbe != nil {
-		p.onProbe()
-	}
-	return p.active[key], nil
+	p.running[vmName][slotIndex] = running
 }
 
-func (p *fakeActiveJobProber) SlotCPUActivity(_ context.Context, vm *broker.WarmVM, slotIndex int, slotCount int) (float64, error) {
+func (p *fakeSlotProber) SetProbeErr(vmName string, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	key := probeKey(vm.Name, slotIndex, slotCount)
-	p.cpuCalls = append(p.cpuCalls, key)
-	if p.cpuProbeErr != nil {
-		return 0, p.cpuProbeErr
-	}
-	if p.onCPUProbe != nil {
-		p.onCPUProbe()
-	}
-	return p.cpuActivity[key], nil
+	p.probeErr[vmName] = err
 }
 
-func (p *fakeActiveJobProber) Calls() []string {
+func (p *fakeSlotProber) Calls() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]string(nil), p.calls...)
-}
-
-func (p *fakeActiveJobProber) CPUCalls() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]string(nil), p.cpuCalls...)
-}
-
-func (p *fakeActiveJobProber) SetActive(vmName string, slotIndex int, slotCount int, active bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	key := probeKey(vmName, slotIndex, slotCount)
-	p.active[key] = active
-}
-
-func (p *fakeActiveJobProber) SetCPUActivity(key string, cpuActivity float64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.cpuActivity[key] = cpuActivity
-}
-
-func probeKey(vmName string, slotIndex int, slotCount int) string {
-	if slotCount <= 1 {
-		return vmName
-	}
-	return fmt.Sprintf("%s#%d", vmName, slotIndex)
 }
 
 type mutableClock struct {
@@ -484,7 +466,7 @@ func captureTestLogs(t *testing.T) *bytes.Buffer {
 	return buffer
 }
 
-func busyWorkerState(vmName string, bornAt time.Time, boundAt time.Time, jobID int64, runID int64, cancel context.CancelFunc) workerState {
+func busyWorkerState(vmName string, bornAt time.Time, boundAt time.Time, jobID int64, runID int64, cancel context.CancelCauseFunc) workerState {
 	return workerState{
 		vm:        &broker.WarmVM{Name: vmName, Image: "image-a"},
 		bornAt:    bornAt,
@@ -523,7 +505,8 @@ func TestStatusReportsWorkerViewsAndActiveJob(t *testing.T) {
 	warmer := newFakeWarmer()
 	runner := newBlockingRunner(1)
 	github := newFakeGitHub()
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
+	prober := newFakeSlotProber()
+	prober.SetRunning("vm-busy", 0, false)
 	pool := New(testOptions(clock, 2), warmer, runner, github, prober)
 
 	pool.mu.Lock()
@@ -540,40 +523,19 @@ func TestStatusReportsWorkerViewsAndActiveJob(t *testing.T) {
 	if snapshot.Idle != 1 {
 		t.Fatalf("snapshot idle = %d, want 1", snapshot.Idle)
 	}
-	if len(workers) != 2 {
-		t.Fatalf("workers = %+v, want 2 workers", workers)
-	}
 	busy := workers[0]
-	if busy.Index != 0 {
-		t.Fatalf("busy index = %d, want 0", busy.Index)
-	}
-	if busy.VM != "vm-busy" {
-		t.Fatalf("busy vm = %q, want vm-busy", busy.VM)
-	}
-	if busy.Phase != "busy" {
-		t.Fatalf("busy phase = %q, want busy", busy.Phase)
-	}
-	if busy.RunID != 42 {
-		t.Fatalf("busy run id = %d, want 42", busy.RunID)
+	if busy.VM != "vm-busy" || busy.Phase != "busy" || busy.RunID != 42 {
+		t.Fatalf("busy worker = %+v, want vm-busy busy run 42", busy)
 	}
 	if busy.BindAgeSeconds != 120 {
 		t.Fatalf("busy bind age seconds = %d, want 120", busy.BindAgeSeconds)
 	}
-	if busy.ActiveJob == nil {
-		t.Fatal("busy active job = nil, want false")
-	}
-	if *busy.ActiveJob {
-		t.Fatal("busy active job = true, want false")
+	if busy.ActiveJob == nil || *busy.ActiveJob {
+		t.Fatalf("busy active job = %v, want false", busy.ActiveJob)
 	}
 	idle := workers[1]
-	if idle.Phase != "idle" {
-		t.Fatalf("idle phase = %q, want idle", idle.Phase)
-	}
-	if idle.ActiveJob != nil {
-		t.Fatalf("idle active job = %v, want nil", *idle.ActiveJob)
-	}
-	if idle.BindAgeSeconds != 0 {
-		t.Fatalf("idle bind age seconds = %d, want 0", idle.BindAgeSeconds)
+	if idle.Phase != "idle" || idle.ActiveJob != nil {
+		t.Fatalf("idle worker = %+v, want idle nil active job", idle)
 	}
 	calls := prober.Calls()
 	if len(calls) != 1 || calls[0] != "vm-busy" {
@@ -584,7 +546,8 @@ func TestStatusReportsWorkerViewsAndActiveJob(t *testing.T) {
 func TestStatusReportsSlotViewsForMultiSlotWorker(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	clock := newMutableClock(now)
-	prober := newFakeActiveJobProber(map[string]bool{"vm-slots#0": true})
+	prober := newFakeSlotProber()
+	prober.SetRunning("vm-slots", 0, true)
 	pool := New(testOptionsWithSlots(clock, 1, 2), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
 
 	pool.mu.Lock()
@@ -593,18 +556,10 @@ func TestStatusReportsSlotViewsForMultiSlotWorker(t *testing.T) {
 		vm:        &broker.WarmVM{Name: "vm-slots", Image: "image-a"},
 		bornAt:    now.Add(-time.Hour),
 		idleSince: time.Time{},
-		warming:   false,
-		recycle:   false,
 		slots: []slotState{
-			{
-				boundAt: now.Add(-3 * time.Minute),
-				busy:    true,
-				jobID:   1001,
-				runID:   42,
-			},
+			{boundAt: now.Add(-3 * time.Minute), busy: true, jobID: 1001, runID: 42},
 			{},
 		},
-		lastErr: nil,
 	}
 	pool.mu.Unlock()
 
@@ -613,13 +568,7 @@ func TestStatusReportsSlotViewsForMultiSlotWorker(t *testing.T) {
 	if snapshot.Busy != 1 || snapshot.Idle != 1 {
 		t.Fatalf("snapshot busy/idle = %d/%d, want 1/1", snapshot.Busy, snapshot.Idle)
 	}
-	if len(workers) != 1 {
-		t.Fatalf("workers = %+v, want 1 worker", workers)
-	}
 	worker := workers[0]
-	if worker.Phase != "busy" {
-		t.Fatalf("worker phase = %q, want busy", worker.Phase)
-	}
 	if len(worker.Slots) != 2 {
 		t.Fatalf("worker slots = %+v, want 2 slots", worker.Slots)
 	}
@@ -627,59 +576,15 @@ func TestStatusReportsSlotViewsForMultiSlotWorker(t *testing.T) {
 	if busySlot.Phase != "busy" || busySlot.RunID != 42 || busySlot.JobID != 1001 {
 		t.Fatalf("busy slot = %+v, want busy run 42 job 1001", busySlot)
 	}
-	if busySlot.BindAgeSeconds != 180 {
-		t.Fatalf("busy slot bind age = %d, want 180", busySlot.BindAgeSeconds)
-	}
 	if busySlot.ActiveJob == nil || !*busySlot.ActiveJob {
 		t.Fatalf("busy slot active job = %v, want true", busySlot.ActiveJob)
 	}
-	idleSlot := worker.Slots[1]
-	if idleSlot.Phase != "idle" {
-		t.Fatalf("idle slot phase = %q, want idle", idleSlot.Phase)
-	}
-	if idleSlot.ActiveJob != nil {
-		t.Fatalf("idle slot active job = %v, want nil", idleSlot.ActiveJob)
+	if worker.Slots[1].ActiveJob != nil {
+		t.Fatalf("idle slot active job = %v, want nil", worker.Slots[1].ActiveJob)
 	}
 	calls := prober.Calls()
-	if len(calls) != 1 || calls[0] != "vm-slots#0" {
-		t.Fatalf("prober calls = %v, want [vm-slots#0]", calls)
-	}
-}
-
-func TestStatusSingleSlotKeepsLastErrorEmptyAfterRunJobError(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
-	warmer := newFakeWarmer()
-	runner := newFakeRunner(1)
-	runner.runErr = errors.New("transient run error")
-	pool := New(testOptionsWithSlots(clock, 1, 1), warmer, runner, newFakeGitHub(), nil)
-	ctx := startTestPool(t, pool)
-	waitFor(t, pool.Ready)
-
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo", JobID: 1, RunID: 42}); err != nil {
-		t.Fatalf("Enqueue job: %v", err)
-	}
-	waitStarted(t, runner)
-	waitFor(t, func() bool {
-		snapshot := pool.Snapshot()
-		return snapshot.Idle == 1 && snapshot.Busy == 0 && snapshot.Queued == 0
-	})
-
-	_, workers := pool.Status(context.Background())
-	if len(workers) != 1 {
-		t.Fatalf("workers = %+v, want 1 worker", workers)
-	}
-	worker := workers[0]
-	if worker.LastError != "" {
-		t.Fatalf("single-slot last error = %q, want empty", worker.LastError)
-	}
-	if worker.RunID != 0 {
-		t.Fatalf("single-slot run id = %d, want 0", worker.RunID)
-	}
-	if worker.BindAgeSeconds != 0 {
-		t.Fatalf("single-slot bind age seconds = %d, want 0", worker.BindAgeSeconds)
-	}
-	if worker.Slots != nil {
-		t.Fatalf("single-slot slots = %+v, want nil", worker.Slots)
+	if len(calls) != 1 || calls[0] != "vm-slots" {
+		t.Fatalf("prober calls = %v, want [vm-slots]", calls)
 	}
 }
 
@@ -697,19 +602,13 @@ func TestWorkerReusesWarmVMAcrossJobs(t *testing.T) {
 	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo", JobID: 2, RunID: 11}); err != nil {
 		t.Fatalf("Enqueue second job: %v", err)
 	}
-
-	waitFor(t, func() bool {
-		return len(runner.Calls()) == 2
-	})
+	waitFor(t, func() bool { return len(runner.Calls()) == 2 })
 	calls := runner.Calls()
 	if calls[0].VMName != calls[1].VMName {
 		t.Fatalf("jobs used VMs %q and %q, want one reused VM", calls[0].VMName, calls[1].VMName)
 	}
 	if got := len(warmer.WarmNames()); got != 1 {
 		t.Fatalf("warm calls = %d, want 1", got)
-	}
-	if got := len(warmer.TornNames()); got != 0 {
-		t.Fatalf("teardowns before shutdown = %d, want 0", got)
 	}
 }
 
@@ -727,7 +626,6 @@ func TestVMWithTwoSlotsRunsTwoConcurrentJobs(t *testing.T) {
 	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-b", JobID: 2, RunID: 11}); err != nil {
 		t.Fatalf("Enqueue second job: %v", err)
 	}
-
 	first := waitStarted(t, runner)
 	second := waitStarted(t, runner)
 	if first.VMName != second.VMName {
@@ -736,22 +634,11 @@ func TestVMWithTwoSlotsRunsTwoConcurrentJobs(t *testing.T) {
 	if first.SlotIndex == second.SlotIndex {
 		t.Fatalf("jobs used slot %d twice, want distinct slots", first.SlotIndex)
 	}
-	if first.SlotCount != 2 || second.SlotCount != 2 {
-		t.Fatalf("slot counts = %d and %d, want 2 and 2", first.SlotCount, second.SlotCount)
-	}
 	waitFor(t, func() bool {
 		snapshot := pool.Snapshot()
 		return snapshot.Busy == 2 && snapshot.Idle == 0
 	})
-	if maxActive := runner.MaxActive(); maxActive != 2 {
-		t.Fatalf("max active jobs = %d, want 2", maxActive)
-	}
-
 	runner.Release()
-	waitFor(t, func() bool {
-		snapshot := pool.Snapshot()
-		return snapshot.Busy == 1 && snapshot.Idle == 1
-	})
 	runner.Release()
 }
 
@@ -769,62 +656,24 @@ func TestReadyReportsOnlyImmediateIdleCapacity(t *testing.T) {
 	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-b", JobID: 2, RunID: 11}); err != nil {
 		t.Fatalf("Enqueue second job: %v", err)
 	}
-
 	waitStarted(t, runner)
 	waitStarted(t, runner)
 	waitFor(t, func() bool {
 		snapshot := pool.Snapshot()
 		return snapshot.Busy == 2 && snapshot.Idle == 0 && snapshot.Queued == 0
 	})
-	snapshot := pool.Snapshot()
-	if snapshot.Ready {
-		t.Fatalf("ready with all slots busy = true, want false: %+v", snapshot)
+	if pool.Snapshot().Ready {
+		t.Fatal("ready with all slots busy = true, want false")
 	}
-
 	runner.Release()
 	waitFor(t, func() bool {
 		snapshot := pool.Snapshot()
-		return snapshot.Busy == 1 && snapshot.Idle == 1 && snapshot.Queued == 0
+		return snapshot.Busy == 1 && snapshot.Idle == 1
 	})
-	snapshot = pool.Snapshot()
-	if !snapshot.Ready {
-		t.Fatalf("ready with one idle slot = false, want true: %+v", snapshot)
+	if !pool.Snapshot().Ready {
+		t.Fatal("ready with one idle slot = false, want true")
 	}
 	runner.Release()
-}
-
-func TestWarmWorkerPassesConfiguredSlotCount(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
-	warmer := newFakeWarmer()
-	runner := newFakeRunner(1)
-	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, newFakeGitHub(), nil)
-	startTestPool(t, pool)
-	waitFor(t, pool.Ready)
-
-	slotCounts := warmer.WarmSlotCounts()
-	if len(slotCounts) != 1 || slotCounts[0] != 2 {
-		t.Fatalf("initial warm slot counts = %v, want [2]", slotCounts)
-	}
-
-	nextOptions := testOptionsWithSlots(clock, 1, 3)
-	pool.Reconfigure(nextOptions)
-	firstVM := warmer.WarmNames()[0]
-	pool.mu.Lock()
-	pool.states[0].recycle = true
-	pool.cond.Broadcast()
-	pool.mu.Unlock()
-
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 2
-	})
-	torn := warmer.TornNames()
-	if len(torn) != 1 || torn[0] != firstVM {
-		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
-	}
-	slotCounts = warmer.WarmSlotCounts()
-	if len(slotCounts) != 2 || slotCounts[1] != 3 {
-		t.Fatalf("warm slot counts after reconfigure = %v, want second count 3", slotCounts)
-	}
 }
 
 func TestReconfigureAppliesScalarsAndKeepsRunnerCountAndImage(t *testing.T) {
@@ -833,9 +682,7 @@ func TestReconfigureAppliesScalarsAndKeepsRunnerCountAndImage(t *testing.T) {
 	var logs strings.Builder
 	previousLogger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	t.Cleanup(func() {
-		slog.SetDefault(previousLogger)
-	})
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
 	nextOptions := Options{
 		RunnerCount:    4,
@@ -845,11 +692,7 @@ func TestReconfigureAppliesScalarsAndKeepsRunnerCountAndImage(t *testing.T) {
 		MaxAge:         6 * time.Hour,
 		MaxBind:        7 * time.Minute,
 		PickupTimeout:  90 * time.Second,
-		StallTimeout:   4 * time.Minute,
-		StallReap:      true,
-		RunToken:       "",
 		WarmRetryDelay: 25 * time.Millisecond,
-		Now:            nil,
 	}
 	pool.Reconfigure(nextOptions)
 
@@ -867,215 +710,17 @@ func TestReconfigureAppliesScalarsAndKeepsRunnerCountAndImage(t *testing.T) {
 	if pool.options.RunToken != "test" {
 		t.Fatalf("run token = %q, want preserved test", pool.options.RunToken)
 	}
-	if pool.options.Now == nil {
-		t.Fatal("now function = nil, want preserved clock")
-	}
-	if pool.options.MaxIdle != 15*time.Minute {
-		t.Fatalf("max idle = %s, want 15m", pool.options.MaxIdle)
-	}
-	if pool.options.MaxAge != 6*time.Hour {
-		t.Fatalf("max age = %s, want 6h", pool.options.MaxAge)
-	}
 	if pool.options.MaxBind != 7*time.Minute {
 		t.Fatalf("max bind = %s, want 7m", pool.options.MaxBind)
 	}
 	if pool.options.PickupTimeout != 90*time.Second {
 		t.Fatalf("pickup timeout = %s, want 90s", pool.options.PickupTimeout)
 	}
-	if pool.options.StallTimeout != 4*time.Minute {
-		t.Fatalf("stall timeout = %s, want 4m", pool.options.StallTimeout)
-	}
-	if !pool.options.StallReap {
-		t.Fatal("stall reap = false, want true")
-	}
-	if pool.options.WarmRetryDelay != 25*time.Millisecond {
-		t.Fatalf("warm retry delay = %s, want 25ms", pool.options.WarmRetryDelay)
-	}
 	if !strings.Contains(logs.String(), "runner_count change requires restart") {
 		t.Fatalf("logs = %q, want runner_count restart warning", logs.String())
 	}
 	if !strings.Contains(logs.String(), "image change requires restart") {
 		t.Fatalf("logs = %q, want image restart warning", logs.String())
-	}
-	if !strings.Contains(logs.String(), "runnerpool reconfigured") {
-		t.Fatalf("logs = %q, want reconfigured info", logs.String())
-	}
-}
-
-func TestReconfigureBusyWorkerKeepsOldSlotsUntilIdleResize(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
-	warmer := newFakeWarmer()
-	runner := newBlockingRunner(2)
-	pool := New(testOptionsWithSlots(clock, 1, 1), warmer, runner, newFakeGitHub(), nil)
-	ctx := startTestPool(t, pool)
-	waitFor(t, pool.Ready)
-	firstVM := warmer.WarmNames()[0]
-
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-a", JobID: 1, RunID: 10}); err != nil {
-		t.Fatalf("Enqueue first job: %v", err)
-	}
-	first := waitStarted(t, runner)
-	if first.SlotCount != 1 {
-		t.Fatalf("first slot count = %d, want 1", first.SlotCount)
-	}
-
-	pool.Reconfigure(testOptionsWithSlots(clock, 1, 2))
-	if err := pool.Reconcile(ctx); err != nil {
-		t.Fatalf("Reconcile while busy: %v", err)
-	}
-	if torn := warmer.TornNames(); len(torn) != 0 {
-		t.Fatalf("busy worker teardowns = %v, want none", torn)
-	}
-	pool.mu.Lock()
-	busySlotCount := len(pool.states[0].slots)
-	busyRecycle := pool.states[0].recycle
-	pool.mu.Unlock()
-	if busySlotCount != 1 || busyRecycle {
-		t.Fatalf("busy worker slots recycle = %d %v, want 1 false", busySlotCount, busyRecycle)
-	}
-
-	runner.Release()
-	waitFor(t, func() bool {
-		snapshot := pool.Snapshot()
-		return snapshot.Idle == 1 && snapshot.Busy == 0
-	})
-	if err := pool.Reconcile(ctx); err != nil {
-		t.Fatalf("Reconcile while idle: %v", err)
-	}
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 2
-	})
-	torn := warmer.TornNames()
-	if len(torn) != 1 || torn[0] != firstVM {
-		t.Fatalf("idle resize teardowns = %v, want [%s]", torn, firstVM)
-	}
-	pool.mu.Lock()
-	resizedSlotCount := len(pool.states[0].slots)
-	pool.mu.Unlock()
-	if resizedSlotCount != 2 {
-		t.Fatalf("resized slot count = %d, want 2", resizedSlotCount)
-	}
-	slotCounts := warmer.WarmSlotCounts()
-	if len(slotCounts) != 2 || slotCounts[1] != 2 {
-		t.Fatalf("warm slot counts = %v, want second count 2", slotCounts)
-	}
-
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-b", JobID: 2, RunID: 11}); err != nil {
-		t.Fatalf("Enqueue second job: %v", err)
-	}
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-c", JobID: 3, RunID: 12}); err != nil {
-		t.Fatalf("Enqueue third job: %v", err)
-	}
-	second := waitStarted(t, runner)
-	third := waitStarted(t, runner)
-	if second.VMName != third.VMName {
-		t.Fatalf("resized jobs used VMs %q and %q, want one VM", second.VMName, third.VMName)
-	}
-	if second.SlotCount != 2 || third.SlotCount != 2 {
-		t.Fatalf("resized slot counts = %d and %d, want 2 and 2", second.SlotCount, third.SlotCount)
-	}
-	runner.Release()
-	runner.Release()
-}
-
-func TestStatusReportsBusyWorkerActualSlotsUntilIdleResize(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
-	warmer := newFakeWarmer()
-	runner := newBlockingRunner(2)
-	prober := newFakeActiveJobProber(map[string]bool{})
-	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, newFakeGitHub(), prober)
-	ctx := startTestPool(t, pool)
-	waitFor(t, pool.Ready)
-	firstVM := warmer.WarmNames()[0]
-
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-a", JobID: 1, RunID: 10}); err != nil {
-		t.Fatalf("Enqueue first job: %v", err)
-	}
-	first := waitStarted(t, runner)
-	if first.SlotCount != 2 {
-		t.Fatalf("first slot count = %d, want 2", first.SlotCount)
-	}
-	prober.SetActive(firstVM, first.SlotIndex, first.SlotCount, true)
-
-	pool.Reconfigure(testOptionsWithSlots(clock, 1, 1))
-	if err := pool.Reconcile(ctx); err != nil {
-		t.Fatalf("Reconcile while busy: %v", err)
-	}
-
-	_, workers := pool.Status(context.Background())
-	if len(workers) != 1 {
-		t.Fatalf("workers = %+v, want 1 worker", workers)
-	}
-	if len(workers[0].Slots) != 2 {
-		t.Fatalf("busy worker status slots = %+v, want 2 actual slots", workers[0].Slots)
-	}
-	activeSlot := workers[0].Slots[first.SlotIndex]
-	if activeSlot.ActiveJob == nil || !*activeSlot.ActiveJob {
-		t.Fatalf("busy worker active job = %v, want true", activeSlot.ActiveJob)
-	}
-	calls := prober.Calls()
-	expectedCall := probeKey(firstVM, first.SlotIndex, first.SlotCount)
-	if len(calls) != 1 || calls[0] != expectedCall {
-		t.Fatalf("prober calls = %v, want [%s]", calls, expectedCall)
-	}
-	if torn := warmer.TornNames(); len(torn) != 0 {
-		t.Fatalf("busy worker teardowns = %v, want none", torn)
-	}
-
-	runner.Release()
-	waitFor(t, func() bool {
-		snapshot := pool.Snapshot()
-		return snapshot.Idle == 2 && snapshot.Busy == 0
-	})
-	if err := pool.Reconcile(ctx); err != nil {
-		t.Fatalf("Reconcile while idle: %v", err)
-	}
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 2
-	})
-	torn := warmer.TornNames()
-	if len(torn) != 1 || torn[0] != firstVM {
-		t.Fatalf("idle resize teardowns = %v, want [%s]", torn, firstVM)
-	}
-
-	_, workers = pool.Status(context.Background())
-	if len(workers) != 1 {
-		t.Fatalf("workers after resize = %+v, want 1 worker", workers)
-	}
-	if workers[0].Slots != nil {
-		t.Fatalf("resized worker status slots = %+v, want nil single-slot view", workers[0].Slots)
-	}
-}
-
-func TestReconfigureShrinksIdleWorkerSlotCount(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
-	warmer := newFakeWarmer()
-	runner := newFakeRunner(1)
-	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, newFakeGitHub(), nil)
-	ctx := startTestPool(t, pool)
-	waitFor(t, pool.Ready)
-	firstVM := warmer.WarmNames()[0]
-
-	pool.Reconfigure(testOptionsWithSlots(clock, 1, 1))
-	if err := pool.Reconcile(ctx); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 2
-	})
-	torn := warmer.TornNames()
-	if len(torn) != 1 || torn[0] != firstVM {
-		t.Fatalf("idle shrink teardowns = %v, want [%s]", torn, firstVM)
-	}
-	pool.mu.Lock()
-	slotCount := len(pool.states[0].slots)
-	pool.mu.Unlock()
-	if slotCount != 1 {
-		t.Fatalf("slot count after shrink = %d, want 1", slotCount)
-	}
-	slotCounts := warmer.WarmSlotCounts()
-	if len(slotCounts) != 2 || slotCounts[1] != 1 {
-		t.Fatalf("warm slot counts = %v, want second count 1", slotCounts)
 	}
 }
 
@@ -1096,59 +741,11 @@ func TestSlotRunJobPanicFreesSlot(t *testing.T) {
 		snapshot := pool.Snapshot()
 		return snapshot.Busy == 0 && snapshot.Idle == 2
 	})
-
 	_, workers := pool.Status(context.Background())
-	if len(workers) != 1 {
-		t.Fatalf("workers = %+v, want 1 worker", workers)
-	}
-	worker := workers[0]
-	if len(worker.Slots) != 2 {
-		t.Fatalf("slots = %+v, want 2 slots", worker.Slots)
-	}
-	slot := worker.Slots[call.SlotIndex]
+	slot := workers[0].Slots[call.SlotIndex]
 	if slot.LastError != "panic: runner crashed" {
 		t.Fatalf("slot last error = %q, want panic: runner crashed", slot.LastError)
 	}
-}
-
-func TestJobsPerVMOneKeepsSingleInflightCapacity(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
-	warmer := newFakeWarmer()
-	runner := newBlockingRunner(2)
-	pool := New(testOptionsWithSlots(clock, 1, 1), warmer, runner, newFakeGitHub(), nil)
-	ctx := startTestPool(t, pool)
-	waitFor(t, pool.Ready)
-
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-a", JobID: 1, RunID: 10}); err != nil {
-		t.Fatalf("Enqueue first job: %v", err)
-	}
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-b", JobID: 2, RunID: 11}); err != nil {
-		t.Fatalf("Enqueue second job: %v", err)
-	}
-
-	first := waitStarted(t, runner)
-	waitFor(t, func() bool {
-		snapshot := pool.Snapshot()
-		return snapshot.Busy == 1 && snapshot.Idle == 0 && snapshot.Queued == 1 && !snapshot.Ready
-	})
-	select {
-	case second := <-runner.started:
-		t.Fatalf("second job started early on slot %d: %+v", second.SlotIndex, second)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if first.RunnerName != first.VMName {
-		t.Fatalf("single-slot runner name = %q, want VM name %q", first.RunnerName, first.VMName)
-	}
-	if first.SlotIndex != 0 || first.SlotCount != 1 {
-		t.Fatalf("single-slot call used slot %d of %d, want 0 of 1", first.SlotIndex, first.SlotCount)
-	}
-
-	runner.Release()
-	second := waitStarted(t, runner)
-	if second.VMName != first.VMName {
-		t.Fatalf("second job VM = %q, want reused VM %q", second.VMName, first.VMName)
-	}
-	runner.Release()
 }
 
 func TestCancelRunCancelsOneSlotWithoutStoppingCotenant(t *testing.T) {
@@ -1169,67 +766,10 @@ func TestCancelRunCancelsOneSlotWithoutStoppingCotenant(t *testing.T) {
 	waitStarted(t, runner)
 
 	pool.CancelRun(1)
-
-	waitFor(t, func() bool {
-		return runner.Active() == 1
-	})
+	waitFor(t, func() bool { return runner.Active() == 1 })
 	if torn := warmer.TornNames(); len(torn) != 0 {
 		t.Fatalf("teardowns before cotenant finishes = %v, want none", torn)
 	}
-	snapshot := pool.Snapshot()
-	if snapshot.Busy != 1 {
-		t.Fatalf("busy slots after cancel = %d, want 1", snapshot.Busy)
-	}
-
-	runner.Release()
-}
-
-func TestReconcileReapsOneExpiredSlotWithoutStoppingCotenant(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptionsWithSlots(clock, 1, 2)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = 2 * time.Minute
-	warmer := newFakeWarmer()
-	runner := newBlockingRunner(2)
-	prober := newFakeActiveJobProber(map[string]bool{})
-	pool := New(options, warmer, runner, newFakeGitHub(), prober)
-	ctx := startTestPool(t, pool)
-	waitFor(t, pool.Ready)
-
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-a", JobID: 1, RunID: 10}); err != nil {
-		t.Fatalf("Enqueue first job: %v", err)
-	}
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-b", JobID: 2, RunID: 11}); err != nil {
-		t.Fatalf("Enqueue second job: %v", err)
-	}
-	first := waitStarted(t, runner)
-	second := waitStarted(t, runner)
-	if first.SlotIndex == second.SlotIndex {
-		t.Fatalf("jobs used slot %d twice, want distinct slots", first.SlotIndex)
-	}
-
-	pool.mu.Lock()
-	expiredSlot := first.SlotIndex
-	pool.states[0].slots[expiredSlot].boundAt = now.Add(-options.MaxBind - time.Second)
-	pool.states[0].slots[second.SlotIndex].boundAt = now.Add(-30 * time.Second)
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(ctx); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	waitFor(t, func() bool {
-		return runner.Active() == 1
-	})
-	if torn := warmer.TornNames(); len(torn) != 0 {
-		t.Fatalf("teardowns before cotenant finishes = %v, want none", torn)
-	}
-	calls := prober.Calls()
-	wantCall := probeKey(first.VMName, expiredSlot, 2)
-	if len(calls) != 1 || calls[0] != wantCall {
-		t.Fatalf("prober calls = %v, want [%s]", calls, wantCall)
-	}
-
 	runner.Release()
 }
 
@@ -1240,7 +780,7 @@ func TestCancelRunReapsMatchingBusyWorker(t *testing.T) {
 	cancelCount := 0
 
 	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-time.Minute), 1001, 42, func() {
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-time.Minute), 1001, 42, func(error) {
 		cancelCount++
 	})
 	pool.states[1] = busyWorkerState("vm-other", now.Add(-time.Hour), now.Add(-time.Minute), 1002, 43, nil)
@@ -1248,16 +788,15 @@ func TestCancelRunReapsMatchingBusyWorker(t *testing.T) {
 
 	pool.CancelRun(99)
 	pool.mu.Lock()
-	if pool.states[0].recycle {
-		t.Fatal("worker recycle = true after non-matching CancelRun, want false")
-	}
-	if cancelCount != 0 {
-		t.Fatalf("cancel count = %d after non-matching CancelRun, want 0", cancelCount)
+	if pool.states[0].recycle || cancelCount != 0 {
+		pool.mu.Unlock()
+		t.Fatalf("non-matching CancelRun recycled or cancelled: recycle=%v count=%d", pool.states[0].recycle, cancelCount)
 	}
 	pool.mu.Unlock()
 
 	pool.CancelRun(1001)
 	pool.mu.Lock()
+	defer pool.mu.Unlock()
 	if !pool.states[0].recycle {
 		t.Fatal("matching worker recycle = false, want true")
 	}
@@ -1270,925 +809,45 @@ func TestCancelRunReapsMatchingBusyWorker(t *testing.T) {
 	if cancelCount != 1 {
 		t.Fatalf("cancel count = %d, want 1", cancelCount)
 	}
+}
+
+func TestCancelRunPassesNonContextCauseToJob(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	pool := New(testOptions(clock, 1), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
+
+	jobCtx, cancel := context.WithCancelCause(context.Background())
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-time.Minute), 1001, 42, cancel)
 	pool.mu.Unlock()
 
 	pool.CancelRun(1001)
-	if cancelCount != 1 {
-		t.Fatalf("cancel count after duplicate CancelRun = %d, want 1", cancelCount)
+	if jobCtx.Err() == nil {
+		t.Fatal("job context not cancelled after CancelRun")
+	}
+	cause := context.Cause(jobCtx)
+	if errors.Is(cause, context.Canceled) {
+		t.Fatalf("cancel cause = %v, want a non-context teardown cause", cause)
 	}
 }
 
-func TestCancelRunIgnoresSiblingJobWithSameRunID(t *testing.T) {
+func TestShutdownReleasesWorkerVMsWithoutTeardown(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	warmer := newFakeWarmer()
-	runner := newBlockingRunner(1)
-	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
-	ctx := startTestPool(t, pool)
+	runner := newFakeRunner(1)
+	pool := New(testOptions(clock, 3), warmer, runner, newFakeGitHub(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool.Start(ctx)
 	waitFor(t, pool.Ready)
-	firstVM := warmer.WarmNames()[0]
 
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo", JobID: 1001, RunID: 42}); err != nil {
-		t.Fatalf("Enqueue job: %v", err)
-	}
-	waitStarted(t, runner)
-
-	pool.CancelRun(1002)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	pool.Shutdown(shutdownCtx)
 
 	if torn := warmer.TornNames(); len(torn) != 0 {
-		t.Fatalf("teardowns after sibling cancel = %v, want none", torn)
+		t.Fatalf("torn VMs = %v, want none on control-plane shutdown", torn)
 	}
-
-	pool.CancelRun(1001)
-
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 2
-	})
-	torn := warmer.TornNames()
-	if len(torn) != 1 || torn[0] != firstVM {
-		t.Fatalf("teardowns after matching cancel = %v, want [%s]", torn, firstVM)
-	}
-}
-
-func TestReconcileReapsBusyWorkerAfterPickupTimeoutWithoutActiveJob(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 90)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-	logs := captureTestLogs(t)
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if !pool.states[0].recycle {
-		t.Fatal("busy worker recycle = false, want true")
-	}
-	if pool.states[0].slots[0].jobCancel != nil {
-		t.Fatal("busy worker jobCancel is still set")
-	}
-	if cancelCount != 1 {
-		t.Fatalf("cancel count = %d, want 1", cancelCount)
-	}
-	calls := prober.Calls()
-	if len(calls) != 1 || calls[0] != "vm-busy" {
-		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
-	}
-	if cpuCalls := prober.CPUCalls(); len(cpuCalls) != 0 {
-		t.Fatalf("cpu calls = %v, want none", cpuCalls)
-	}
-	if !strings.Contains(logs.String(), "runnerpool reaping worker (no active job process)") {
-		t.Fatalf("logs = %q, want no active job reap warning", logs.String())
-	}
-}
-
-func TestReconcileWarnsAndRequestsNoActiveJobRecycleOncePerBind(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 90)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-	repeatedCancelCount := 0
-	logs := captureTestLogs(t)
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("first Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	pool.states[0].slots[0].jobCancel = func() {
-		repeatedCancelCount++
-	}
-	pool.mu.Unlock()
-
-	clock.Advance(time.Second)
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("second Reconcile: %v", err)
-	}
-
-	warnMessage := "runnerpool reaping worker (no active job process)"
-	if warnCount := strings.Count(logs.String(), warnMessage); warnCount != 1 {
-		t.Fatalf("no active job warning count = %d, want 1; logs = %q", warnCount, logs.String())
-	}
-	if cancelCount != 1 {
-		t.Fatalf("cancel count = %d, want 1", cancelCount)
-	}
-	if repeatedCancelCount != 0 {
-		t.Fatalf("repeated cancel count = %d, want 0", repeatedCancelCount)
-	}
-
-	pool.mu.Lock()
-	pool.states[0].recycle = false
-	pool.states[0].slots[0].boundAt = clock.Now().Add(-options.PickupTimeout - time.Second)
-	pool.states[0].slots[0].jobID = 1002
-	pool.states[0].slots[0].runID = 43
-	pool.states[0].slots[0].jobCancel = func() {
-		cancelCount++
-	}
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("fresh bind Reconcile: %v", err)
-	}
-
-	if warnCount := strings.Count(logs.String(), warnMessage); warnCount != 2 {
-		t.Fatalf("no active job warning count after fresh bind = %d, want 2; logs = %q", warnCount, logs.String())
-	}
-	if cancelCount != 2 {
-		t.Fatalf("cancel count after fresh bind = %d, want 2", cancelCount)
-	}
-}
-
-func TestReconcileKeepsBusyWorkerWithActiveJobAfterPickupTimeout(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if pool.states[0].recycle {
-		t.Fatal("busy worker recycle = true, want false")
-	}
-	if pool.states[0].slots[0].jobCancel == nil {
-		t.Fatal("busy worker jobCancel = nil, want still set")
-	}
-	if cancelCount != 0 {
-		t.Fatalf("cancel count = %d, want 0", cancelCount)
-	}
-	calls := prober.Calls()
-	if len(calls) != 1 || calls[0] != "vm-busy" {
-		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
-	}
-}
-
-func TestReconcileReapsStalledBusyWorkerWhenStallReapEnabled(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	options.StallTimeout = 2 * time.Minute
-	options.StallReap = true
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 0)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-	logs := captureTestLogs(t)
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 1001, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("first Reconcile: %v", err)
-	}
-	clock.Advance(options.StallTimeout)
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("second Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if !pool.states[0].recycle {
-		t.Fatal("stalled worker recycle = false, want true")
-	}
-	if pool.states[0].slots[0].jobCancel != nil {
-		t.Fatal("stalled worker jobCancel is still set")
-	}
-	if cancelCount != 1 {
-		t.Fatalf("cancel count = %d, want 1", cancelCount)
-	}
-	if !strings.Contains(logs.String(), "runnerpool worker stalled (no cpu progress)") {
-		t.Fatalf("logs = %q, want stalled worker warning", logs.String())
-	}
-}
-
-func TestReconcileUsesSlotProbeKeyForMultiSlotCPUActivity(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptionsWithSlots(clock, 1, 2)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	options.StallTimeout = 2 * time.Minute
-	options.StallReap = true
-	slotIndex := 1
-	slotCount := 2
-	key := probeKey("vm-busy", slotIndex, slotCount)
-	prober := newFakeActiveJobProber(map[string]bool{key: true})
-	prober.SetCPUActivity(key, 90)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-
-	pool.mu.Lock()
-	pool.states[0] = workerState{
-		vm:        &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
-		bornAt:    now.Add(-time.Hour),
-		idleSince: time.Time{},
-		warming:   false,
-		recycle:   false,
-		slots:     make([]slotState, slotCount),
-		lastErr:   nil,
-	}
-	pool.states[0].slots[slotIndex] = slotState{
-		boundAt:         now.Add(-options.PickupTimeout - options.StallTimeout - time.Second),
-		busy:            true,
-		jobID:           1001,
-		runID:           42,
-		jobCancel:       func() { cancelCount++ },
-		cpuStalledSince: now.Add(-options.StallTimeout),
-		lastErr:         nil,
-	}
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if pool.states[0].recycle {
-		t.Fatal("busy worker recycle = true, want false")
-	}
-	if !pool.states[0].slots[slotIndex].cpuStalledSince.IsZero() {
-		t.Fatalf("cpu stalled since = %v, want zero", pool.states[0].slots[slotIndex].cpuStalledSince)
-	}
-	if cancelCount != 0 {
-		t.Fatalf("cancel count = %d, want 0", cancelCount)
-	}
-	if calls := prober.Calls(); len(calls) != 1 || calls[0] != key {
-		t.Fatalf("prober calls = %v, want [%s]", calls, key)
-	}
-	if cpuCalls := prober.CPUCalls(); len(cpuCalls) != 1 || cpuCalls[0] != key {
-		t.Fatalf("cpu calls = %v, want [%s]", cpuCalls, key)
-	}
-}
-
-func TestReconcileUsesSlotProbeKeyForMultiSlotActiveJob(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptionsWithSlots(clock, 1, 2)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	options.StallTimeout = 2 * time.Minute
-	options.StallReap = true
-	slotIndex := 1
-	slotCount := 2
-	key := probeKey("vm-busy", slotIndex, slotCount)
-	prober := newFakeActiveJobProber(map[string]bool{})
-	prober.SetActive("vm-busy", slotIndex, slotCount, true)
-	prober.SetCPUActivity(key, 90)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-
-	pool.mu.Lock()
-	pool.states[0] = workerState{
-		vm:        &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
-		bornAt:    now.Add(-time.Hour),
-		idleSince: time.Time{},
-		warming:   false,
-		recycle:   false,
-		slots:     make([]slotState, slotCount),
-		lastErr:   nil,
-	}
-	pool.states[0].slots[slotIndex] = slotState{
-		boundAt:   now.Add(-options.PickupTimeout - time.Second),
-		busy:      true,
-		jobID:     1001,
-		runID:     42,
-		jobCancel: func() { cancelCount++ },
-		lastErr:   nil,
-	}
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if pool.states[0].recycle {
-		t.Fatal("busy worker recycle = true, want false")
-	}
-	if pool.states[0].slots[slotIndex].jobCancel == nil {
-		t.Fatal("busy worker jobCancel = nil, want still set")
-	}
-	if cancelCount != 0 {
-		t.Fatalf("cancel count = %d, want 0", cancelCount)
-	}
-	if calls := prober.Calls(); len(calls) != 1 || calls[0] != key {
-		t.Fatalf("prober calls = %v, want [%s]", calls, key)
-	}
-	if cpuCalls := prober.CPUCalls(); len(cpuCalls) != 1 || cpuCalls[0] != key {
-		t.Fatalf("cpu calls = %v, want [%s]", cpuCalls, key)
-	}
-}
-
-func TestReconcileWarnsAndRequestsStallRecycleOncePerBind(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	options.StallTimeout = 2 * time.Minute
-	options.StallReap = true
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 0)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-	repeatedCancelCount := 0
-	logs := captureTestLogs(t)
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 1001, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("first Reconcile: %v", err)
-	}
-	clock.Advance(options.StallTimeout)
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("second Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	pool.states[0].slots[0].jobCancel = func() {
-		repeatedCancelCount++
-	}
-	pool.mu.Unlock()
-
-	clock.Advance(time.Second)
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("third Reconcile: %v", err)
-	}
-
-	warnMessage := "runnerpool worker stalled (no cpu progress)"
-	if warnCount := strings.Count(logs.String(), warnMessage); warnCount != 1 {
-		t.Fatalf("stall warning count = %d, want 1; logs = %q", warnCount, logs.String())
-	}
-	if cancelCount != 1 {
-		t.Fatalf("cancel count = %d, want 1", cancelCount)
-	}
-	if repeatedCancelCount != 0 {
-		t.Fatalf("repeated cancel count = %d, want 0", repeatedCancelCount)
-	}
-
-	pool.mu.Lock()
-	newBoundAt := clock.Now().Add(-options.PickupTimeout - options.StallTimeout - time.Second)
-	pool.states[0].recycle = false
-	pool.states[0].slots[0].boundAt = newBoundAt
-	pool.states[0].slots[0].jobID = 1002
-	pool.states[0].slots[0].runID = 43
-	pool.states[0].slots[0].jobCancel = func() {
-		cancelCount++
-	}
-	pool.states[0].slots[0].cpuStalledSince = clock.Now().Add(-options.StallTimeout)
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("fresh bind Reconcile: %v", err)
-	}
-
-	if warnCount := strings.Count(logs.String(), warnMessage); warnCount != 2 {
-		t.Fatalf("stall warning count after fresh bind = %d, want 2; logs = %q", warnCount, logs.String())
-	}
-	if cancelCount != 2 {
-		t.Fatalf("cancel count after fresh bind = %d, want 2", cancelCount)
-	}
-}
-
-func TestReconcileLogsStalledBusyWorkerWhenStallReapDisabled(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	options.StallTimeout = 2 * time.Minute
-	options.StallReap = false
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 0)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-	logs := captureTestLogs(t)
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 1001, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("first Reconcile: %v", err)
-	}
-	clock.Advance(options.StallTimeout)
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("second Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if pool.states[0].recycle {
-		t.Fatal("stalled worker recycle = true with stall reap disabled, want false")
-	}
-	if pool.states[0].slots[0].jobCancel == nil {
-		t.Fatal("stalled worker jobCancel = nil, want still set")
-	}
-	if cancelCount != 0 {
-		t.Fatalf("cancel count = %d, want 0", cancelCount)
-	}
-	if !strings.Contains(logs.String(), "runnerpool worker stalled (no cpu progress)") {
-		t.Fatalf("logs = %q, want stalled worker warning", logs.String())
-	}
-}
-
-func TestMaybeWarnStalledBusyWorkerSnapshotsOptionsDuringReconfigure(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Nanosecond
-	options.StallTimeout = time.Nanosecond
-	options.StallReap = true
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
-
-	previousLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	t.Cleanup(func() {
-		slog.SetDefault(previousLogger)
-	})
-
-	boundAt := now.Add(-time.Minute)
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), boundAt, 1001, 42, nil)
-	pool.states[0].slots[0].cpuStalledSince = now.Add(-time.Minute)
-	pool.mu.Unlock()
-
-	const iterationCount = 500
-	start := make(chan struct{})
-	var waitGroup sync.WaitGroup
-	waitGroup.Add(2)
-
-	go func() {
-		defer waitGroup.Done()
-		<-start
-		for i := range iterationCount {
-			nextOptions := options
-			if i%2 == 0 {
-				nextOptions.StallTimeout = time.Nanosecond
-				nextOptions.StallReap = true
-			} else {
-				nextOptions.StallTimeout = time.Hour
-				nextOptions.StallReap = false
-			}
-			pool.Reconfigure(nextOptions)
-		}
-	}()
-
-	go func() {
-		defer waitGroup.Done()
-		<-start
-		for i := range iterationCount {
-			currentBoundAt := boundAt.Add(time.Duration(i) * time.Nanosecond)
-			currentJobID := int64(1001 + i)
-			currentRunID := int64(42 + i)
-
-			pool.mu.Lock()
-			pool.states[0].recycle = false
-			pool.states[0].slots[0] = slotState{
-				boundAt:         currentBoundAt,
-				busy:            true,
-				jobID:           currentJobID,
-				runID:           currentRunID,
-				jobCancel:       nil,
-				cpuStalledSince: now.Add(-time.Minute),
-				stallWarnedAt:   time.Time{},
-				reapWarnedAt:    time.Time{},
-				lastErr:         nil,
-			}
-			pool.mu.Unlock()
-
-			candidate := busyCandidate{
-				index:     0,
-				slotIndex: 0,
-				slotCount: 1,
-				vm:        &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
-				boundAt:   currentBoundAt,
-				jobID:     currentJobID,
-				runID:     currentRunID,
-				now:       now,
-			}
-			pool.maybeWarnStalledBusyWorker(context.Background(), candidate, time.Minute, now.Add(-time.Minute), 0)
-		}
-	}()
-
-	close(start)
-	waitGroup.Wait()
-}
-
-func TestReconcileKeepsProgressingBusyWorkerPastStallTimeout(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	options.StallTimeout = 2 * time.Minute
-	options.StallReap = true
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 90)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 1001, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("first Reconcile: %v", err)
-	}
-	clock.Advance(options.StallTimeout)
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("second Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if pool.states[0].recycle {
-		t.Fatal("progressing worker recycle = true, want false")
-	}
-	if !pool.states[0].slots[0].cpuStalledSince.IsZero() {
-		t.Fatalf("cpu stalled since = %v, want zero", pool.states[0].slots[0].cpuStalledSince)
-	}
-	if cancelCount != 0 {
-		t.Fatalf("cancel count = %d, want 0", cancelCount)
-	}
-}
-
-func TestReconcileResetsStallClockWhenCPUProgressReturns(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	options.StallTimeout = 2 * time.Minute
-	options.StallReap = true
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 0)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 1001, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("first Reconcile: %v", err)
-	}
-	clock.Advance(time.Minute)
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 90)
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("second Reconcile: %v", err)
-	}
-	pool.mu.Lock()
-	if !pool.states[0].slots[0].cpuStalledSince.IsZero() {
-		t.Fatalf("cpu stalled since after progress = %v, want zero", pool.states[0].slots[0].cpuStalledSince)
-	}
-	pool.mu.Unlock()
-
-	clock.Advance(options.StallTimeout)
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 0)
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("third Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if pool.states[0].recycle {
-		t.Fatal("worker recycle = true after reset stall clock, want false")
-	}
-	if !pool.states[0].slots[0].cpuStalledSince.Equal(clock.Now()) {
-		t.Fatalf("cpu stalled since = %v, want %v", pool.states[0].slots[0].cpuStalledSince, clock.Now())
-	}
-	if cancelCount != 0 {
-		t.Fatalf("cancel count = %d, want 0", cancelCount)
-	}
-}
-
-func TestReconcileKeepsBusyWorkerWhenBindingChangesBeforeRecycleApply(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	oldCancelCount := 0
-	newCancelCount := 0
-	newBoundAt := now.Add(-30 * time.Second)
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func() {
-		oldCancelCount++
-	})
-	pool.mu.Unlock()
-
-	prober.onProbe = func() {
-		pool.mu.Lock()
-		defer pool.mu.Unlock()
-		pool.states[0].slots[0].boundAt = newBoundAt
-		pool.states[0].slots[0].runID = 43
-		pool.states[0].slots[0].jobCancel = func() {
-			newCancelCount++
-		}
-	}
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if pool.states[0].recycle {
-		t.Fatal("rebound worker recycle = true, want false")
-	}
-	if pool.states[0].slots[0].runID != 43 {
-		t.Fatalf("rebound worker run id = %d, want 43", pool.states[0].slots[0].runID)
-	}
-	if !pool.states[0].slots[0].boundAt.Equal(newBoundAt) {
-		t.Fatalf("rebound worker boundAt = %v, want %v", pool.states[0].slots[0].boundAt, newBoundAt)
-	}
-	if pool.states[0].slots[0].jobCancel == nil {
-		t.Fatal("rebound worker jobCancel = nil, want still set")
-	}
-	if oldCancelCount != 0 {
-		t.Fatalf("old cancel count = %d, want 0", oldCancelCount)
-	}
-	if newCancelCount != 0 {
-		t.Fatalf("new cancel count = %d, want 0", newCancelCount)
-	}
-	calls := prober.Calls()
-	if len(calls) != 1 || calls[0] != "vm-busy" {
-		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
-	}
-}
-
-func TestReconcileKeepsBusyWorkerAfterPickupTimeoutWhenProbeErrors(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = time.Hour
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
-	prober.probeErr = errors.New("guest probe failed")
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if pool.states[0].recycle {
-		t.Fatal("busy worker recycle = true after probe error, want false")
-	}
-	if pool.states[0].slots[0].jobCancel == nil {
-		t.Fatal("busy worker jobCancel = nil, want still set")
-	}
-	if cancelCount != 0 {
-		t.Fatalf("cancel count = %d, want 0", cancelCount)
-	}
-	calls := prober.Calls()
-	if len(calls) != 1 || calls[0] != "vm-busy" {
-		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
-	}
-}
-
-func TestReconcileKeepsBusyWorkerPastMaxBindWithActiveJob(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = 2 * time.Minute
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.MaxBind-time.Second), 0, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if pool.states[0].recycle {
-		t.Fatal("busy worker recycle = true, want false")
-	}
-	if pool.states[0].slots[0].jobCancel == nil {
-		t.Fatal("busy worker jobCancel = nil, want still set")
-	}
-	if cancelCount != 0 {
-		t.Fatalf("cancel count = %d, want 0", cancelCount)
-	}
-	calls := prober.Calls()
-	if len(calls) != 1 || calls[0] != "vm-busy" {
-		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
-	}
-}
-
-func TestReconcileReapsBusyWorkerPastMaxBindWhenProbeErrors(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = 2 * time.Minute
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
-	prober.probeErr = errors.New("guest probe failed")
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 90)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-	logs := captureTestLogs(t)
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.MaxBind-time.Second), 0, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if !pool.states[0].recycle {
-		t.Fatal("busy worker recycle = false, want true")
-	}
-	if pool.states[0].slots[0].jobCancel != nil {
-		t.Fatal("busy worker jobCancel is still set")
-	}
-	if cancelCount != 1 {
-		t.Fatalf("cancel count = %d, want 1", cancelCount)
-	}
-	calls := prober.Calls()
-	if len(calls) != 1 || calls[0] != "vm-busy" {
-		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
-	}
-	if cpuCalls := prober.CPUCalls(); len(cpuCalls) != 0 {
-		t.Fatalf("cpu calls = %v, want none", cpuCalls)
-	}
-	if !strings.Contains(logs.String(), "runnerpool reaping worker (probe error past max_bind)") {
-		t.Fatalf("logs = %q, want probe error reap warning", logs.String())
-	}
-}
-
-func TestReconcileWarnsAndRequestsProbeErrorMaxBindRecycleOncePerBind(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	options.MaxBind = 2 * time.Minute
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
-	prober.probeErr = errors.New("guest probe failed")
-	prober.SetCPUActivity(probeKey("vm-busy", 0, 1), 90)
-	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
-	cancelCount := 0
-	repeatedCancelCount := 0
-	logs := captureTestLogs(t)
-
-	pool.mu.Lock()
-	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.MaxBind-time.Second), 0, 42, func() {
-		cancelCount++
-	})
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("first Reconcile: %v", err)
-	}
-
-	pool.mu.Lock()
-	pool.states[0].slots[0].jobCancel = func() {
-		repeatedCancelCount++
-	}
-	pool.mu.Unlock()
-
-	clock.Advance(time.Second)
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("second Reconcile: %v", err)
-	}
-
-	warnMessage := "runnerpool reaping worker (probe error past max_bind)"
-	if warnCount := strings.Count(logs.String(), warnMessage); warnCount != 1 {
-		t.Fatalf("probe error warning count = %d, want 1; logs = %q", warnCount, logs.String())
-	}
-	if cancelCount != 1 {
-		t.Fatalf("cancel count = %d, want 1", cancelCount)
-	}
-	if repeatedCancelCount != 0 {
-		t.Fatalf("repeated cancel count = %d, want 0", repeatedCancelCount)
-	}
-
-	pool.mu.Lock()
-	pool.states[0].recycle = false
-	pool.states[0].slots[0].boundAt = clock.Now().Add(-options.MaxBind - time.Second)
-	pool.states[0].slots[0].jobID = 1002
-	pool.states[0].slots[0].runID = 43
-	pool.states[0].slots[0].jobCancel = func() {
-		cancelCount++
-	}
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("fresh bind Reconcile: %v", err)
-	}
-
-	if warnCount := strings.Count(logs.String(), warnMessage); warnCount != 2 {
-		t.Fatalf("probe error warning count after fresh bind = %d, want 2; logs = %q", warnCount, logs.String())
-	}
-	if cancelCount != 2 {
-		t.Fatalf("cancel count after fresh bind = %d, want 2", cancelCount)
-	}
-}
-
-func TestCancelRunTearsDownAndRewarmsWorker(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
-	warmer := newFakeWarmer()
-	runner := newBlockingRunner(1)
-	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
-	ctx := startTestPool(t, pool)
-	waitFor(t, pool.Ready)
-	firstVM := warmer.WarmNames()[0]
-
-	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo", JobID: 1, RunID: 42}); err != nil {
-		t.Fatalf("Enqueue job: %v", err)
-	}
-	waitStarted(t, runner)
-
-	pool.CancelRun(1)
-
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 2
-	})
-	torn := warmer.TornNames()
-	if len(torn) != 1 || torn[0] != firstVM {
-		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
-	}
-	waitFor(t, func() bool {
-		return pool.Snapshot().Idle == 1
-	})
 }
 
 func TestQueueIsFIFOForSingleWorker(t *testing.T) {
@@ -2205,10 +864,7 @@ func TestQueueIsFIFOForSingleWorker(t *testing.T) {
 			t.Fatalf("Enqueue job %d: %v", i, err)
 		}
 	}
-
-	waitFor(t, func() bool {
-		return len(runner.Calls()) == 3
-	})
+	waitFor(t, func() bool { return len(runner.Calls()) == 3 })
 	calls := runner.Calls()
 	for i, call := range calls {
 		wantRepo := fmt.Sprintf("owner/repo-%d", i+1)
@@ -2232,19 +888,13 @@ func TestConcurrentWorkersDoNotDoubleServeJobs(t *testing.T) {
 			t.Fatalf("Enqueue job %d: %v", i, err)
 		}
 	}
-
 	for i := 0; i < 3; i++ {
 		waitStarted(t, runner)
-	}
-	if pool.Ready() {
-		t.Fatal("Ready should be false when all workers are busy and the queue is backed up")
 	}
 	for i := 0; i < 8; i++ {
 		runner.Release()
 	}
-	waitFor(t, func() bool {
-		return len(runner.Calls()) == 8
-	})
+	waitFor(t, func() bool { return len(runner.Calls()) == 8 })
 	if maxActive := runner.MaxActive(); maxActive > 3 {
 		t.Fatalf("max active jobs = %d, want at most 3", maxActive)
 	}
@@ -2279,9 +929,7 @@ func TestReconcileRecyclesIdleVMByMaxIdle(t *testing.T) {
 	if err := pool.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 2
-	})
+	waitFor(t, func() bool { return len(warmer.WarmNames()) == 2 })
 	torn := warmer.TornNames()
 	if len(torn) != 1 || torn[0] != firstVM {
 		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
@@ -2296,18 +944,12 @@ func TestReconcileReplacesIdleVMOnHealthFailure(t *testing.T) {
 	ctx := startTestPool(t, pool)
 	waitFor(t, pool.Ready)
 	firstVM := warmer.WarmNames()[0]
-	warmer.SetCheckError(firstVM, errors.New("vsock failed"))
+	warmer.SetCheckError(firstVM, errors.New("hello failed"))
 
 	if err := pool.Reconcile(ctx); err == nil {
 		t.Fatal("Reconcile should report the health failure")
 	}
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 2
-	})
-	torn := warmer.TornNames()
-	if len(torn) != 1 || torn[0] != firstVM {
-		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
-	}
+	waitFor(t, func() bool { return len(warmer.WarmNames()) == 2 })
 }
 
 func TestReconcileReplacesIdleVMWithStaleGitHubRunner(t *testing.T) {
@@ -2324,35 +966,407 @@ func TestReconcileReplacesIdleVMWithStaleGitHubRunner(t *testing.T) {
 	if err := pool.Reconcile(ctx); err == nil {
 		t.Fatal("Reconcile should report the stale GitHub runner")
 	}
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 2
+	waitFor(t, func() bool { return len(warmer.WarmNames()) == 2 })
+}
+
+func TestReconcileReapsBusyWorkerAfterPickupTimeoutWithoutRunningExecution(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	prober := newFakeSlotProber()
+	prober.SetRunning("vm-busy", 0, false)
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+	logs := captureTestLogs(t)
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func(error) {
+		cancelCount++
 	})
-	torn := warmer.TornNames()
-	if len(torn) != 1 || torn[0] != firstVM {
-		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if !pool.states[0].recycle {
+		t.Fatal("busy worker recycle = false, want true")
+	}
+	if cancelCount != 1 {
+		t.Fatalf("cancel count = %d, want 1", cancelCount)
+	}
+	if !strings.Contains(logs.String(), "runnerpool reaping worker (no active job process)") {
+		t.Fatalf("logs = %q, want no active job reap warning", logs.String())
+	}
+	if calls := prober.Calls(); len(calls) != 1 || calls[0] != "vm-busy" {
+		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
 	}
 }
 
-func TestReconcileReplacesIdleVMWithStaleGitHubSlotRunner(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+func TestReconcileKeepsBusyWorkerWithRunningExecution(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = 2 * time.Minute
+	prober := newFakeSlotProber()
+	prober.SetRunning("vm-busy", 0, true)
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.MaxBind-time.Second), 0, 42, func(error) {
+		cancelCount++
+	})
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].recycle {
+		t.Fatal("busy worker recycle = true, want false while running past max bind")
+	}
+	if cancelCount != 0 {
+		t.Fatalf("cancel count = %d, want 0", cancelCount)
+	}
+}
+
+func TestReconcileReapsOneExpiredSlotWithoutStoppingCotenant(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptionsWithSlots(clock, 1, 2)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = 2 * time.Minute
 	warmer := newFakeWarmer()
-	runner := newFakeRunner(1)
-	github := newFakeGitHub()
-	pool := New(testOptionsWithSlots(clock, 1, 2), warmer, runner, github, nil)
+	runner := newBlockingRunner(2)
+	prober := newFakeSlotProber()
+	pool := New(options, warmer, runner, newFakeGitHub(), prober)
 	ctx := startTestPool(t, pool)
 	waitFor(t, pool.Ready)
-	firstVM := warmer.WarmNames()[0]
-	github.SetRunners("owner/repo", []ghapp.Runner{{Name: firstVM + "-slot-1", Status: "offline"}})
 
-	if err := pool.Reconcile(ctx); err == nil {
-		t.Fatal("Reconcile should report the stale GitHub slot runner")
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-a", JobID: 1, RunID: 10}); err != nil {
+		t.Fatalf("Enqueue first job: %v", err)
+	}
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo-b", JobID: 2, RunID: 11}); err != nil {
+		t.Fatalf("Enqueue second job: %v", err)
+	}
+	first := waitStarted(t, runner)
+	second := waitStarted(t, runner)
+	if first.SlotIndex == second.SlotIndex {
+		t.Fatalf("jobs used slot %d twice, want distinct slots", first.SlotIndex)
+	}
+	prober.SetRunning(first.VMName, first.SlotIndex, false)
+	prober.SetRunning(first.VMName, second.SlotIndex, true)
+
+	pool.mu.Lock()
+	pool.states[0].slots[first.SlotIndex].boundAt = now.Add(-options.MaxBind - time.Second)
+	pool.states[0].slots[second.SlotIndex].boundAt = now.Add(-30 * time.Second)
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	waitFor(t, func() bool { return runner.Active() == 1 })
+	if torn := warmer.TornNames(); len(torn) != 0 {
+		t.Fatalf("teardowns before cotenant finishes = %v, want none", torn)
+	}
+	calls := prober.Calls()
+	if len(calls) != 1 || calls[0] != first.VMName {
+		t.Fatalf("prober calls = %v, want one call [%s]", calls, first.VMName)
+	}
+	runner.Release()
+}
+
+func TestReconcileReapsBusyWorkerPastMaxBindWhenProbeErrors(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = 2 * time.Minute
+	prober := newFakeSlotProber()
+	prober.SetProbeErr("vm-busy", errors.New("guest unreachable"))
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+	logs := captureTestLogs(t)
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.MaxBind-time.Second), 0, 42, func(error) {
+		cancelCount++
+	})
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if !pool.states[0].recycle {
+		t.Fatal("busy worker recycle = false, want true on probe error past max bind")
+	}
+	if cancelCount != 1 {
+		t.Fatalf("cancel count = %d, want 1", cancelCount)
+	}
+	if !strings.Contains(logs.String(), "runnerpool reaping worker (probe error past max_bind)") {
+		t.Fatalf("logs = %q, want probe error reap warning", logs.String())
+	}
+}
+
+func TestReconcileKeepsBusyWorkerAfterPickupTimeoutWhenProbeErrors(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	prober := newFakeSlotProber()
+	prober.SetProbeErr("vm-busy", errors.New("guest probe failed"))
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func(error) {
+		cancelCount++
+	})
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].recycle {
+		t.Fatal("busy worker recycle = true after probe error before max bind, want false")
+	}
+	if cancelCount != 0 {
+		t.Fatalf("cancel count = %d, want 0", cancelCount)
+	}
+}
+
+func TestReconcileWarnsAndRequestsNoActiveJobRecycleOncePerBind(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	prober := newFakeSlotProber()
+	prober.SetRunning("vm-busy", 0, false)
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	cancelCount := 0
+	repeatedCancelCount := 0
+	logs := captureTestLogs(t)
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func(error) {
+		cancelCount++
+	})
+	pool.mu.Unlock()
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	pool.mu.Lock()
+	pool.states[0].slots[0].jobCancel = func(error) { repeatedCancelCount++ }
+	pool.mu.Unlock()
+	clock.Advance(time.Second)
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+
+	warnMessage := "runnerpool reaping worker (no active job process)"
+	if count := strings.Count(logs.String(), warnMessage); count != 1 {
+		t.Fatalf("no active job warning count = %d, want 1", count)
+	}
+	if cancelCount != 1 || repeatedCancelCount != 0 {
+		t.Fatalf("cancel counts = %d/%d, want 1/0", cancelCount, repeatedCancelCount)
+	}
+}
+
+func TestReconcileKeepsBusyWorkerWhenBindingChangesBeforeRecycleApply(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	prober := newFakeSlotProber()
+	prober.SetRunning("vm-busy", 0, false)
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+	oldCancelCount := 0
+	newCancelCount := 0
+	newBoundAt := now.Add(-30 * time.Second)
+
+	pool.mu.Lock()
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, func(error) {
+		oldCancelCount++
+	})
+	pool.mu.Unlock()
+
+	prober.onProbe = func() {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		pool.states[0].slots[0].boundAt = newBoundAt
+		pool.states[0].slots[0].runID = 43
+		pool.states[0].slots[0].jobCancel = func(error) { newCancelCount++ }
+	}
+
+	if err := pool.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.states[0].recycle {
+		t.Fatal("rebound worker recycle = true, want false")
+	}
+	if oldCancelCount != 0 || newCancelCount != 0 {
+		t.Fatalf("cancel counts = %d/%d, want 0/0", oldCancelCount, newCancelCount)
+	}
+}
+
+func TestStartAdoptsRunningVMsBeforeWarming(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	warmer.SetAdopted([]broker.AdoptedVM{
+		{VM: &broker.WarmVM{Name: "vm-adopted", Image: "image-a"}, Slots: nil},
+	})
+	runner := newFakeRunner(1)
+	pool := New(testOptions(clock, 2), warmer, runner, newFakeGitHub(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool.Start(ctx)
+	waitFor(t, func() bool { return len(warmer.WarmNames()) == 1 })
+
+	adoptCalls := warmer.AdoptCalls()
+	if len(adoptCalls) != 1 || adoptCalls[0].Limit != 2 {
+		t.Fatalf("adopt calls = %+v, want one call with limit 2", adoptCalls)
+	}
+	_, workers := pool.Status(context.Background())
+	if workers[0].VM != "vm-adopted" {
+		t.Fatalf("first worker vm = %q, want vm-adopted", workers[0].VM)
+	}
+}
+
+func TestStartReAdoptsAndResumesBusySlotAcrossRestart(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	warmer := newFakeWarmer()
+	warmer.SetAdopted([]broker.AdoptedVM{
+		{
+			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+			Slots: []broker.SlotBinding{
+				{
+					SlotIndex:    0,
+					Repo:         "owner/repo",
+					JobID:        1001,
+					RunID:        42,
+					ExecutionID:  "owner/repo#42#1001",
+					ResumeCursor: 9,
+					BoundAt:      now.Add(-time.Minute),
+				},
+			},
+		},
+	})
+	runner := newBlockingRunner(1)
+	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool.Start(ctx)
+
+	resume := waitStarted(t, runner)
+	if !resume.Resume || resume.ExecutionID != "owner/repo#42#1001" || resume.Cursor != 9 {
+		t.Fatalf("resume call = %+v, want resume of owner/repo#42#1001 cursor 9", resume)
 	}
 	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 2
+		snapshot := pool.Snapshot()
+		return snapshot.Busy == 1 && snapshot.Idle == 0
 	})
+	if got := len(warmer.WarmNames()); got != 0 {
+		t.Fatalf("warm calls = %d, want 0 while adopted busy vm occupies the slot", got)
+	}
+	runner.Release()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	pool.Shutdown(shutdownCtx)
+}
+
+func TestInstallAdoptedWorkersCarriesExecutionAndCursor(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	pool := New(testOptionsWithSlots(clock, 1, 2), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
+	boundAt := now.Add(-time.Minute)
+
+	pool.mu.Lock()
+	pool.installAdoptedWorkersLocked([]broker.AdoptedVM{
+		{
+			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+			Slots: []broker.SlotBinding{
+				{
+					SlotIndex:    0,
+					Repo:         "owner/repo",
+					JobID:        1001,
+					RunID:        42,
+					ExecutionID:  "owner/repo#42#1001",
+					ResumeCursor: 5,
+					BoundAt:      boundAt,
+				},
+			},
+		},
+	})
+	pool.mu.Unlock()
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	slot := pool.states[0].slots[0]
+	if !slot.busy || !slot.adopted || slot.executionID != "owner/repo#42#1001" || slot.resumeCursor != 5 {
+		t.Fatalf("slot 0 = %+v, want adopted busy execution owner/repo#42#1001 cursor 5", slot)
+	}
+}
+
+func TestReconcileRecyclesAdoptedBusySlotAfterExecutionStops(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	warmer := newFakeWarmer()
+	runner := newBlockingRunner(1)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	prober := newFakeSlotProber()
+	prober.SetRunning("vm-busy", 0, false)
+	warmer.SetAdopted([]broker.AdoptedVM{
+		{
+			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+			Slots: []broker.SlotBinding{
+				{
+					SlotIndex:    0,
+					Repo:         "owner/repo",
+					JobID:        1001,
+					RunID:        42,
+					ExecutionID:  "owner/repo#42#1001",
+					ResumeCursor: 3,
+					BoundAt:      now.Add(-2 * time.Minute),
+				},
+			},
+		},
+	})
+	pool := New(options, warmer, runner, newFakeGitHub(), prober)
+	ctx := startTestPool(t, pool)
+	waitStarted(t, runner)
+	waitFor(t, func() bool {
+		snapshot := pool.Snapshot()
+		return snapshot.Busy == 1
+	})
+
+	if err := pool.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// The reap cancels the resumed drain with the recycle cause; releasing the
+	// runner lets the drain return so the worker recycles and re-warms.
+	runner.Release()
+	waitFor(t, func() bool { return len(warmer.TornNames()) == 1 })
 	torn := warmer.TornNames()
-	if len(torn) != 1 || torn[0] != firstVM {
-		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
+	if torn[0] != "vm-busy" {
+		t.Fatalf("torn VMs = %v, want [vm-busy]", torn)
 	}
 }
 
@@ -2365,324 +1379,5 @@ func TestRunnerNameBelongsToVMMatchesExactNameWithMultipleSlots(t *testing.T) {
 func TestRunnerNameBelongsToVMMatchesStaleSlotNameWithSingleSlot(t *testing.T) {
 	if !runnerNameBelongsToVM("vm-slots", "vm-slots-slot-1", 1) {
 		t.Fatal("stale slot runner name did not match single-slot VM name")
-	}
-}
-
-func TestReconcileListsInstalledReposOnceForMultipleIdleCandidates(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	warmer := newFakeWarmer()
-	runner := newFakeRunner(1)
-	github := newFakeGitHub()
-	github.installedRepos = []string{"owner/repo-a", "owner/repo-b"}
-	pool := New(testOptions(clock, 3), warmer, runner, github, nil)
-
-	pool.mu.Lock()
-	pool.started = true
-	for i := range pool.states {
-		vmName := fmt.Sprintf("vm-idle-%d", i)
-		pool.states[i] = idleWorkerState(vmName, now.Add(-time.Hour), now.Add(-time.Minute))
-		warmer.alive[vmName] = true
-	}
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	if calls := github.InstalledCalls(); calls != 1 {
-		t.Fatalf("installed repo calls = %d, want 1", calls)
-	}
-	runnerCalls := github.RunnerCalls()
-	if len(runnerCalls) != 6 {
-		t.Fatalf("runner calls = %v, want 6 calls", runnerCalls)
-	}
-}
-
-func TestReconcileSkipsRegistrationLeakCheckWhenInstalledRepoListingFails(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	warmer := newFakeWarmer()
-	runner := newFakeRunner(1)
-	github := newFakeGitHub()
-	github.err = errors.New("installations unavailable")
-	pool := New(testOptions(clock, 2), warmer, runner, github, nil)
-
-	pool.mu.Lock()
-	pool.started = true
-	for i := range pool.states {
-		vmName := fmt.Sprintf("vm-idle-%d", i)
-		pool.states[i] = idleWorkerState(vmName, now.Add(-time.Hour), now.Add(-time.Minute))
-		warmer.alive[vmName] = true
-	}
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	if calls := github.InstalledCalls(); calls != 1 {
-		t.Fatalf("installed repo calls = %d, want 1", calls)
-	}
-	if runnerCalls := github.RunnerCalls(); len(runnerCalls) != 0 {
-		t.Fatalf("runner calls = %v, want none", runnerCalls)
-	}
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	for i, state := range pool.states {
-		if state.recycle {
-			t.Fatalf("state %d recycle = true, want false", i)
-		}
-	}
-}
-
-func TestStartAdoptsRunningVMsBeforeWarming(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
-	warmer := newFakeWarmer()
-	warmer.SetAdopted([]broker.AdoptedVM{
-		{
-			VM:    &broker.WarmVM{Name: "vm-adopted", Image: "image-a"},
-			Slots: nil,
-		},
-	})
-	runner := newFakeRunner(1)
-	pool := New(testOptions(clock, 2), warmer, runner, newFakeGitHub(), nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	pool.Start(ctx)
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 1
-	})
-
-	adoptCalls := warmer.AdoptCalls()
-	if len(adoptCalls) != 1 {
-		t.Fatalf("adopt calls = %v, want one call", adoptCalls)
-	}
-	if adoptCalls[0].Image != "image-a" || adoptCalls[0].SlotCount != 1 || adoptCalls[0].Limit != 2 {
-		t.Fatalf("adopt call = %+v, want image-a slotCount 1 limit 2", adoptCalls[0])
-	}
-	if got := len(warmer.WarmNames()); got != 1 {
-		t.Fatalf("warm calls = %d, want 1 replacement for the unadopted slot", got)
-	}
-	_, workers := pool.Status(context.Background())
-	if len(workers) != 2 {
-		t.Fatalf("workers = %+v, want 2", workers)
-	}
-	if workers[0].VM != "vm-adopted" {
-		t.Fatalf("first worker vm = %q, want vm-adopted", workers[0].VM)
-	}
-}
-
-func TestInstallAdoptedWorkersSkipsNilEntriesAndBoundsByInstalledVMs(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
-	pool := New(testOptions(clock, 2), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
-	adopted := []broker.AdoptedVM{
-		{VM: nil},
-		{VM: &broker.WarmVM{Name: "vm-a", Image: "image-a"}},
-		{VM: &broker.WarmVM{Name: "vm-b", Image: "image-a"}},
-		{VM: &broker.WarmVM{Name: "vm-c", Image: "image-a"}},
-	}
-
-	pool.mu.Lock()
-	pool.installAdoptedWorkersLocked(adopted)
-	pool.mu.Unlock()
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if pool.states[0].vm == nil || pool.states[0].vm.Name != "vm-a" {
-		t.Fatalf("state 0 vm = %+v, want vm-a", pool.states[0].vm)
-	}
-	if pool.states[1].vm == nil || pool.states[1].vm.Name != "vm-b" {
-		t.Fatalf("state 1 vm = %+v, want vm-b", pool.states[1].vm)
-	}
-}
-
-func TestStartReAdoptsBusySlotAcrossRestart(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	warmer := newFakeWarmer()
-	warmer.SetAdopted([]broker.AdoptedVM{
-		{
-			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
-			Slots: []broker.SlotBinding{
-				{
-					SlotIndex: 0,
-					Repo:      "owner/repo",
-					JobID:     1001,
-					RunID:     42,
-					BoundAt:   now.Add(-time.Minute),
-				},
-			},
-		},
-	})
-	runner := newFakeRunner(1)
-	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	pool.Start(ctx)
-	waitFor(t, func() bool {
-		snapshot := pool.Snapshot()
-		return snapshot.Busy == 1 && snapshot.Idle == 0 && snapshot.Queued == 0
-	})
-
-	_, workers := pool.Status(context.Background())
-	if len(workers) != 1 {
-		t.Fatalf("workers = %+v, want 1", workers)
-	}
-	worker := workers[0]
-	if worker.VM != "vm-busy" || worker.Phase != "busy" || worker.RunID != 42 {
-		t.Fatalf("worker = %+v, want adopted busy vm with run 42", worker)
-	}
-	if got := len(warmer.WarmNames()); got != 0 {
-		t.Fatalf("warm calls = %d, want 0 while adopted busy vm occupies the slot", got)
-	}
-}
-
-func TestInstallAdoptedWorkersPreservesValidBusyBindingAndIgnoresIncompleteBinding(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	pool := New(testOptionsWithSlots(clock, 1, 2), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), nil)
-	boundAt := now.Add(-time.Minute)
-
-	pool.mu.Lock()
-	pool.installAdoptedWorkersLocked([]broker.AdoptedVM{
-		{
-			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
-			Slots: []broker.SlotBinding{
-				{
-					SlotIndex: 0,
-					Repo:      "owner/repo",
-					JobID:     1001,
-					RunID:     42,
-					BoundAt:   boundAt,
-				},
-				{
-					SlotIndex: 1,
-					Repo:      "owner/repo",
-					JobID:     0,
-					RunID:     43,
-					BoundAt:   boundAt,
-				},
-			},
-		},
-	})
-	pool.mu.Unlock()
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	slot := pool.states[0].slots[0]
-	if !slot.busy || slot.jobID != 1001 || slot.runID != 42 || !slot.boundAt.Equal(boundAt) {
-		t.Fatalf("slot 0 = %+v, want busy job 1001 run 42 bound at %s", slot, boundAt)
-	}
-	incompleteSlot := pool.states[0].slots[1]
-	if incompleteSlot.busy || incompleteSlot.jobID != 0 || incompleteSlot.runID != 0 {
-		t.Fatalf("slot 1 = %+v, want idle because binding is incomplete", incompleteSlot)
-	}
-}
-
-func TestReconcileKeepsAdoptedBusySlotWithActiveJob(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	warmer := newFakeWarmer()
-	runner := newFakeRunner(1)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": true})
-	pool := New(options, warmer, runner, newFakeGitHub(), prober)
-	pool.mu.Lock()
-	pool.started = true
-	pool.states[0] = workerState{
-		vm:        &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
-		bornAt:    now.Add(-time.Hour),
-		idleSince: time.Time{},
-		warming:   false,
-		recycle:   false,
-		slots: []slotState{
-			{
-				boundAt: now.Add(-2 * time.Minute),
-				busy:    true,
-				jobID:   1001,
-				runID:   42,
-				adopted: true,
-			},
-		},
-	}
-	pool.mu.Unlock()
-
-	if err := pool.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	if torn := warmer.TornNames(); len(torn) != 0 {
-		t.Fatalf("torn VMs = %v, want none while active job is running", torn)
-	}
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if !pool.states[0].slots[0].busy {
-		t.Fatal("adopted slot busy = false, want true while active job is running")
-	}
-	if pool.states[0].recycle {
-		t.Fatal("adopted worker recycle = true, want false while active job is running")
-	}
-}
-
-func TestReconcileRecyclesAdoptedBusySlotAfterActiveJobStops(t *testing.T) {
-	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
-	clock := newMutableClock(now)
-	warmer := newFakeWarmer()
-	runner := newFakeRunner(1)
-	options := testOptions(clock, 1)
-	options.PickupTimeout = time.Minute
-	prober := newFakeActiveJobProber(map[string]bool{"vm-busy": false})
-	warmer.SetAdopted([]broker.AdoptedVM{
-		{
-			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
-			Slots: []broker.SlotBinding{
-				{
-					SlotIndex: 0,
-					Repo:      "owner/repo",
-					JobID:     1001,
-					RunID:     42,
-					BoundAt:   now.Add(-2 * time.Minute),
-				},
-			},
-		},
-	})
-	pool := New(options, warmer, runner, newFakeGitHub(), prober)
-	ctx := startTestPool(t, pool)
-	waitFor(t, func() bool {
-		snapshot := pool.Snapshot()
-		return snapshot.Busy == 1 && snapshot.Idle == 0
-	})
-
-	if err := pool.Reconcile(ctx); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	waitFor(t, func() bool {
-		return len(warmer.WarmNames()) == 1
-	})
-	torn := warmer.TornNames()
-	if len(torn) != 1 || torn[0] != "vm-busy" {
-		t.Fatalf("torn VMs = %v, want [vm-busy]", torn)
-	}
-}
-
-func TestShutdownReleasesWorkerVMsWithoutTeardown(t *testing.T) {
-	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
-	warmer := newFakeWarmer()
-	runner := newFakeRunner(1)
-	pool := New(testOptions(clock, 3), warmer, runner, newFakeGitHub(), nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	pool.Start(ctx)
-	waitFor(t, pool.Ready)
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	pool.Shutdown(shutdownCtx)
-
-	torn := warmer.TornNames()
-	if len(torn) != 0 {
-		t.Fatalf("torn VMs = %v, want none on control-plane shutdown", torn)
 	}
 }

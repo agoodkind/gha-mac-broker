@@ -31,9 +31,20 @@ func runGuestSupervisor(ctx context.Context, args []string) error {
 		slog.ErrorContext(ctx, "guest-supervisor flag parse failed", "err", err)
 		return fmt.Errorf("guest-supervisor flags: %w", err)
 	}
+	// Mint a per-boot token when the env token is unset, so the golden's baked
+	// launchd unit (KeepAlive, no env token) boots cleanly instead of crashlooping.
+	// An env-provided token still wins for tests and dev. The host reads the file
+	// over the tart-exec control channel and dials the guest agent with it.
 	token := os.Getenv(guestAgentCredentialEnv)
 	if token == "" {
-		return fmt.Errorf("guest-supervisor requires %s", guestAgentCredentialEnv)
+		minted, err := guestsupervisor.MintToken()
+		if err != nil {
+			return fmt.Errorf("guest-supervisor mint token: %w", err)
+		}
+		token = minted
+	}
+	if err := guestsupervisor.WriteTokenFile(guestsupervisor.TokenPath, token); err != nil {
+		return fmt.Errorf("guest-supervisor write token: %w", err)
 	}
 	if *slotCount == 0 {
 		return fmt.Errorf("guest-supervisor requires at least one slot")

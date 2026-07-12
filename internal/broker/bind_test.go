@@ -6,345 +6,364 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
+	"goodkind.io/gha-mac-broker/internal/guestproto"
 	"goodkind.io/gha-mac-broker/internal/tart"
 )
 
-func TestActiveJobProbeScriptAvoidsSelfMatch(t *testing.T) {
-	if !strings.Contains(activeJobProbeScript, "[R]unner\\.Worker") {
-		t.Fatalf("active job probe script = %q, want bracketed Runner.Worker pattern", activeJobProbeScript)
+// stubStream is a canned JobStatus stream. It replays events, then reports err.
+type stubStream struct {
+	events []*guestproto.JobStatusEvent
+	pos    int
+	err    error
+}
+
+func (s *stubStream) Receive() bool {
+	if s.pos < len(s.events) {
+		s.pos++
+		return true
 	}
-	if strings.Contains(activeJobProbeScript, "Runner.Worker") {
-		t.Fatalf("active job probe script = %q, want no bare Runner.Worker substring", activeJobProbeScript)
+	return false
+}
+
+func (s *stubStream) Msg() *guestproto.JobStatusEvent { return s.events[s.pos-1] }
+func (s *stubStream) Err() error                      { return s.err }
+func (s *stubStream) Close() error                    { return nil }
+
+// stubGuest is a scripted guestConn for host-side unit tests.
+type stubGuest struct {
+	mu            sync.Mutex
+	hello         *guestproto.HelloResponse
+	helloErr      error
+	runResp       *guestproto.RunJobResponse
+	runErr        error
+	runRequests   []*guestproto.RunJobRequest
+	statusFactory []func(from uint64) (jobStatusStream, error)
+	statusCalls   []uint64
+	reattach      *guestproto.ReattachResponse
+	reattachErr   error
+	cancelCalls   []string
+	drainCalls    int
+}
+
+func (g *stubGuest) Hello(_ context.Context) (*guestproto.HelloResponse, error) {
+	if g.helloErr != nil {
+		return nil, g.helloErr
+	}
+	if g.hello != nil {
+		return g.hello, nil
+	}
+	return &guestproto.HelloResponse{ProtocolMajor: hostProtocolMajor}, nil
+}
+
+func (g *stubGuest) RunJob(_ context.Context, request *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error) {
+	g.mu.Lock()
+	g.runRequests = append(g.runRequests, request)
+	g.mu.Unlock()
+	if g.runErr != nil {
+		return nil, g.runErr
+	}
+	return g.runResp, nil
+}
+
+func (g *stubGuest) JobStatus(_ context.Context, _ string, fromSequence uint64) (jobStatusStream, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.statusCalls = append(g.statusCalls, fromSequence)
+	index := len(g.statusCalls) - 1
+	if index >= len(g.statusFactory) {
+		index = len(g.statusFactory) - 1
+	}
+	return g.statusFactory[index](fromSequence)
+}
+
+func (g *stubGuest) Reattach(_ context.Context) (*guestproto.ReattachResponse, error) {
+	if g.reattachErr != nil {
+		return nil, g.reattachErr
+	}
+	return g.reattach, nil
+}
+
+func (g *stubGuest) Drain(_ context.Context) (*guestproto.DrainResponse, error) {
+	g.mu.Lock()
+	g.drainCalls++
+	g.mu.Unlock()
+	return &guestproto.DrainResponse{Idle: true, ActiveExecutions: 0}, nil
+}
+
+func (g *stubGuest) CancelJob(_ context.Context, executionID string) error {
+	g.mu.Lock()
+	g.cancelCalls = append(g.cancelCalls, executionID)
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *stubGuest) statusCallCursors() []uint64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]uint64(nil), g.statusCalls...)
+}
+
+func (g *stubGuest) cancelledExecutions() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.cancelCalls...)
+}
+
+func logEvent(sequence uint64, data string) *guestproto.JobStatusEvent {
+	return &guestproto.JobStatusEvent{
+		Sequence: sequence,
+		Event: &guestproto.JobStatusEvent_Log{
+			Log: &guestproto.LogChunk{Stream: guestproto.LogChunk_STDOUT, Data: []byte(data)},
+		},
 	}
 }
 
-func TestRunJobRemoteCommandKeepsLegacySingleSlotPath(t *testing.T) {
-	command := runJobRemoteCommand("encoded-jit", 0, 1)
-	want := "cd ~/actions-runner && export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= GIT_TERMINAL_PROMPT=0 && ./run.sh --jitconfig 'encoded-jit'"
-	if command != want {
-		t.Fatalf("single-slot command = %q, want %q", command, want)
-	}
-	if strings.Contains(command, "GCM_INTERACTIVE") {
-		t.Fatalf("single slot command = %q, want no GCM_INTERACTIVE", command)
+func terminalEvent(sequence uint64, exitCode int32) *guestproto.JobStatusEvent {
+	return &guestproto.JobStatusEvent{
+		Sequence: sequence,
+		Event: &guestproto.JobStatusEvent_Result{
+			Result: &guestproto.TerminalResult{ExitCode: exitCode, Message: ""},
+		},
 	}
 }
 
-func TestRunJobRemoteCommandUsesSlotHomeAndTMPDIR(t *testing.T) {
-	command := runJobRemoteCommand("encoded-jit", 1, 2)
-	for _, fragment := range []string{
-		`base_home="$HOME"`,
-		`runner_home="$base_home/actions-runner-1"`,
-		`export TMPDIR="$base_home/tmp-1"`,
-		`export HOME="$base_home/slot-home-1"`,
-		`mkdir -p "$HOME"`,
-		`slot_keychain="$HOME/Library/Keychains/login.keychain-db"`,
-		`security create-keychain -p "" "$slot_keychain"`,
-		`security default-keychain -s "$slot_keychain"`,
-		`security unlock-keychain -p "" "$slot_keychain"`,
-		"export GIT_CONFIG_COUNT=1",
-		"export GIT_CONFIG_KEY_0=credential.helper",
-		"export GIT_CONFIG_VALUE_0=",
-		"export GIT_TERMINAL_PROMPT=0",
-		"./run.sh --jitconfig 'encoded-jit'",
-	} {
-		if !strings.Contains(command, fragment) {
-			t.Fatalf("slot command = %q, want fragment %q", command, fragment)
-		}
-	}
-	homeIndex := strings.Index(command, `export HOME="$base_home/slot-home-1"`)
-	cdIndex := strings.Index(command, `cd "$runner_home"`)
-	if homeIndex < 0 || cdIndex < 0 || homeIndex > cdIndex {
-		t.Fatalf("slot command = %q, want HOME exported before cd into runner home", command)
-	}
-	// The isolated slot HOME needs a default keychain, set after HOME is exported
-	// and before the runner starts, so signing steps do not fail with "A default
-	// keychain could not be found".
-	keychainIndex := strings.Index(command, `security default-keychain -s "$slot_keychain"`)
-	if keychainIndex < homeIndex || keychainIndex > cdIndex {
-		t.Fatalf("slot command = %q, want default keychain set after HOME and before cd", command)
-	}
-	if strings.Contains(command, "cd ~/actions-runner &&") {
-		t.Fatalf("slot command = %q, want no legacy runner home", command)
-	}
-	if strings.Contains(command, `runner_home="$HOME/actions-runner-1"`) {
-		t.Fatalf("slot command = %q, want runner home from base home", command)
-	}
-	if strings.Contains(command, "GCM_INTERACTIVE") {
-		t.Fatalf("slot command = %q, want no GCM_INTERACTIVE", command)
-	}
-}
-
-func TestCloneRunnerSlotsCommandSkipsSingleSlot(t *testing.T) {
-	command := cloneRunnerSlotsCommand(1)
-	if command != "" {
-		t.Fatalf("single-slot clone command = %q, want empty", command)
-	}
-}
-
-func TestCloneRunnerSlotsCommandRefreshesHomebrewBeforeCloningSlots(t *testing.T) {
-	command := cloneRunnerSlotsCommand(3)
-	for _, fragment := range []string{
-		`brew_boot_refresh_marker="/tmp/swift-mk-brew-boot-refreshed"`,
-		`rm -f "$brew_boot_refresh_marker"`,
-		`if command -v brew >/dev/null 2>&1; then`,
-		`brew update --quiet`,
-		`grep -Eiq "already locked|another active homebrew|another .* process is already running"`,
-		`: > "$brew_boot_refresh_marker"`,
-	} {
-		if !strings.Contains(command, fragment) {
-			t.Fatalf("clone command = %q, want fragment %q", command, fragment)
-		}
-	}
-	refreshIndex := strings.Index(command, `rm -f "$brew_boot_refresh_marker"`)
-	slotLoopIndex := strings.Index(command, `while [[ "$slot_index" -lt "$slot_count" ]]`)
-	if refreshIndex < 0 || slotLoopIndex < 0 || refreshIndex > slotLoopIndex {
-		t.Fatalf("clone command = %q, want Homebrew refresh before slot loop", command)
-	}
-}
-
-func TestCloneRunnerSlotsCommandCopiesGoldenRunnerToSlotDirs(t *testing.T) {
-	command := cloneRunnerSlotsCommand(3)
-	for _, fragment := range []string{
-		"slot_count=3",
-		`cp -R "$HOME/actions-runner" "$runner_home"`,
-		`mkdir -p "$tmp_dir"`,
-		`warm_cache_paths=(`,
-		`".local"`,
-		`".swiftpm"`,
-		`".cache"`,
-		`"Library/Caches/org.swift.swiftpm"`,
-		`"Library/Caches/Homebrew"`,
-		`"Library/Developer/Xcode/DerivedData"`,
-		`".gitconfig"`,
-		`".netrc"`,
-		`slot_home="$HOME/slot-home-$slot_index"`,
-		`rm -rf "$slot_home"`,
-		`mkdir -p "$slot_home"`,
-		`source_path="$HOME/$warm_cache_path"`,
-		`dest_path="$slot_home/$warm_cache_path"`,
-		`mkdir -p "$(dirname "$dest_path")"`,
-		`cp -cR "$source_path" "$dest_path"`,
-		`cp -R "$source_path" "$dest_path"`,
-	} {
-		if !strings.Contains(command, fragment) {
-			t.Fatalf("clone command = %q, want fragment %q", command, fragment)
-		}
-	}
-	// The toolchain is keyed by source hash and restored per slot by actions/cache,
-	// so it must not be seeded into the slot home (a seed/cache merge risk).
-	if strings.Contains(command, ".swift-mk-ci-toolchain") {
-		t.Fatalf("clone command = %q, want no toolchain in the warm cache seed", command)
-	}
-}
-
-func TestActiveJobProbeCommandTargetsSlotRunner(t *testing.T) {
-	command := activeJobProbeCommand(2, 4)
-	if !strings.Contains(command, "actions-runner-2/bin/[R]unner\\.Worker") {
-		t.Fatalf("active job probe command = %q, want slot runner path", command)
-	}
-	if strings.Contains(command, "bin/Runner.Worker") {
-		t.Fatalf("active job probe command = %q, want bracketed Runner.Worker pattern", command)
-	}
-}
-
-func TestSlotCPUActivityCommandTargetsSlotRunnerAndSumsSubtree(t *testing.T) {
-	command := slotCPUActivityCommand(2, 4)
-	for _, fragment := range []string{
-		"actions-runner-2/bin/[R]unner\\.Worker",
-		"ps -Ao pid=,ppid=,pcpu=",
-		`awk -v roots="$roots"`,
-		"while (changed)",
-		`printf "%.1f\n", total`,
-	} {
-		if !strings.Contains(command, fragment) {
-			t.Fatalf("slot cpu activity command = %q, want fragment %q", command, fragment)
-		}
-	}
-	if strings.Contains(command, "bin/Runner.Worker") {
-		t.Fatalf("slot cpu activity command = %q, want bracketed Runner.Worker pattern", command)
-	}
-	for _, disallowed := range []string{"head", "tail", "sort"} {
-		if strings.Contains(command, disallowed) {
-			t.Fatalf("slot cpu activity command = %q, want no %s", command, disallowed)
-		}
-	}
-}
-
-func TestRunJobClearsSlotBindingAfterJobCompletion(t *testing.T) {
+func stubBinder(t *testing.T, guest guestConn) *Binder {
+	t.Helper()
 	t.Setenv("HOME", t.TempDir())
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-tart")
-	bindingFile := filepath.Join(dir, "binding.json")
-	runStartedFile := filepath.Join(dir, "run-started")
-	writeRunJobFakeTart(t, bin, bindingFile, runStartedFile, "complete")
-
 	cfg := &config.Config{Labels: []string{"self-hosted"}}
-	binder := New(cfg, newRunJobTestGitHubClient(t), tart.New(bin))
-	err := binder.RunJob(
-		context.Background(),
-		&WarmVM{Name: "warm-vm-1"},
-		"owner/repo",
-		"runner-1",
-		0,
-		1,
-		1001,
-		42,
-		time.Date(2026, 7, 3, 11, 59, 0, 0, time.UTC),
-	)
+	binder := New(cfg, newRunJobTestGitHubClient(t), tart.New("/nonexistent-tart"))
+	binder.guestFor = func(_ context.Context, _ *WarmVM) (guestConn, error) {
+		return guest, nil
+	}
+	return binder
+}
+
+func TestRunJobAcceptedZeroExitReturnsNil(t *testing.T) {
+	guest := &stubGuest{
+		runResp: &guestproto.RunJobResponse{Outcome: guestproto.RunJobResponse_ACCEPTED},
+		statusFactory: []func(uint64) (jobStatusStream, error){
+			func(uint64) (jobStatusStream, error) {
+				return &stubStream{events: []*guestproto.JobStatusEvent{logEvent(1, "hi"), terminalEvent(2, 0)}}, nil
+			},
+		},
+	}
+	binder := stubBinder(t, guest)
+	err := binder.RunJob(context.Background(), &WarmVM{Name: "warm-vm-1"}, "owner/repo", "runner-1", 0, 1, 1001, 42, time.Time{})
 	if err != nil {
 		t.Fatalf("RunJob: %v", err)
 	}
-	if _, err := os.Stat(runStartedFile); err != nil {
-		t.Fatalf("run started file stat err = %v, want completed guest run", err)
+	if len(guest.runRequests) != 1 {
+		t.Fatalf("run requests = %d, want 1", len(guest.runRequests))
 	}
-	if _, err := os.Stat(bindingFile); !os.IsNotExist(err) {
-		t.Fatalf("binding file stat err = %v, want removed binding file", err)
+	request := guest.runRequests[0]
+	if request.GetExecutionId() != "owner/repo#42#1001" {
+		t.Fatalf("execution id = %q, want owner/repo#42#1001", request.GetExecutionId())
+	}
+	if request.GetSlot() != 0 {
+		t.Fatalf("slot = %d, want 0", request.GetSlot())
+	}
+	if request.GetMeta().GetJobId() != 1001 || request.GetMeta().GetRunId() != 42 {
+		t.Fatalf("meta = %+v, want job 1001 run 42", request.GetMeta())
+	}
+	if request.GetEnv()["GIT_TERMINAL_PROMPT"] != "0" {
+		t.Fatalf("env = %v, want GIT_TERMINAL_PROMPT=0", request.GetEnv())
 	}
 }
 
-func TestRunJobClearsSlotBindingAfterJobCompletionWithCanceledContext(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-tart")
-	bindingFile := filepath.Join(dir, "binding.json")
-	runStartedFile := filepath.Join(dir, "run-started")
-	writeRunJobFakeTart(t, bin, bindingFile, runStartedFile, "complete")
+func TestRunJobNonzeroExitReturnsError(t *testing.T) {
+	guest := &stubGuest{
+		runResp: &guestproto.RunJobResponse{Outcome: guestproto.RunJobResponse_ACCEPTED},
+		statusFactory: []func(uint64) (jobStatusStream, error){
+			func(uint64) (jobStatusStream, error) {
+				return &stubStream{events: []*guestproto.JobStatusEvent{terminalEvent(1, 7)}}, nil
+			},
+		},
+	}
+	binder := stubBinder(t, guest)
+	err := binder.RunJob(context.Background(), &WarmVM{Name: "warm-vm-1"}, "owner/repo", "runner-1", 0, 1, 1001, 42, time.Time{})
+	if err == nil {
+		t.Fatal("RunJob error = nil, want nonzero-exit error")
+	}
+}
 
-	cfg := &config.Config{Labels: []string{"self-hosted"}}
-	binder := New(cfg, newRunJobTestGitHubClient(t), tart.New(bin))
-	ctx := contextErrAfterFile{Context: context.Background(), path: runStartedFile}
-	err := binder.RunJob(
-		ctx,
-		&WarmVM{Name: "warm-vm-1"},
-		"owner/repo",
-		"runner-1",
-		0,
-		1,
-		1001,
-		42,
-		time.Date(2026, 7, 3, 11, 59, 0, 0, time.UTC),
-	)
+func TestRunJobConflictReturnsErrorWithoutDraining(t *testing.T) {
+	guest := &stubGuest{
+		runResp: &guestproto.RunJobResponse{Outcome: guestproto.RunJobResponse_CONFLICT},
+	}
+	binder := stubBinder(t, guest)
+	err := binder.RunJob(context.Background(), &WarmVM{Name: "warm-vm-1"}, "owner/repo", "runner-1", 0, 1, 1001, 42, time.Time{})
+	if err == nil {
+		t.Fatal("RunJob error = nil, want conflict error")
+	}
+	if len(guest.statusCallCursors()) != 0 {
+		t.Fatalf("status calls = %v, want none on conflict", guest.statusCallCursors())
+	}
+}
+
+func TestDrainJobReconnectsFromCursorAfterMidStreamDrop(t *testing.T) {
+	guest := &stubGuest{
+		statusFactory: []func(uint64) (jobStatusStream, error){
+			func(uint64) (jobStatusStream, error) {
+				return &stubStream{
+					events: []*guestproto.JobStatusEvent{logEvent(1, "a"), logEvent(2, "b")},
+					err:    errors.New("stream dropped"),
+				}, nil
+			},
+			func(uint64) (jobStatusStream, error) {
+				return &stubStream{events: []*guestproto.JobStatusEvent{terminalEvent(3, 0)}}, nil
+			},
+		},
+	}
+	binder := stubBinder(t, guest)
+	err := binder.drainJob(context.Background(), guest, "owner/repo#42#1001", 0, &WarmVM{Name: "warm-vm-1"}, 0, 1)
 	if err != nil {
-		t.Fatalf("RunJob: %v", err)
+		t.Fatalf("drainJob: %v", err)
 	}
-	if _, err := os.Stat(bindingFile); !os.IsNotExist(err) {
-		t.Fatalf("binding file stat err = %v, want removed binding file", err)
+	cursors := guest.statusCallCursors()
+	if len(cursors) != 2 {
+		t.Fatalf("status calls = %v, want two (initial + reconnect)", cursors)
+	}
+	if cursors[0] != 0 || cursors[1] != 2 {
+		t.Fatalf("reconnect cursors = %v, want [0 2]", cursors)
 	}
 }
 
-func TestRunJobKeepsSlotBindingWhenContextCanceled(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-tart")
-	bindingFile := filepath.Join(dir, "binding.json")
-	runStartedFile := filepath.Join(dir, "run-started")
-	writeRunJobFakeTart(t, bin, bindingFile, runStartedFile, "block")
+func TestDrainJobExecutionNotFoundFreesSlot(t *testing.T) {
+	guest := &stubGuest{
+		statusFactory: []func(uint64) (jobStatusStream, error){
+			func(uint64) (jobStatusStream, error) {
+				return nil, connect.NewError(connect.CodeNotFound, errors.New("execution not found"))
+			},
+		},
+	}
+	binder := stubBinder(t, guest)
+	err := binder.drainJob(context.Background(), guest, "owner/repo#42#1001", 0, &WarmVM{Name: "warm-vm-1"}, 0, 1)
+	if err != nil {
+		t.Fatalf("drainJob = %v, want nil for expired execution", err)
+	}
+}
 
-	cfg := &config.Config{Labels: []string{"self-hosted"}}
-	binder := New(cfg, newRunJobTestGitHubClient(t), tart.New(bin))
+func TestDrainJobRecycleCauseCancelsThenDrainsToTerminal(t *testing.T) {
+	guest := &stubGuest{
+		statusFactory: []func(uint64) (jobStatusStream, error){
+			func(uint64) (jobStatusStream, error) {
+				return &stubStream{events: []*guestproto.JobStatusEvent{terminalEvent(5, 0)}}, nil
+			},
+		},
+	}
+	binder := stubBinder(t, guest)
+	recycleCause := errors.New("recycle slot")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(recycleCause)
+	err := binder.drainJob(ctx, guest, "owner/repo#42#1001", 0, &WarmVM{Name: "warm-vm-1"}, 0, 1)
+	if err != nil {
+		t.Fatalf("drainJob = %v, want nil after cancel-drain to zero exit", err)
+	}
+	if cancels := guest.cancelledExecutions(); len(cancels) != 1 || cancels[0] != "owner/repo#42#1001" {
+		t.Fatalf("cancel calls = %v, want [owner/repo#42#1001]", cancels)
+	}
+}
+
+func TestDrainJobPlainCancelDetachesWithoutCancelingJob(t *testing.T) {
+	guest := &stubGuest{
+		statusFactory: []func(uint64) (jobStatusStream, error){
+			func(uint64) (jobStatusStream, error) {
+				return &stubStream{events: []*guestproto.JobStatusEvent{terminalEvent(1, 0)}}, nil
+			},
+		},
+	}
+	binder := stubBinder(t, guest)
 	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- binder.RunJob(
-			ctx,
-			&WarmVM{Name: "warm-vm-1"},
-			"owner/repo",
-			"runner-1",
-			0,
-			1,
-			1001,
-			42,
-			time.Date(2026, 7, 3, 11, 59, 0, 0, time.UTC),
-		)
-	}()
-
-	waitForFile(t, runStartedFile)
-	if _, err := os.Stat(bindingFile); err != nil {
-		t.Fatalf("binding file stat err = %v, want binding file before cancellation", err)
-	}
 	cancel()
-	select {
-	case err := <-errCh:
-		if err == nil {
-			t.Fatal("RunJob error = nil, want canceled exec error")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("RunJob did not return after context cancellation")
+	err := binder.drainJob(ctx, guest, "owner/repo#42#1001", 0, &WarmVM{Name: "warm-vm-1"}, 0, 1)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("drainJob = %v, want context.Canceled detach", err)
 	}
-	if ctx.Err() != context.Canceled {
-		t.Fatalf("context err = %v, want context.Canceled", ctx.Err())
+	if cancels := guest.cancelledExecutions(); len(cancels) != 0 {
+		t.Fatalf("cancel calls = %v, want none on plain-cancel detach", cancels)
 	}
-	if _, err := os.Stat(bindingFile); err != nil {
-		t.Fatalf("binding file stat err = %v, want binding file left for adoption", err)
+	if calls := guest.statusCallCursors(); len(calls) != 0 {
+		t.Fatalf("status calls = %v, want none on plain-cancel detach", calls)
 	}
 }
 
-type contextErrAfterFile struct {
-	context.Context
-	path string
-}
-
-func (ctx contextErrAfterFile) Err() error {
-	if _, err := os.Stat(ctx.path); err == nil {
-		return context.Canceled
+func TestRunningSlotsReportsRunningExecutions(t *testing.T) {
+	guest := &stubGuest{
+		reattach: &guestproto.ReattachResponse{
+			Executions: []*guestproto.ExecutionState{
+				{ExecutionId: "owner/repo#42#1001", Slot: 0, Running: true, LastSequence: 9},
+				{ExecutionId: "owner/repo#43#1002", Slot: 1, Running: false, LastSequence: 3},
+			},
+		},
 	}
-	return ctx.Context.Err()
+	binder := stubBinder(t, guest)
+	running, err := binder.RunningSlots(context.Background(), &WarmVM{Name: "warm-vm-1"})
+	if err != nil {
+		t.Fatalf("RunningSlots: %v", err)
+	}
+	if !running[0] {
+		t.Fatalf("running = %v, want slot 0 running", running)
+	}
+	if running[1] {
+		t.Fatalf("running = %v, want slot 1 not running", running)
+	}
 }
 
-func TestAdoptPrefersLiveBusyVMWithinLimit(t *testing.T) {
+func TestResumeJobDrainsFromCursor(t *testing.T) {
+	guest := &stubGuest{
+		statusFactory: []func(uint64) (jobStatusStream, error){
+			func(uint64) (jobStatusStream, error) {
+				return &stubStream{events: []*guestproto.JobStatusEvent{terminalEvent(8, 0)}}, nil
+			},
+		},
+	}
+	binder := stubBinder(t, guest)
+	err := binder.ResumeJob(context.Background(), &WarmVM{Name: "warm-vm-1"}, "owner/repo#42#1001", 7, 0, 1)
+	if err != nil {
+		t.Fatalf("ResumeJob: %v", err)
+	}
+	cursors := guest.statusCallCursors()
+	if len(cursors) != 1 || cursors[0] != 7 {
+		t.Fatalf("resume cursors = %v, want [7]", cursors)
+	}
+}
+
+func TestAdoptMarksRunningExecutionSlotBusyWithResumeCursor(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-tart")
-	binding := `{"slot_index":0,"repo":"owner/repo","job_id":1001,"run_id":42,"bound_at":"2026-07-03T11:59:00Z"}`
-	script := strings.ReplaceAll(`#!/usr/bin/env bash
-set -euo pipefail
+	writeListOnlyFakeTart(t, bin, `[{"Name":"pool-a-busy","State":"running"}]`)
 
-if [[ "$1" == "list" ]]; then
-    printf '[{"Name":"pool-a-dead","State":"running"},{"Name":"pool-b-idle","State":"running"},{"Name":"pool-c-busy","State":"running"}]'
-    exit 0
-fi
-
-if [[ "$1" == "exec" ]]; then
-    vm="$2"
-    shift 2
-    joined="$*"
-    if [[ "$vm" == "pool-a-dead" ]]; then
-        exit 1
-    fi
-    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
-        exit 0
-    fi
-    if [[ "$vm" == "pool-c-busy" && "$joined" == *"gha-broker-slot-0.json"* ]]; then
-        cat <<'JSON'
-__BINDING__
-JSON
-        exit 0
-    fi
-    if [[ "$joined" == *"pgrep"* ]]; then
-        printf 'no\n'
-        exit 0
-    fi
-    exit 0
-fi
-
-exit 1
-`, "__BINDING__", binding)
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake tart: %v", err)
+	guest := &stubGuest{
+		reattach: &guestproto.ReattachResponse{
+			Executions: []*guestproto.ExecutionState{
+				{
+					ExecutionId:  "owner/repo#42#1001",
+					Slot:         0,
+					Running:      true,
+					LastSequence: 12,
+					Meta:         &guestproto.JobMeta{Repo: "owner/repo", JobId: 1001, RunId: 42},
+				},
+			},
+		},
 	}
-
 	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
 	binder := New(cfg, nil, tart.New(bin))
+	binder.guestFor = func(_ context.Context, _ *WarmVM) (guestConn, error) {
+		return guest, nil
+	}
 	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
 	if err != nil {
 		t.Fatalf("Adopt: %v", err)
@@ -356,414 +375,29 @@ exit 1
 			}
 		}
 	})
-
 	if len(adopted) != 1 {
-		t.Fatalf("adopted = %+v, want one live busy VM", adopted)
+		t.Fatalf("adopted = %+v, want one busy VM", adopted)
 	}
-	if adopted[0].VM.Name != "pool-c-busy" {
-		t.Fatalf("adopted vm = %q, want pool-c-busy", adopted[0].VM.Name)
-	}
-	if len(adopted[0].Slots) != 1 || adopted[0].Slots[0].RunID != 42 {
-		t.Fatalf("adopted slots = %+v, want run 42 binding", adopted[0].Slots)
-	}
-}
-
-func TestAdoptDoesNotLetIncompleteBindingConsumeLimit(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-tart")
-	incompleteBinding := `{"slot_index":0,"repo":"owner/repo","job_id":0,"run_id":42,"bound_at":"2026-07-03T11:58:00Z"}`
-	busyBinding := `{"slot_index":0,"repo":"owner/repo","job_id":1001,"run_id":43,"bound_at":"2026-07-03T11:59:00Z"}`
-	script := strings.ReplaceAll(strings.ReplaceAll(`#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ "$1" == "list" ]]; then
-    printf '[{"Name":"pool-a-incomplete","State":"running"},{"Name":"pool-b-busy","State":"running"}]'
-    exit 0
-fi
-
-if [[ "$1" == "exec" ]]; then
-    vm="$2"
-    shift 2
-    joined="$*"
-    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
-        exit 0
-    fi
-    if [[ "$vm" == "pool-a-incomplete" && "$joined" == *"gha-broker-slot-0.json"* ]]; then
-        cat <<'JSON'
-__INCOMPLETE_BINDING__
-JSON
-        exit 0
-    fi
-    if [[ "$vm" == "pool-b-busy" && "$joined" == *"gha-broker-slot-0.json"* ]]; then
-        cat <<'JSON'
-__BUSY_BINDING__
-JSON
-        exit 0
-    fi
-    if [[ "$joined" == *"pgrep"* ]]; then
-        printf 'no\n'
-        exit 0
-    fi
-    exit 0
-fi
-
-exit 1
-`, "__INCOMPLETE_BINDING__", incompleteBinding), "__BUSY_BINDING__", busyBinding)
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake tart: %v", err)
-	}
-
-	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
-	binder := New(cfg, nil, tart.New(bin))
-	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	t.Cleanup(func() {
-		for _, adoptedVM := range adopted {
-			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
-				adoptedVM.VM.stopTouch()
-			}
-		}
-	})
-
-	if len(adopted) != 1 {
-		t.Fatalf("adopted = %+v, want one valid busy VM", adopted)
-	}
-	if adopted[0].VM.Name != "pool-b-busy" {
-		t.Fatalf("adopted vm = %q, want pool-b-busy", adopted[0].VM.Name)
-	}
-}
-
-func TestAdoptFallsBackToActiveProbeForIncompleteBinding(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-tart")
-	binding := `{"slot_index":0,"repo":"owner/repo","job_id":0,"run_id":43,"bound_at":"2026-07-03T11:59:00Z"}`
-	script := strings.ReplaceAll(`#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ "$1" == "list" ]]; then
-    printf '[{"Name":"pool-a-busy","State":"running"}]'
-    exit 0
-fi
-
-if [[ "$1" == "exec" ]]; then
-    shift 2
-    joined="$*"
-    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
-        exit 0
-    fi
-    if [[ "$joined" == *"gha-broker-slot-0.json"* ]]; then
-        cat <<'JSON'
-__BINDING__
-JSON
-        exit 0
-    fi
-    if [[ "$joined" == *"pgrep"* ]]; then
-        printf 'yes\n'
-        exit 0
-    fi
-    exit 0
-fi
-
-exit 1
-`, "__BINDING__", binding)
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake tart: %v", err)
-	}
-
-	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
-	binder := New(cfg, nil, tart.New(bin))
-	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	t.Cleanup(func() {
-		for _, adoptedVM := range adopted {
-			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
-				adoptedVM.VM.stopTouch()
-			}
-		}
-	})
-
-	if len(adopted) != 1 {
-		t.Fatalf("adopted = %+v, want one live VM", adopted)
+	if adopted[0].VM.Name != "pool-a-busy" {
+		t.Fatalf("adopted vm = %q, want pool-a-busy", adopted[0].VM.Name)
 	}
 	if len(adopted[0].Slots) != 1 {
-		t.Fatalf("adopted slots = %+v, want one active fallback slot", adopted[0].Slots)
+		t.Fatalf("adopted slots = %+v, want one busy slot", adopted[0].Slots)
 	}
 	slot := adopted[0].Slots[0]
-	if !slot.ObservedActive || slot.JobID != 0 || slot.RunID != 0 {
-		t.Fatalf("adopted slot = %+v, want observed-active fallback without stale IDs", slot)
+	if slot.ExecutionID != "owner/repo#42#1001" || slot.ResumeCursor != 12 || slot.RunID != 42 || slot.JobID != 1001 {
+		t.Fatalf("adopted slot = %+v, want execution owner/repo#42#1001 cursor 12 job 1001 run 42", slot)
+	}
+	if !slot.ObservedActive {
+		t.Fatalf("adopted slot observed active = false, want true")
 	}
 }
 
-func TestAdoptTreatsCorruptBindingAsBusy(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-tart")
-	script := `#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ "$1" == "list" ]]; then
-    printf '[{"Name":"pool-a-busy","State":"running"}]'
-    exit 0
-fi
-
-if [[ "$1" == "exec" ]]; then
-    shift 2
-    joined="$*"
-    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
-        exit 0
-    fi
-    if [[ "$joined" == *"gha-broker-slot-0.json"* ]]; then
-        printf '{"slot_index":0'
-        exit 0
-    fi
-    if [[ "$joined" == *"pgrep"* ]]; then
-        printf 'no\n'
-        exit 0
-    fi
-    exit 0
-fi
-
-exit 1
-`
+func writeListOnlyFakeTart(t *testing.T, bin string, listJSON string) {
+	t.Helper()
+	script := "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"$1\" == \"list\" ]]; then\n  printf '%s' '" + listJSON + "'\n  exit 0\nfi\nexit 0\n"
 	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake tart: %v", err)
-	}
-
-	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
-	binder := New(cfg, nil, tart.New(bin))
-	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	t.Cleanup(func() {
-		for _, adoptedVM := range adopted {
-			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
-				adoptedVM.VM.stopTouch()
-			}
-		}
-	})
-
-	if len(adopted) != 1 {
-		t.Fatalf("adopted = %+v, want one live VM", adopted)
-	}
-	if len(adopted[0].Slots) != 1 {
-		t.Fatalf("adopted slots = %+v, want one conservative busy slot", adopted[0].Slots)
-	}
-	slot := adopted[0].Slots[0]
-	if !slot.ObservedActive || slot.JobID != 0 || slot.RunID != 0 {
-		t.Fatalf("adopted slot = %+v, want conservative busy fallback without stale IDs", slot)
-	}
-}
-
-func TestAdoptTreatsBindingReadErrorAsBusy(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-tart")
-	script := `#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ "$1" == "list" ]]; then
-    printf '[{"Name":"pool-a-busy","State":"running"}]'
-    exit 0
-fi
-
-if [[ "$1" == "exec" ]]; then
-    shift 2
-    joined="$*"
-    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
-        exit 0
-    fi
-    if [[ "$joined" == *"gha-broker-slot-0.json"* ]]; then
-        printf 'permission denied\n' >&2
-        exit 42
-    fi
-    if [[ "$joined" == *"pgrep"* ]]; then
-        printf 'no\n'
-        exit 0
-    fi
-    exit 0
-fi
-
-exit 1
-`
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake tart: %v", err)
-	}
-
-	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
-	binder := New(cfg, nil, tart.New(bin))
-	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	t.Cleanup(func() {
-		for _, adoptedVM := range adopted {
-			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
-				adoptedVM.VM.stopTouch()
-			}
-		}
-	})
-
-	if len(adopted) != 1 {
-		t.Fatalf("adopted = %+v, want one live VM", adopted)
-	}
-	if len(adopted[0].Slots) != 1 {
-		t.Fatalf("adopted slots = %+v, want one conservative busy slot", adopted[0].Slots)
-	}
-	slot := adopted[0].Slots[0]
-	if !slot.ObservedActive || slot.JobID != 0 || slot.RunID != 0 {
-		t.Fatalf("adopted slot = %+v, want conservative busy fallback without stale IDs", slot)
-	}
-}
-
-func TestAdoptTreatsActiveJobProbeErrorAsBusy(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-tart")
-	script := `#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ "$1" == "list" ]]; then
-    printf '[{"Name":"pool-a-busy","State":"running"}]'
-    exit 0
-fi
-
-if [[ "$1" == "exec" ]]; then
-    shift 2
-    joined="$*"
-    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
-        exit 0
-    fi
-    if [[ "$joined" == *"gha-broker-slot-0.json"* ]]; then
-        exit 0
-    fi
-    if [[ "$joined" == *"pgrep"* ]]; then
-        printf 'probe failed\n' >&2
-        exit 42
-    fi
-    exit 0
-fi
-
-exit 1
-`
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake tart: %v", err)
-	}
-
-	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
-	binder := New(cfg, nil, tart.New(bin))
-	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	t.Cleanup(func() {
-		for _, adoptedVM := range adopted {
-			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
-				adoptedVM.VM.stopTouch()
-			}
-		}
-	})
-
-	if len(adopted) != 1 {
-		t.Fatalf("adopted = %+v, want one live VM", adopted)
-	}
-	if len(adopted[0].Slots) != 1 {
-		t.Fatalf("adopted slots = %+v, want one conservative busy slot", adopted[0].Slots)
-	}
-	slot := adopted[0].Slots[0]
-	if !slot.ObservedActive || slot.JobID != 0 || slot.RunID != 0 {
-		t.Fatalf("adopted slot = %+v, want conservative busy fallback without stale IDs", slot)
-	}
-}
-
-func TestAdoptTearsDownIdleExcessAndKeepsBusyExcess(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-tart")
-	callsFile := filepath.Join(dir, "calls")
-	selectedBinding := `{"slot_index":0,"repo":"owner/repo","job_id":1001,"run_id":42,"bound_at":"2026-07-03T11:59:00Z"}`
-	excessBinding := `{"slot_index":0,"repo":"owner/repo","job_id":1002,"run_id":43,"bound_at":"2026-07-03T12:00:00Z"}`
-	script := strings.NewReplacer(
-		"__CALLS_FILE__", callsFile,
-		"__SELECTED_BINDING__", selectedBinding,
-		"__EXCESS_BINDING__", excessBinding,
-	).Replace(`#!/usr/bin/env bash
-set -euo pipefail
-
-calls_file="__CALLS_FILE__"
-
-if [[ "$1" == "list" ]]; then
-    printf '[{"Name":"pool-a-busy-selected","State":"running"},{"Name":"pool-b-busy-excess","State":"running"},{"Name":"pool-c-idle-excess","State":"running"}]'
-    exit 0
-fi
-
-if [[ "$1" == "exec" ]]; then
-    vm="$2"
-    shift 2
-    joined="$*"
-    if [[ "$joined" == "touch /tmp/gha-broker.alive" ]]; then
-        exit 0
-    fi
-    if [[ "$vm" == "pool-a-busy-selected" && "$joined" == *"gha-broker-slot-0.json"* ]]; then
-        cat <<'JSON'
-__SELECTED_BINDING__
-JSON
-        exit 0
-    fi
-    if [[ "$vm" == "pool-b-busy-excess" && "$joined" == *"gha-broker-slot-0.json"* ]]; then
-        cat <<'JSON'
-__EXCESS_BINDING__
-JSON
-        exit 0
-    fi
-    if [[ "$joined" == *"pgrep"* ]]; then
-        printf 'no\n'
-        exit 0
-    fi
-    exit 0
-fi
-
-if [[ "$1" == "stop" || "$1" == "delete" ]]; then
-    printf '%s %s\n' "$1" "$2" >> "$calls_file"
-    exit 0
-fi
-
-exit 1
-`)
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake tart: %v", err)
-	}
-
-	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
-	binder := New(cfg, nil, tart.New(bin))
-	adopted, err := binder.Adopt(context.Background(), "image-a", 1, 1)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	t.Cleanup(func() {
-		for _, adoptedVM := range adopted {
-			if adoptedVM.VM != nil && adoptedVM.VM.stopTouch != nil {
-				adoptedVM.VM.stopTouch()
-			}
-		}
-	})
-
-	if len(adopted) != 1 {
-		t.Fatalf("adopted = %+v, want one selected busy VM", adopted)
-	}
-	if adopted[0].VM.Name != "pool-a-busy-selected" {
-		t.Fatalf("adopted vm = %q, want pool-a-busy-selected", adopted[0].VM.Name)
-	}
-	callsData, err := os.ReadFile(callsFile)
-	if err != nil {
-		t.Fatalf("read calls file: %v", err)
-	}
-	calls := string(callsData)
-	if !strings.Contains(calls, "stop pool-c-idle-excess") || !strings.Contains(calls, "delete pool-c-idle-excess") {
-		t.Fatalf("calls = %q, want idle excess stopped and deleted", calls)
-	}
-	if strings.Contains(calls, "pool-b-busy-excess") {
-		t.Fatalf("calls = %q, want busy excess left running", calls)
 	}
 }
 
@@ -771,53 +405,6 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
-}
-
-func writeRunJobFakeTart(t *testing.T, bin string, bindingFile string, runStartedFile string, runMode string) {
-	t.Helper()
-	t.Setenv("FAKE_TART_BINDING_FILE", bindingFile)
-	t.Setenv("FAKE_TART_RUN_STARTED_FILE", runStartedFile)
-	t.Setenv("FAKE_TART_RUN_MODE", runMode)
-	t.Setenv("FAKE_TART_BLOCK_FIFO", filepath.Join(filepath.Dir(bindingFile), "block-fifo"))
-	script := `#!/usr/bin/env bash
-set -euo pipefail
-
-binding_file="${FAKE_TART_BINDING_FILE:?}"
-run_started_file="${FAKE_TART_RUN_STARTED_FILE:?}"
-run_mode="${FAKE_TART_RUN_MODE:?}"
-block_fifo="${FAKE_TART_BLOCK_FIFO:?}"
-
-if [[ "$1" == "exec" ]]; then
-	shift 2
-	joined="$*"
-	if [[ "$joined" == *"cat >"* && "$joined" == *"gha-broker-slot-0.json"* ]]; then
-		printf '%s\n' "$joined" > "$binding_file"
-		exit 0
-	fi
-    if [[ "$joined" == "rm -f /tmp/gha-broker-slot-0.json" ]]; then
-        rm -f "$binding_file"
-        exit 0
-    fi
-    if [[ "$joined" == *"./run.sh --jitconfig"* ]]; then
-        if [[ ! -f "$binding_file" ]]; then
-            printf 'missing binding\n' >&2
-            exit 3
-		fi
-		printf 'started\n' > "$run_started_file"
-		if [[ "$run_mode" == "block" ]]; then
-			mkfifo "$block_fifo"
-			read -r _ < "$block_fifo"
-		fi
-		exit 0
-	fi
-    exit 0
-fi
-
-exit 1
-`
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake tart: %v", err)
-	}
 }
 
 func newRunJobTestGitHubClient(t *testing.T) *ghapp.Client {
@@ -861,24 +448,6 @@ func testPrivateKeyPEM(t *testing.T) []byte {
 	der := x509.MarshalPKCS1PrivateKey(key)
 	block := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: der}
 	return pem.EncodeToMemory(block)
-}
-
-func waitForFile(t *testing.T, path string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		_, err := os.Stat(path)
-		if err == nil {
-			return
-		}
-		if !os.IsNotExist(err) {
-			t.Fatalf("stat %s: %v", path, err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", path)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 }
 
 func TestReapBootCommandWaitsForExitedProcess(t *testing.T) {
