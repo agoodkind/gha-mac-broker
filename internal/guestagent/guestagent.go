@@ -5,6 +5,7 @@ package guestagent
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,14 +19,15 @@ import (
 )
 
 const (
-	protocolMajor         = uint32(1)
-	defaultAgentBuild     = "dev"
-	defaultSlotCount      = uint32(1)
-	capabilityRunJob      = "run-job"
-	capabilityReattach    = "reattach"
-	capabilityDrain       = "drain"
-	capabilityCancelJob   = "cancel-job"
-	capabilityUpdateAgent = "update-agent"
+	protocolMajor            = uint32(1)
+	defaultAgentBuild        = "dev"
+	defaultSlotCount         = uint32(1)
+	capabilityRunJob         = "run-job"
+	capabilityReattach       = "reattach"
+	capabilityDrain          = "drain"
+	capabilityCancelJob      = "cancel-job"
+	capabilityUpdateAgent    = "update-agent"
+	capabilityConfigureSlots = "configure-slots"
 )
 
 var processBootID = generateBootID()
@@ -37,6 +39,15 @@ var processBootID = generateBootID()
 // registry, preserving the single-process guest-agent path.
 type ChildLauncher interface {
 	Run(spec guestexec.ExecSpec) (guestexec.Outcome, error)
+}
+
+// SlotConfigurer applies a host-requested slot count. A worker cannot change its
+// own slot count, which is fixed at worker start, so the implementation asks the
+// durable supervisor to reconfigure and replace the worker. It returns the
+// applied count, or an error when the supervisor rejects the change (for example
+// a shrink below a running slot).
+type SlotConfigurer interface {
+	ConfigureSlots(ctx context.Context, slotCount uint32) (uint32, error)
 }
 
 // Options configures the guest-agent service.
@@ -63,6 +74,11 @@ type Options struct {
 	// for the detached signature. When nil the handler uses the compile-time
 	// baked key. Tests inject a known key here.
 	UpdatePublicKey ed25519.PublicKey
+	// SlotConfigurer applies a host-requested slot count by asking the supervisor
+	// to reconfigure and replace the worker. When nil, ConfigureSlots reports
+	// CodeUnimplemented, so a single-process guest-agent without a supervisor
+	// refuses slot reconfiguration.
+	SlotConfigurer SlotConfigurer
 }
 
 // Handler implements GuestAgentService over a guest execution registry.
@@ -78,6 +94,7 @@ type Handler struct {
 	installDir        string
 	currentBinary     string
 	updatePublicKey   ed25519.PublicKey
+	slotConfigurer    SlotConfigurer
 	// slotLocksMu guards slotLocks; each slot lock serializes admission, per-slot
 	// prep, and start for one slot, so two concurrent RunJobs for the same slot
 	// cannot both run destructive prepareSlot before either records the execution.
@@ -138,6 +155,7 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 		installDir:        installDir,
 		currentBinary:     currentBinary,
 		updatePublicKey:   updatePublicKey,
+		slotConfigurer:    options.SlotConfigurer,
 		slotLocksMu:       sync.Mutex{},
 		slotLocks:         make(map[uint32]*sync.Mutex),
 	}
@@ -180,6 +198,7 @@ func (handler *Handler) Hello(
 			capabilityDrain,
 			capabilityCancelJob,
 			capabilityUpdateAgent,
+			capabilityConfigureSlots,
 		},
 		Slots:             handler.slots(),
 		GoldenFingerprint: handler.goldenFingerprint,
@@ -316,6 +335,40 @@ func (handler *Handler) CancelJob(
 		return nil, mapRegistryError(err)
 	}
 	return connect.NewResponse(&guestproto.CancelJobResponse{}), nil
+}
+
+// ConfigureSlots applies a host-requested slot count. The worker's own slot
+// count is fixed at start, so the handler asks the supervisor to reconfigure and
+// replace the worker; a subsequent Hello (after the replacement is current)
+// advertises the applied slots. A shrink below a running slot is rejected as a
+// failed precondition, so the host leaves that VM as is rather than orphaning a
+// job.
+//
+// The returned slot_count and slots are the INTENDED (requested) inventory,
+// computed before the replacement worker is serving, not the currently-serving
+// set. The reload is asynchronous, so a consumer that needs the live inventory
+// must re-Hello; the host does. Do not trust the returned slots as live.
+func (handler *Handler) ConfigureSlots(
+	ctx context.Context,
+	request *connect.Request[guestproto.ConfigureSlotsRequest],
+) (*connect.Response[guestproto.ConfigureSlotsResponse], error) {
+	requested := request.Msg.GetSlotCount()
+	if requested == 0 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("guestagent: slot_count must be positive"))
+	}
+	if handler.slotConfigurer == nil {
+		return nil, connect.NewError(connect.CodeUnimplemented, errors.New("guestagent: slot reconfiguration unavailable"))
+	}
+	applied, err := handler.slotConfigurer.ConfigureSlots(ctx, requested)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
+	}
+	slots := make([]*guestproto.SlotInfo, 0, applied)
+	for slot := uint32(0); slot < applied; slot++ {
+		slots = append(slots, &guestproto.SlotInfo{Index: slot})
+	}
+	response := &guestproto.ConfigureSlotsResponse{SlotCount: applied, Slots: slots}
+	return connect.NewResponse(response), nil
 }
 
 func (handler *Handler) slots() []*guestproto.SlotInfo {

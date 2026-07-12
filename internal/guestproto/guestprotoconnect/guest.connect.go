@@ -52,6 +52,9 @@ const (
 	// GuestAgentServiceUpdateAgentProcedure is the fully-qualified name of the GuestAgentService's
 	// UpdateAgent RPC.
 	GuestAgentServiceUpdateAgentProcedure = "/gha.guest.v1.GuestAgentService/UpdateAgent"
+	// GuestAgentServiceConfigureSlotsProcedure is the fully-qualified name of the GuestAgentService's
+	// ConfigureSlots RPC.
+	GuestAgentServiceConfigureSlotsProcedure = "/gha.guest.v1.GuestAgentService/ConfigureSlots"
 )
 
 // GuestAgentServiceClient is a client for the gha.guest.v1.GuestAgentService service.
@@ -63,6 +66,7 @@ type GuestAgentServiceClient interface {
 	Drain(context.Context, *connect.Request[guestproto.DrainRequest]) (*connect.Response[guestproto.DrainResponse], error)
 	CancelJob(context.Context, *connect.Request[guestproto.CancelJobRequest]) (*connect.Response[guestproto.CancelJobResponse], error)
 	UpdateAgent(context.Context) *connect.ClientStreamForClient[guestproto.UpdateAgentRequest, guestproto.UpdateAgentResponse]
+	ConfigureSlots(context.Context, *connect.Request[guestproto.ConfigureSlotsRequest]) (*connect.Response[guestproto.ConfigureSlotsResponse], error)
 }
 
 // NewGuestAgentServiceClient constructs a client for the gha.guest.v1.GuestAgentService service. By
@@ -118,18 +122,25 @@ func NewGuestAgentServiceClient(httpClient connect.HTTPClient, baseURL string, o
 			connect.WithSchema(guestAgentServiceMethods.ByName("UpdateAgent")),
 			connect.WithClientOptions(opts...),
 		),
+		configureSlots: connect.NewClient[guestproto.ConfigureSlotsRequest, guestproto.ConfigureSlotsResponse](
+			httpClient,
+			baseURL+GuestAgentServiceConfigureSlotsProcedure,
+			connect.WithSchema(guestAgentServiceMethods.ByName("ConfigureSlots")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
 // guestAgentServiceClient implements GuestAgentServiceClient.
 type guestAgentServiceClient struct {
-	hello       *connect.Client[guestproto.HelloRequest, guestproto.HelloResponse]
-	runJob      *connect.Client[guestproto.RunJobRequest, guestproto.RunJobResponse]
-	jobStatus   *connect.Client[guestproto.JobStatusRequest, guestproto.JobStatusEvent]
-	reattach    *connect.Client[guestproto.ReattachRequest, guestproto.ReattachResponse]
-	drain       *connect.Client[guestproto.DrainRequest, guestproto.DrainResponse]
-	cancelJob   *connect.Client[guestproto.CancelJobRequest, guestproto.CancelJobResponse]
-	updateAgent *connect.Client[guestproto.UpdateAgentRequest, guestproto.UpdateAgentResponse]
+	hello          *connect.Client[guestproto.HelloRequest, guestproto.HelloResponse]
+	runJob         *connect.Client[guestproto.RunJobRequest, guestproto.RunJobResponse]
+	jobStatus      *connect.Client[guestproto.JobStatusRequest, guestproto.JobStatusEvent]
+	reattach       *connect.Client[guestproto.ReattachRequest, guestproto.ReattachResponse]
+	drain          *connect.Client[guestproto.DrainRequest, guestproto.DrainResponse]
+	cancelJob      *connect.Client[guestproto.CancelJobRequest, guestproto.CancelJobResponse]
+	updateAgent    *connect.Client[guestproto.UpdateAgentRequest, guestproto.UpdateAgentResponse]
+	configureSlots *connect.Client[guestproto.ConfigureSlotsRequest, guestproto.ConfigureSlotsResponse]
 }
 
 // Hello calls gha.guest.v1.GuestAgentService.Hello.
@@ -167,6 +178,11 @@ func (c *guestAgentServiceClient) UpdateAgent(ctx context.Context) *connect.Clie
 	return c.updateAgent.CallClientStream(ctx)
 }
 
+// ConfigureSlots calls gha.guest.v1.GuestAgentService.ConfigureSlots.
+func (c *guestAgentServiceClient) ConfigureSlots(ctx context.Context, req *connect.Request[guestproto.ConfigureSlotsRequest]) (*connect.Response[guestproto.ConfigureSlotsResponse], error) {
+	return c.configureSlots.CallUnary(ctx, req)
+}
+
 // GuestAgentServiceHandler is an implementation of the gha.guest.v1.GuestAgentService service.
 type GuestAgentServiceHandler interface {
 	Hello(context.Context, *connect.Request[guestproto.HelloRequest]) (*connect.Response[guestproto.HelloResponse], error)
@@ -176,6 +192,7 @@ type GuestAgentServiceHandler interface {
 	Drain(context.Context, *connect.Request[guestproto.DrainRequest]) (*connect.Response[guestproto.DrainResponse], error)
 	CancelJob(context.Context, *connect.Request[guestproto.CancelJobRequest]) (*connect.Response[guestproto.CancelJobResponse], error)
 	UpdateAgent(context.Context, *connect.ClientStream[guestproto.UpdateAgentRequest]) (*connect.Response[guestproto.UpdateAgentResponse], error)
+	ConfigureSlots(context.Context, *connect.Request[guestproto.ConfigureSlotsRequest]) (*connect.Response[guestproto.ConfigureSlotsResponse], error)
 }
 
 // NewGuestAgentServiceHandler builds an HTTP handler from the service implementation. It returns
@@ -227,6 +244,12 @@ func NewGuestAgentServiceHandler(svc GuestAgentServiceHandler, opts ...connect.H
 		connect.WithSchema(guestAgentServiceMethods.ByName("UpdateAgent")),
 		connect.WithHandlerOptions(opts...),
 	)
+	guestAgentServiceConfigureSlotsHandler := connect.NewUnaryHandler(
+		GuestAgentServiceConfigureSlotsProcedure,
+		svc.ConfigureSlots,
+		connect.WithSchema(guestAgentServiceMethods.ByName("ConfigureSlots")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/gha.guest.v1.GuestAgentService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case GuestAgentServiceHelloProcedure:
@@ -243,6 +266,8 @@ func NewGuestAgentServiceHandler(svc GuestAgentServiceHandler, opts ...connect.H
 			guestAgentServiceCancelJobHandler.ServeHTTP(w, r)
 		case GuestAgentServiceUpdateAgentProcedure:
 			guestAgentServiceUpdateAgentHandler.ServeHTTP(w, r)
+		case GuestAgentServiceConfigureSlotsProcedure:
+			guestAgentServiceConfigureSlotsHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -278,4 +303,8 @@ func (UnimplementedGuestAgentServiceHandler) CancelJob(context.Context, *connect
 
 func (UnimplementedGuestAgentServiceHandler) UpdateAgent(context.Context, *connect.ClientStream[guestproto.UpdateAgentRequest]) (*connect.Response[guestproto.UpdateAgentResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("gha.guest.v1.GuestAgentService.UpdateAgent is not implemented"))
+}
+
+func (UnimplementedGuestAgentServiceHandler) ConfigureSlots(context.Context, *connect.Request[guestproto.ConfigureSlotsRequest]) (*connect.Response[guestproto.ConfigureSlotsResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("gha.guest.v1.GuestAgentService.ConfigureSlots is not implemented"))
 }

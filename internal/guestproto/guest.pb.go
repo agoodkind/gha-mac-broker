@@ -1392,6 +1392,108 @@ func (x *UpdateAgentResponse) GetAcceptedVersion() string {
 	return ""
 }
 
+// ConfigureSlotsRequest asks the guest to serve slot_count execution slots. The
+// host sends its configured jobs_per_vm so a guest that booted with the default
+// single slot grows to the pool's slot count before it serves.
+type ConfigureSlotsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SlotCount     uint32                 `protobuf:"varint,1,opt,name=slot_count,json=slotCount,proto3" json:"slot_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConfigureSlotsRequest) Reset() {
+	*x = ConfigureSlotsRequest{}
+	mi := &file_guest_v1_guest_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfigureSlotsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfigureSlotsRequest) ProtoMessage() {}
+
+func (x *ConfigureSlotsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_guest_v1_guest_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfigureSlotsRequest.ProtoReflect.Descriptor instead.
+func (*ConfigureSlotsRequest) Descriptor() ([]byte, []int) {
+	return file_guest_v1_guest_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ConfigureSlotsRequest) GetSlotCount() uint32 {
+	if x != nil {
+		return x.SlotCount
+	}
+	return 0
+}
+
+// ConfigureSlotsResponse echoes the slot count the guest applied and the slot
+// inventory it now exposes, so the host can confirm the requested slots are
+// present.
+type ConfigureSlotsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SlotCount     uint32                 `protobuf:"varint,1,opt,name=slot_count,json=slotCount,proto3" json:"slot_count,omitempty"`
+	Slots         []*SlotInfo            `protobuf:"bytes,2,rep,name=slots,proto3" json:"slots,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConfigureSlotsResponse) Reset() {
+	*x = ConfigureSlotsResponse{}
+	mi := &file_guest_v1_guest_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfigureSlotsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfigureSlotsResponse) ProtoMessage() {}
+
+func (x *ConfigureSlotsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_guest_v1_guest_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfigureSlotsResponse.ProtoReflect.Descriptor instead.
+func (*ConfigureSlotsResponse) Descriptor() ([]byte, []int) {
+	return file_guest_v1_guest_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *ConfigureSlotsResponse) GetSlotCount() uint32 {
+	if x != nil {
+		return x.SlotCount
+	}
+	return 0
+}
+
+func (x *ConfigureSlotsResponse) GetSlots() []*SlotInfo {
+	if x != nil {
+		return x.Slots
+	}
+	return nil
+}
+
 var File_guest_v1_guest_proto protoreflect.FileDescriptor
 
 const file_guest_v1_guest_proto_rawDesc = "" +
@@ -1490,7 +1592,14 @@ const file_guest_v1_guest_proto_rawDesc = "" +
 	"\x06sha256\x18\x03 \x01(\fR\x06sha256\x12+\n" +
 	"\x11ed25519_signature\x18\x04 \x01(\fR\x10ed25519Signature\"@\n" +
 	"\x13UpdateAgentResponse\x12)\n" +
-	"\x10accepted_version\x18\x01 \x01(\tR\x0facceptedVersion2\x98\x04\n" +
+	"\x10accepted_version\x18\x01 \x01(\tR\x0facceptedVersion\"6\n" +
+	"\x15ConfigureSlotsRequest\x12\x1d\n" +
+	"\n" +
+	"slot_count\x18\x01 \x01(\rR\tslotCount\"e\n" +
+	"\x16ConfigureSlotsResponse\x12\x1d\n" +
+	"\n" +
+	"slot_count\x18\x01 \x01(\rR\tslotCount\x12,\n" +
+	"\x05slots\x18\x02 \x03(\v2\x16.gha.guest.v1.SlotInfoR\x05slots2\xf5\x04\n" +
 	"\x11GuestAgentService\x12@\n" +
 	"\x05Hello\x12\x1a.gha.guest.v1.HelloRequest\x1a\x1b.gha.guest.v1.HelloResponse\x12C\n" +
 	"\x06RunJob\x12\x1b.gha.guest.v1.RunJobRequest\x1a\x1c.gha.guest.v1.RunJobResponse\x12K\n" +
@@ -1498,7 +1607,8 @@ const file_guest_v1_guest_proto_rawDesc = "" +
 	"\bReattach\x12\x1d.gha.guest.v1.ReattachRequest\x1a\x1e.gha.guest.v1.ReattachResponse\x12@\n" +
 	"\x05Drain\x12\x1a.gha.guest.v1.DrainRequest\x1a\x1b.gha.guest.v1.DrainResponse\x12L\n" +
 	"\tCancelJob\x12\x1e.gha.guest.v1.CancelJobRequest\x1a\x1f.gha.guest.v1.CancelJobResponse\x12T\n" +
-	"\vUpdateAgent\x12 .gha.guest.v1.UpdateAgentRequest\x1a!.gha.guest.v1.UpdateAgentResponse(\x01B;Z9goodkind.io/gha-mac-broker/internal/guestproto;guestprotob\x06proto3"
+	"\vUpdateAgent\x12 .gha.guest.v1.UpdateAgentRequest\x1a!.gha.guest.v1.UpdateAgentResponse(\x01\x12[\n" +
+	"\x0eConfigureSlots\x12#.gha.guest.v1.ConfigureSlotsRequest\x1a$.gha.guest.v1.ConfigureSlotsResponseB;Z9goodkind.io/gha-mac-broker/internal/guestproto;guestprotob\x06proto3"
 
 var (
 	file_guest_v1_guest_proto_rawDescOnce sync.Once
@@ -1513,37 +1623,39 @@ func file_guest_v1_guest_proto_rawDescGZIP() []byte {
 }
 
 var file_guest_v1_guest_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_guest_v1_guest_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
+var file_guest_v1_guest_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_guest_v1_guest_proto_goTypes = []any{
-	(RunJobResponse_Outcome)(0), // 0: gha.guest.v1.RunJobResponse.Outcome
-	(LogChunk_Stream)(0),        // 1: gha.guest.v1.LogChunk.Stream
-	(*HelloRequest)(nil),        // 2: gha.guest.v1.HelloRequest
-	(*HelloResponse)(nil),       // 3: gha.guest.v1.HelloResponse
-	(*SlotInfo)(nil),            // 4: gha.guest.v1.SlotInfo
-	(*RunJobRequest)(nil),       // 5: gha.guest.v1.RunJobRequest
-	(*JobMeta)(nil),             // 6: gha.guest.v1.JobMeta
-	(*RunJobResponse)(nil),      // 7: gha.guest.v1.RunJobResponse
-	(*JobStatusRequest)(nil),    // 8: gha.guest.v1.JobStatusRequest
-	(*JobStatusEvent)(nil),      // 9: gha.guest.v1.JobStatusEvent
-	(*PhaseChange)(nil),         // 10: gha.guest.v1.PhaseChange
-	(*LogChunk)(nil),            // 11: gha.guest.v1.LogChunk
-	(*Heartbeat)(nil),           // 12: gha.guest.v1.Heartbeat
-	(*TerminalResult)(nil),      // 13: gha.guest.v1.TerminalResult
-	(*ReattachRequest)(nil),     // 14: gha.guest.v1.ReattachRequest
-	(*ReattachResponse)(nil),    // 15: gha.guest.v1.ReattachResponse
-	(*ExecutionState)(nil),      // 16: gha.guest.v1.ExecutionState
-	(*DrainRequest)(nil),        // 17: gha.guest.v1.DrainRequest
-	(*DrainResponse)(nil),       // 18: gha.guest.v1.DrainResponse
-	(*CancelJobRequest)(nil),    // 19: gha.guest.v1.CancelJobRequest
-	(*CancelJobResponse)(nil),   // 20: gha.guest.v1.CancelJobResponse
-	(*UpdateAgentRequest)(nil),  // 21: gha.guest.v1.UpdateAgentRequest
-	(*UpdateAgentHeader)(nil),   // 22: gha.guest.v1.UpdateAgentHeader
-	(*UpdateAgentResponse)(nil), // 23: gha.guest.v1.UpdateAgentResponse
-	nil,                         // 24: gha.guest.v1.RunJobRequest.EnvEntry
+	(RunJobResponse_Outcome)(0),    // 0: gha.guest.v1.RunJobResponse.Outcome
+	(LogChunk_Stream)(0),           // 1: gha.guest.v1.LogChunk.Stream
+	(*HelloRequest)(nil),           // 2: gha.guest.v1.HelloRequest
+	(*HelloResponse)(nil),          // 3: gha.guest.v1.HelloResponse
+	(*SlotInfo)(nil),               // 4: gha.guest.v1.SlotInfo
+	(*RunJobRequest)(nil),          // 5: gha.guest.v1.RunJobRequest
+	(*JobMeta)(nil),                // 6: gha.guest.v1.JobMeta
+	(*RunJobResponse)(nil),         // 7: gha.guest.v1.RunJobResponse
+	(*JobStatusRequest)(nil),       // 8: gha.guest.v1.JobStatusRequest
+	(*JobStatusEvent)(nil),         // 9: gha.guest.v1.JobStatusEvent
+	(*PhaseChange)(nil),            // 10: gha.guest.v1.PhaseChange
+	(*LogChunk)(nil),               // 11: gha.guest.v1.LogChunk
+	(*Heartbeat)(nil),              // 12: gha.guest.v1.Heartbeat
+	(*TerminalResult)(nil),         // 13: gha.guest.v1.TerminalResult
+	(*ReattachRequest)(nil),        // 14: gha.guest.v1.ReattachRequest
+	(*ReattachResponse)(nil),       // 15: gha.guest.v1.ReattachResponse
+	(*ExecutionState)(nil),         // 16: gha.guest.v1.ExecutionState
+	(*DrainRequest)(nil),           // 17: gha.guest.v1.DrainRequest
+	(*DrainResponse)(nil),          // 18: gha.guest.v1.DrainResponse
+	(*CancelJobRequest)(nil),       // 19: gha.guest.v1.CancelJobRequest
+	(*CancelJobResponse)(nil),      // 20: gha.guest.v1.CancelJobResponse
+	(*UpdateAgentRequest)(nil),     // 21: gha.guest.v1.UpdateAgentRequest
+	(*UpdateAgentHeader)(nil),      // 22: gha.guest.v1.UpdateAgentHeader
+	(*UpdateAgentResponse)(nil),    // 23: gha.guest.v1.UpdateAgentResponse
+	(*ConfigureSlotsRequest)(nil),  // 24: gha.guest.v1.ConfigureSlotsRequest
+	(*ConfigureSlotsResponse)(nil), // 25: gha.guest.v1.ConfigureSlotsResponse
+	nil,                            // 26: gha.guest.v1.RunJobRequest.EnvEntry
 }
 var file_guest_v1_guest_proto_depIdxs = []int32{
 	4,  // 0: gha.guest.v1.HelloResponse.slots:type_name -> gha.guest.v1.SlotInfo
-	24, // 1: gha.guest.v1.RunJobRequest.env:type_name -> gha.guest.v1.RunJobRequest.EnvEntry
+	26, // 1: gha.guest.v1.RunJobRequest.env:type_name -> gha.guest.v1.RunJobRequest.EnvEntry
 	6,  // 2: gha.guest.v1.RunJobRequest.meta:type_name -> gha.guest.v1.JobMeta
 	0,  // 3: gha.guest.v1.RunJobResponse.outcome:type_name -> gha.guest.v1.RunJobResponse.Outcome
 	10, // 4: gha.guest.v1.JobStatusEvent.phase:type_name -> gha.guest.v1.PhaseChange
@@ -1554,25 +1666,28 @@ var file_guest_v1_guest_proto_depIdxs = []int32{
 	16, // 9: gha.guest.v1.ReattachResponse.executions:type_name -> gha.guest.v1.ExecutionState
 	6,  // 10: gha.guest.v1.ExecutionState.meta:type_name -> gha.guest.v1.JobMeta
 	22, // 11: gha.guest.v1.UpdateAgentRequest.header:type_name -> gha.guest.v1.UpdateAgentHeader
-	2,  // 12: gha.guest.v1.GuestAgentService.Hello:input_type -> gha.guest.v1.HelloRequest
-	5,  // 13: gha.guest.v1.GuestAgentService.RunJob:input_type -> gha.guest.v1.RunJobRequest
-	8,  // 14: gha.guest.v1.GuestAgentService.JobStatus:input_type -> gha.guest.v1.JobStatusRequest
-	14, // 15: gha.guest.v1.GuestAgentService.Reattach:input_type -> gha.guest.v1.ReattachRequest
-	17, // 16: gha.guest.v1.GuestAgentService.Drain:input_type -> gha.guest.v1.DrainRequest
-	19, // 17: gha.guest.v1.GuestAgentService.CancelJob:input_type -> gha.guest.v1.CancelJobRequest
-	21, // 18: gha.guest.v1.GuestAgentService.UpdateAgent:input_type -> gha.guest.v1.UpdateAgentRequest
-	3,  // 19: gha.guest.v1.GuestAgentService.Hello:output_type -> gha.guest.v1.HelloResponse
-	7,  // 20: gha.guest.v1.GuestAgentService.RunJob:output_type -> gha.guest.v1.RunJobResponse
-	9,  // 21: gha.guest.v1.GuestAgentService.JobStatus:output_type -> gha.guest.v1.JobStatusEvent
-	15, // 22: gha.guest.v1.GuestAgentService.Reattach:output_type -> gha.guest.v1.ReattachResponse
-	18, // 23: gha.guest.v1.GuestAgentService.Drain:output_type -> gha.guest.v1.DrainResponse
-	20, // 24: gha.guest.v1.GuestAgentService.CancelJob:output_type -> gha.guest.v1.CancelJobResponse
-	23, // 25: gha.guest.v1.GuestAgentService.UpdateAgent:output_type -> gha.guest.v1.UpdateAgentResponse
-	19, // [19:26] is the sub-list for method output_type
-	12, // [12:19] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	4,  // 12: gha.guest.v1.ConfigureSlotsResponse.slots:type_name -> gha.guest.v1.SlotInfo
+	2,  // 13: gha.guest.v1.GuestAgentService.Hello:input_type -> gha.guest.v1.HelloRequest
+	5,  // 14: gha.guest.v1.GuestAgentService.RunJob:input_type -> gha.guest.v1.RunJobRequest
+	8,  // 15: gha.guest.v1.GuestAgentService.JobStatus:input_type -> gha.guest.v1.JobStatusRequest
+	14, // 16: gha.guest.v1.GuestAgentService.Reattach:input_type -> gha.guest.v1.ReattachRequest
+	17, // 17: gha.guest.v1.GuestAgentService.Drain:input_type -> gha.guest.v1.DrainRequest
+	19, // 18: gha.guest.v1.GuestAgentService.CancelJob:input_type -> gha.guest.v1.CancelJobRequest
+	21, // 19: gha.guest.v1.GuestAgentService.UpdateAgent:input_type -> gha.guest.v1.UpdateAgentRequest
+	24, // 20: gha.guest.v1.GuestAgentService.ConfigureSlots:input_type -> gha.guest.v1.ConfigureSlotsRequest
+	3,  // 21: gha.guest.v1.GuestAgentService.Hello:output_type -> gha.guest.v1.HelloResponse
+	7,  // 22: gha.guest.v1.GuestAgentService.RunJob:output_type -> gha.guest.v1.RunJobResponse
+	9,  // 23: gha.guest.v1.GuestAgentService.JobStatus:output_type -> gha.guest.v1.JobStatusEvent
+	15, // 24: gha.guest.v1.GuestAgentService.Reattach:output_type -> gha.guest.v1.ReattachResponse
+	18, // 25: gha.guest.v1.GuestAgentService.Drain:output_type -> gha.guest.v1.DrainResponse
+	20, // 26: gha.guest.v1.GuestAgentService.CancelJob:output_type -> gha.guest.v1.CancelJobResponse
+	23, // 27: gha.guest.v1.GuestAgentService.UpdateAgent:output_type -> gha.guest.v1.UpdateAgentResponse
+	25, // 28: gha.guest.v1.GuestAgentService.ConfigureSlots:output_type -> gha.guest.v1.ConfigureSlotsResponse
+	21, // [21:29] is the sub-list for method output_type
+	13, // [13:21] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_guest_v1_guest_proto_init() }
@@ -1596,7 +1711,7 @@ func file_guest_v1_guest_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_guest_v1_guest_proto_rawDesc), len(file_guest_v1_guest_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   23,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
