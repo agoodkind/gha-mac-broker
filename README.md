@@ -98,6 +98,14 @@ The installer provisions a macOS launchd timer from the `[maintenance]` config
 section. `command` is the shell line to run, and `interval_seconds` is the
 launchd interval in seconds. Set `command = ""` to disable the timer.
 
+### Host metrics
+
+The broker samples host CPU, load, memory, swap, disk, and uptime on an interval,
+logs each sample, and serves the latest on `GET /status` as a `host_stats` object.
+The `[metrics]` section sets `enabled` (default on), `interval` (default `60s`), and
+`disk_path` (default `/`). The `enabled` flag and the `interval` reload without a
+restart. See [host metrics](docs/metrics.md).
+
 ## Subcommands
 
 ```sh
