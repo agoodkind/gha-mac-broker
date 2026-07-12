@@ -84,19 +84,24 @@ func (p *Pool) slotLoop(ctx context.Context, index int, slotIndex int, vm *broke
 		}()
 		switch {
 		case err == nil:
-			// Resume drained the inherited execution to its terminal, so the slot
-			// frees and the VM keeps serving.
+			// Resume drained the inherited execution to a zero-exit terminal (or an
+			// expired execution), so the slot frees and the VM keeps serving.
 			p.finishSlotJob(index, slotIndex, vm, nil)
+		case errors.Is(err, broker.ErrJobTerminal):
+			// The adopted job ran to its terminal with a nonzero exit. That is a
+			// normal job failure, not a resume failure, so free the slot and keep the
+			// VM available for the next job, exactly as a non-adopted completion does.
+			p.finishSlotJob(index, slotIndex, vm, err)
 		case errors.Is(err, context.Canceled):
 			// A worker shutdown detached the resume drain; the inherited execution
 			// keeps running and is re-adopted later, so do not recycle the VM.
 			slog.DebugContext(ctx, "runnerpool resume detached on shutdown", "vm", vm.Name, "slot", slotIndex, "execution", execID)
 			p.finishSlotJob(index, slotIndex, vm, err)
 		default:
-			// Resume could not attach or drain the inherited execution, which may
-			// still be running on the guest. Freeing the slot for a new job could
-			// dispatch onto a busy guest slot, so recycle the VM instead: it is torn
-			// down and re-warmed clean rather than serving new work on this slot.
+			// Resume could not attach to or drain the inherited execution to a
+			// terminal, which may still be running on the guest. Freeing the slot for
+			// a new job could dispatch onto a busy guest slot, so recycle the VM: it
+			// is torn down and re-warmed clean rather than serving new work here.
 			slog.WarnContext(ctx, "runnerpool resume job failed; recycling vm", "err", err, "vm", vm.Name, "slot", slotIndex, "execution", execID)
 			p.recycleWorkerAfterResumeFailure(index, slotIndex, vm, err)
 			return

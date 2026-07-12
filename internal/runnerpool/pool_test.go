@@ -1406,6 +1406,52 @@ func TestResumeFailureRecyclesAdoptedVM(t *testing.T) {
 	pool.Shutdown(shutdownCtx)
 }
 
+func TestResumeNonzeroTerminalKeepsAdoptedVM(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	warmer := newFakeWarmer()
+	warmer.SetAdopted([]broker.AdoptedVM{
+		{
+			VM: &broker.WarmVM{Name: "vm-busy", Image: "image-a"},
+			Slots: []broker.SlotBinding{
+				{
+					SlotIndex:    0,
+					Repo:         "owner/repo",
+					JobID:        1001,
+					RunID:        42,
+					ExecutionID:  "owner/repo#42#1001",
+					ResumeCursor: 3,
+					BoundAt:      now.Add(-time.Minute),
+				},
+			},
+		},
+	})
+	runner := newFakeRunner(1)
+	// The adopted job reached its terminal with a nonzero exit, wrapped with
+	// ErrJobTerminal. That is a normal job failure, not a resume/attach failure.
+	runner.runErr = fmt.Errorf("job exited 7: %w", broker.ErrJobTerminal)
+	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool.Start(ctx)
+
+	// The slot frees and the VM stays available rather than being recycled.
+	waitFor(t, func() bool {
+		snapshot := pool.Snapshot()
+		return snapshot.Idle == 1 && snapshot.Busy == 0
+	})
+	if torn := warmer.TornNames(); len(torn) != 0 {
+		t.Fatalf("torn VMs = %v, want none (terminal job failure keeps the VM)", torn)
+	}
+	if warmed := warmer.WarmNames(); len(warmed) != 0 {
+		t.Fatalf("warm calls = %v, want none (adopted VM kept, not re-warmed)", warmed)
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	pool.Shutdown(shutdownCtx)
+}
+
 func TestInstallAdoptedWorkersCarriesExecutionAndCursor(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	clock := newMutableClock(now)

@@ -246,9 +246,18 @@ func (b *Binder) verifySlotInventory(ctx context.Context, client guestConn, vmNa
 		slog.WarnContext(ctx, "slot inventory hello failed", "err", err, "vm", vmName)
 		return fmt.Errorf("broker: slot inventory hello on %s: %w", vmName, err)
 	}
-	if len(response.GetSlots()) < slotCount {
-		slog.WarnContext(ctx, "guest advertises too few slots", "vm", vmName, "advertised", len(response.GetSlots()), "want", slotCount)
-		return fmt.Errorf("broker: guest %s advertises %d slots, want at least %d", vmName, len(response.GetSlots()), slotCount)
+	advertised := make(map[uint32]struct{}, len(response.GetSlots()))
+	for _, slot := range response.GetSlots() {
+		advertised[slot.GetIndex()] = struct{}{}
+	}
+	// Require every configured index 0..slotCount-1 to be present, not just a
+	// matching count, so a sparse or duplicate inventory (say [1, 2] or [0, 0])
+	// cannot pass while host dispatch still targets a missing slot.
+	for slotIndex := range slotCount {
+		if _, ok := advertised[uint32(slotIndex)]; !ok { // #nosec G115 -- slot index is bounded and non-negative.
+			slog.WarnContext(ctx, "guest missing configured slot", "vm", vmName, "missing_slot", slotIndex, "advertised", len(advertised), "want", slotCount)
+			return fmt.Errorf("broker: guest %s missing slot %d of %d configured slots", vmName, slotIndex, slotCount)
+		}
 	}
 	return nil
 }
@@ -386,7 +395,13 @@ func (b *Binder) drainJob(ctx context.Context, client guestConn, execID string, 
 	cursor := fromSeq
 	canceled, err := b.drainToTerminal(ctx, client, execID, vm, runLog, &cursor)
 	if !canceled {
-		return err
+		if err != nil {
+			// The job reached a terminal with a nonzero exit. Mark it so the pool can
+			// tell a terminal job failure (free the slot, keep the VM) from a resume
+			// attach or drain failure (recycle the VM).
+			return errors.Join(err, ErrJobTerminal)
+		}
+		return nil
 	}
 	if classifyCancel(ctx) == cancelDetach {
 		slog.DebugContext(ctx, "detaching drain on worker shutdown", "vm", vm.Name, "execution", execID)
@@ -507,6 +522,13 @@ func sleepWithContext(ctx context.Context, delay time.Duration) {
 	case <-timer.C:
 	}
 }
+
+// ErrJobTerminal marks an error that reports a guest job which reached its
+// terminal result with a nonzero exit. The pool uses it to tell a normal adopted
+// job failure (the job ran to a terminal) from a resume attach or drain failure
+// (the inherited execution could never be reached), so it frees the slot instead
+// of recycling a healthy VM.
+var ErrJobTerminal = errors.New("broker: guest job reached terminal")
 
 func terminalToError(terminal *guestproto.TerminalResult, execID string, vm *WarmVM) error {
 	if terminal.GetExitCode() == 0 {

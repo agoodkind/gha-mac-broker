@@ -212,6 +212,36 @@ func TestRunJobNonzeroExitReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("RunJob error = nil, want nonzero-exit error")
 	}
+	if !errors.Is(err, ErrJobTerminal) {
+		t.Fatalf("RunJob error = %v, want wrapped ErrJobTerminal", err)
+	}
+}
+
+func TestVerifySlotInventoryRejectsMissingIndex(t *testing.T) {
+	binder := New(&config.Config{}, nil, tart.New("/nonexistent-tart"))
+	cases := map[string][]*guestproto.SlotInfo{
+		"sparse":    {{Index: 1}, {Index: 2}},
+		"duplicate": {{Index: 0}, {Index: 0}},
+	}
+	for name, slots := range cases {
+		t.Run(name, func(t *testing.T) {
+			guest := &stubGuest{hello: &guestproto.HelloResponse{ProtocolMajor: hostProtocolMajor, Slots: slots}}
+			if err := binder.verifySlotInventory(context.Background(), guest, "vm-x", 2); err == nil {
+				t.Fatalf("verifySlotInventory(%+v) = nil, want rejection for a missing configured index", slots)
+			}
+		})
+	}
+}
+
+func TestVerifySlotInventoryAcceptsAllIndicesPresent(t *testing.T) {
+	binder := New(&config.Config{}, nil, tart.New("/nonexistent-tart"))
+	guest := &stubGuest{hello: &guestproto.HelloResponse{
+		ProtocolMajor: hostProtocolMajor,
+		Slots:         []*guestproto.SlotInfo{{Index: 0}, {Index: 1}},
+	}}
+	if err := binder.verifySlotInventory(context.Background(), guest, "vm-x", 2); err != nil {
+		t.Fatalf("verifySlotInventory = %v, want nil when 0..1 are present", err)
+	}
 }
 
 func TestRunJobConflictReturnsErrorWithoutDraining(t *testing.T) {
