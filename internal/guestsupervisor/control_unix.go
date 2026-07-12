@@ -57,6 +57,7 @@ const (
 	opPollExits     = "poll_exits"
 	opAckExit       = "ack_exit"
 	opStatus        = "status"
+	opSetSlots      = "set_slots"
 )
 
 const (
@@ -154,6 +155,7 @@ type controlRequest struct {
 	Arguments         []string       `json:"arguments,omitempty"`
 	Environment       []string       `json:"environment,omitempty"`
 	PollTimeoutMillis int64          `json:"poll_timeout_ms,omitempty"`
+	SlotCount         uint32         `json:"slot_count,omitempty"`
 }
 
 type controlResponse struct {
@@ -165,6 +167,7 @@ type controlResponse struct {
 	SupervisorPID int        `json:"supervisor_pid,omitempty"`
 	State         string     `json:"state,omitempty"`
 	Generation    uint64     `json:"generation,omitempty"`
+	SlotCount     uint32     `json:"slot_count,omitempty"`
 }
 
 // writeFrame sends one length-prefixed control frame, attaching files as
@@ -361,6 +364,7 @@ func newControlRequest(op string) controlRequest {
 		Arguments:         nil,
 		Environment:       nil,
 		PollTimeoutMillis: 0,
+		SlotCount:         0,
 	}
 }
 
@@ -376,6 +380,7 @@ func newControlResponse() controlResponse {
 		SupervisorPID: 0,
 		State:         "",
 		Generation:    0,
+		SlotCount:     0,
 	}
 }
 
@@ -466,6 +471,93 @@ func RequestReplacement(
 		return 0, fmt.Errorf("guestsupervisor: replace_worker returned invalid pid %d", response.NewPID)
 	}
 	return response.NewPID, nil
+}
+
+// ConfigureSlots asks the supervisor to serve slotCount execution slots. The
+// supervisor validates the request against the running slots, updates its slot
+// count, and triggers a worker replacement so the new worker generation serves
+// the new count. It returns the applied count. A no-op when the count already
+// matches, and a rejection (returned as an error) when a shrink would strand a
+// running slot.
+func ConfigureSlots(socketPath string, slotCount uint32) (uint32, error) {
+	request := newControlRequest(opSetSlots)
+	request.SlotCount = slotCount
+	response, files, err := roundTrip(socketPath, request, nil, controlRequestTimeout)
+	closeFiles(files)
+	if err != nil {
+		return 0, err
+	}
+	return response.SlotCount, nil
+}
+
+// handleSetSlots applies a host-requested slot count. It is a no-op when the
+// count already matches, and it rejects a shrink that would strand a running
+// slot rather than orphan a job. Otherwise it updates the slot count and signals
+// the current worker to reload, so the next worker generation inherits the new
+// count through assembleEnv and its snapshot handoff preserves any running
+// execution. It reports the applied count.
+func (s *Supervisor) handleSetSlots(conn *net.UnixConn, request controlRequest) {
+	requested := request.SlotCount
+	if requested == 0 {
+		s.replyError(conn, fmt.Errorf("set_slots requires a positive slot count"))
+		return
+	}
+	current := s.slotCount.Load()
+	if requested == current {
+		response := newControlResponse()
+		response.SlotCount = current
+		s.reply(conn, response, nil)
+		return
+	}
+
+	s.mu.Lock()
+	if requested < current {
+		if busySlot, busy := s.maxRunningSlotAtOrAboveLocked(requested); busy {
+			s.mu.Unlock()
+			s.replyError(conn, fmt.Errorf("set_slots rejected: slot %d is running, cannot shrink to %d slots", busySlot, requested))
+			return
+		}
+	}
+	s.slotCount.Store(requested)
+	workerPID := 0
+	if handle, ok := s.workers[s.currentGeneration]; ok && handle.cmd.Process != nil {
+		workerPID = handle.cmd.Process.Pid
+	}
+	s.mu.Unlock()
+
+	// Signal the current worker to reload. Its SIGHUP handler drives the PR3
+	// snapshot handoff, so the replacement generation reads the updated slot count
+	// while any running execution restores onto it. A zero pid means no worker is
+	// current yet (only in a control-only test), so there is nothing to reload.
+	if workerPID > 0 {
+		if err := syscall.Kill(workerPID, syscall.SIGHUP); err != nil {
+			s.log.Warn("guest supervisor set_slots reload signal failed", "pid", workerPID, "err", err)
+		}
+	}
+	response := newControlResponse()
+	response.SlotCount = requested
+	s.reply(conn, response, nil)
+}
+
+// maxRunningSlotAtOrAboveLocked reports the highest running slot index that is at
+// or above floor, so a shrink to floor slots can reject rather than strand it.
+// The caller holds s.mu.
+func (s *Supervisor) maxRunningSlotAtOrAboveLocked(floor uint32) (uint32, bool) {
+	found := false
+	highest := uint32(0)
+	for _, runnerChild := range s.children {
+		if runnerChild.exited {
+			continue
+		}
+		if runnerChild.slot < floor {
+			continue
+		}
+		if !found || runnerChild.slot > highest {
+			highest = runnerChild.slot
+			found = true
+		}
+	}
+	return highest, found
 }
 
 func parseState(name string) State {

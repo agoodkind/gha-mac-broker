@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -69,6 +70,7 @@ type Options struct {
 
 type child struct {
 	executionID string
+	slot        uint32
 	pid         int
 	pgid        int
 	cmd         *exec.Cmd
@@ -96,6 +98,12 @@ type Supervisor struct {
 	log           *slog.Logger
 	controlSocket *net.UnixListener
 
+	// slotCount is the live execution slot count each new worker generation
+	// inherits. It starts from Options.SlotCount and a set_slots control op
+	// updates it, so the count is read on the worker-spawn path and written on the
+	// control path without the supervisor lock.
+	slotCount atomic.Uint32
+
 	mu                sync.Mutex
 	state             State
 	generationCounter uint64
@@ -118,10 +126,11 @@ func New(opts Options) *Supervisor {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Supervisor{
+	supervisor := &Supervisor{
 		opts:              opts,
 		log:               log,
 		controlSocket:     nil,
+		slotCount:         atomic.Uint32{},
 		mu:                sync.Mutex{},
 		state:             StateBooting,
 		generationCounter: 0,
@@ -136,6 +145,8 @@ func New(opts Options) *Supervisor {
 		firstReady:        make(chan struct{}),
 		firstOnce:         sync.Once{},
 	}
+	supervisor.slotCount.Store(opts.SlotCount)
+	return supervisor
 }
 
 // Run spawns the first worker, serves the control socket, and supervises worker
@@ -479,7 +490,7 @@ func (s *Supervisor) assembleEnv(
 		EnvListenerFD:        strconv.Itoa(listenerFD),
 		EnvReadyFD:           strconv.Itoa(readyFD),
 		EnvGeneration:        strconv.FormatUint(generation, 10),
-		EnvSlots:             strconv.FormatUint(uint64(s.opts.SlotCount), 10),
+		EnvSlots:             strconv.FormatUint(uint64(s.slotCount.Load()), 10),
 		EnvToken:             s.opts.Token,
 		EnvGoldenFingerprint: s.opts.GoldenFingerprint,
 		EnvPipeFDs:           pipeJSON,
@@ -545,6 +556,9 @@ func (s *Supervisor) handleControl(ctx context.Context, conn *net.UnixConn) {
 		s.handleAckExit(conn, request)
 	case opReplaceWorker:
 		s.handleReplaceWorker(conn, request, files)
+	case opSetSlots:
+		closeFiles(files)
+		s.handleSetSlots(conn, request)
 	default:
 		closeFiles(files)
 		s.replyError(conn, fmt.Errorf("unsupported control op %q", request.Op))
@@ -611,6 +625,7 @@ func (s *Supervisor) handleStartChild(conn *net.UnixConn, request controlRequest
 	}
 	runnerChild := &child{
 		executionID: spec.ExecutionID,
+		slot:        spec.Slot,
 		pid:         launched.PID,
 		pgid:        launched.PGID,
 		cmd:         launched.Command,

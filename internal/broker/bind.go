@@ -52,6 +52,17 @@ var drainTimeout = 30 * time.Second
 // before its terminal event.
 const drainReconnectBackoff = time.Second
 
+// slotReconfigureTimeout bounds the wait for a guest to serve the requested slot
+// count after ConfigureSlots. The guest applies the count by replacing its
+// worker, which is asynchronous, so the host re-Hellos until the inventory
+// covers every configured slot or this deadline elapses. It is a var so tests
+// can shorten it.
+var slotReconfigureTimeout = 30 * time.Second
+
+// slotReconfigureInterval paces the re-Hello poll while the guest worker
+// replacement completes.
+var slotReconfigureInterval = 500 * time.Millisecond
+
 // guestAgentPort is the fixed TCP port the guest agent listens on inside the VM.
 const guestAgentPort = "53931"
 
@@ -77,6 +88,7 @@ type guestConn interface {
 	Reattach(ctx context.Context) (*guestproto.ReattachResponse, error)
 	Drain(ctx context.Context) (*guestproto.DrainResponse, error)
 	CancelJob(ctx context.Context, executionID string) error
+	ConfigureSlots(ctx context.Context, slotCount uint32) (*guestproto.ConfigureSlotsResponse, error)
 }
 
 // WarmVM is a booted VM whose guest agent answers Hello. Name is safe to read
@@ -215,15 +227,46 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 		b.teardown(ctx, vmName)
 		return nil, err
 	}
-	// Reject a guest that advertises fewer slots than configured, so a later
-	// RunJob never targets a slot the guest does not have.
-	if err := b.verifySlotInventory(ctx, client, vmName, slotCount); err != nil {
+	// Ask the guest to serve the configured slot count, then reject it if the
+	// advertised inventory still does not cover every slot, so a later RunJob never
+	// targets a slot the guest does not have. A fresh guest boots with one slot and
+	// grows to the configured count here.
+	if err := b.ensureSlots(ctx, client, vmName, slotCount); err != nil {
 		_ = bootCmd.Process.Kill()
 		b.teardown(ctx, vmName)
 		return nil, err
 	}
 
 	return vm, nil
+}
+
+// ensureSlots asks the guest to serve slotCount slots, then confirms the
+// advertised inventory covers them. A fresh guest booted with the default single
+// slot grows to slotCount; a guest a prior host already configured is a no-op.
+// The guest applies the count by replacing its worker, which is asynchronous, so
+// verifySlotInventory is re-Hello-polled until the new worker is current or the
+// deadline elapses. A guest that rejects the request (a shrink below a running
+// slot) surfaces the error here so the caller leaves the VM as is.
+func (b *Binder) ensureSlots(ctx context.Context, client guestConn, vmName string, slotCount int) error {
+	if _, err := client.ConfigureSlots(ctx, uint32(slotCount)); err != nil { // #nosec G115 -- slotCount is normalized to at least 1.
+		slog.WarnContext(ctx, "configure slots failed", "err", err, "vm", vmName, "slot_count", slotCount)
+		return fmt.Errorf("broker: configure %d slots on %s: %w", slotCount, vmName, err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, slotReconfigureTimeout)
+	defer cancel()
+	ticker := time.NewTicker(slotReconfigureInterval)
+	defer ticker.Stop()
+	for {
+		err := b.verifySlotInventory(ctx, client, vmName, slotCount)
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-ticker.C:
+		}
+	}
 }
 
 // verifySlotInventory rejects a guest whose advertised slot inventory does not
@@ -675,7 +718,7 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 			slog.WarnContext(ctx, "skip running vm adoption after guest resolve failure", "err", err, "vm", name)
 			continue
 		}
-		if err := b.verifySlotInventory(ctx, client, name, normalizedSlotCount); err != nil {
+		if err := b.ensureSlots(ctx, client, name, normalizedSlotCount); err != nil {
 			slog.WarnContext(ctx, "skip running vm adoption after slot inventory check", "err", err, "vm", name)
 			continue
 		}
