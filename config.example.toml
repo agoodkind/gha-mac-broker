@@ -57,3 +57,12 @@ tag   = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
 # swift-mk to the latest signed release, then prunes the cache to a size cap.
 command = "swift-mk update apply || true; exec swift-mk cache prune --max-bytes 53687091200 --path $HOME/pool-cache"
 interval_seconds = 3600
+
+[metrics]
+# Host system-stats sampler. Reads CPU, load, memory, swap, disk, and uptime on
+# an interval, logs one sample per interval, and serves the latest on /status as
+# host_stats. enabled and interval reload without a restart; disk_path is read at
+# startup.
+enabled = true
+interval = "60s"
+disk_path = "/"
