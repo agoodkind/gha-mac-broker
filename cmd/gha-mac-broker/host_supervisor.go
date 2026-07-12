@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,6 +30,13 @@ const hostReconcileStallTimeout = 6 * time.Minute
 // supervisorPIDFileMode keeps the pidfile owner-only; it is not sensitive but a
 // tight mode avoids a broad-permission warning and is all the deploy path needs.
 const supervisorPIDFileMode = 0o600
+
+// supervisorPIDDirMode is the mode for the pidfile's parent directory.
+const supervisorPIDDirMode = 0o755
+
+// osDarwinName is the [runtime.GOOS] value for macOS, used to place the pidfile in
+// the platform's per-user application state directory.
+const osDarwinName = "darwin"
 
 // runSupervisor runs the durable host supervisor: it binds the webhook, capacity,
 // and status listener, then spawns and supervises the swappable worker, replacing
@@ -112,14 +120,31 @@ func runSupervisor(ctx context.Context, args []string) error {
 	return nil
 }
 
-// supervisorPIDPath is the file the supervisor writes its pid to, so a separate
-// deploy or update process can signal it to reload the worker in place.
+// supervisorPIDPath is the stable, well-known file the supervisor writes its pid
+// to, so a separate deploy or update process can find and signal it. It derives
+// from HOME rather than TMPDIR because a launchd user agent and a shell both
+// resolve the same HOME, while their TMPDIR differs, so a TMPDIR path would let a
+// shell-run deploy miss the live supervisor and silently downgrade a worker reload
+// to a full service restart.
 func supervisorPIDPath() string {
-	return filepath.Join(os.TempDir(), "gha-mac-broker-supervisor.pid")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		// HOME should always resolve for a user agent; fall back to a fixed name only
+		// so the pidfile still has a path when it does not.
+		return filepath.Join(os.TempDir(), "gha-mac-broker-supervisor.pid")
+	}
+	if runtime.GOOS == osDarwinName {
+		return filepath.Join(home, "Library", "Application Support", "gha-mac-broker", "supervisor.pid")
+	}
+	return filepath.Join(home, ".local", "state", "gha-mac-broker", "supervisor.pid")
 }
 
 func writeSupervisorPIDFile(pid int) error {
 	path := supervisorPIDPath()
+	if err := os.MkdirAll(filepath.Dir(path), supervisorPIDDirMode); err != nil {
+		slog.Error("supervisor create pidfile dir failed", "err", err, "path", path)
+		return fmt.Errorf("supervisor: create pidfile dir: %w", err)
+	}
 	content := []byte(strconv.Itoa(pid) + "\n")
 	if err := os.WriteFile(path, content, supervisorPIDFileMode); err != nil {
 		slog.Error("supervisor write pidfile failed", "err", err, "path", path)

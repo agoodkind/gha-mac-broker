@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -22,9 +24,10 @@ import (
 )
 
 const (
-	workerMainEnv  = "GHA_HOST_WORKER_TEST_MAIN"
-	workerStallEnv = "GHA_HOST_WORKER_TEST_STALL"
-	harnessTimeout = 30 * time.Second
+	workerMainEnv   = "GHA_HOST_WORKER_TEST_MAIN"
+	workerStallEnv  = "GHA_HOST_WORKER_TEST_STALL"
+	workerEventsEnv = "GHA_HOST_WORKER_TEST_EVENTS"
+	harnessTimeout  = 30 * time.Second
 )
 
 // TestMain lets the test binary re-exec itself as a host worker. The supervisor
@@ -46,6 +49,10 @@ func TestMain(m *testing.M) {
 func runStubWorker() {
 	listener := stubListener()
 	generation := os.Getenv(hostsupervisor.EnvGeneration)
+	// Record the generation's start before signaling ready, so the single-writer
+	// ordering test sees a start event that necessarily precedes the supervisor's
+	// promotion of this generation.
+	stubAppendEvent("start:" + generation)
 	server := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = io.WriteString(w, generation)
@@ -63,9 +70,28 @@ func runStubWorker() {
 	stubSignalReady()
 
 	<-ctx.Done()
+	// Record the stop as soon as the stop signal arrives, before graceful shutdown,
+	// so the ordering test can prove this generation stopped before the next started.
+	stubAppendEvent("stop:" + generation)
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutCtx)
+}
+
+// stubAppendEvent appends one lifecycle event line to the shared events file. A
+// POSIX append of a short line from separate worker processes is atomic, so the
+// file records a total order of starts and stops across generations.
+func stubAppendEvent(event string) {
+	path := os.Getenv(workerEventsEnv)
+	if path == "" {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = io.WriteString(file, event+"\n")
+	_ = file.Close()
 }
 
 func stubListener() net.Listener {
@@ -220,10 +246,12 @@ func TestReloadKeepsListenerUpAcrossWorkerSwap(t *testing.T) {
 	}
 	firstPID := h.supervisor.CurrentWorkerPID()
 
-	// Dial the listener continuously across the reload. A successful dial proves the
-	// listening socket stays in LISTEN, which is the "no listener gap" property: the
-	// supervisor owns the socket and each worker holds a dup, so a draining worker
-	// closing its dup never closes the socket. A gap would surface as a refused dial.
+	// Dial the listener continuously across the reload. The reload is stop-old-first,
+	// so there is a brief window with no acceptor; the listening socket still stays in
+	// LISTEN because the supervisor owns it, so a connection made during the window
+	// completes the handshake and queues in the kernel backlog rather than being
+	// refused. A refused dial is the only true "listener dropped" signal, so only that
+	// fails the test; a backlog-latency timeout during the acceptor gap is tolerated.
 	pollStop := make(chan struct{})
 	pollFailures := make(chan error, 1)
 	go func() {
@@ -234,16 +262,18 @@ func TestReloadKeepsListenerUpAcrossWorkerSwap(t *testing.T) {
 				return
 			default:
 			}
-			conn, err := net.DialTimeout("tcp", h.addr, time.Second)
+			conn, err := net.DialTimeout("tcp", h.addr, 2*time.Second)
 			if err != nil {
-				select {
-				case pollFailures <- err:
-				default:
+				if strings.Contains(err.Error(), "refused") {
+					select {
+					case pollFailures <- err:
+					default:
+					}
 				}
 			} else {
 				_ = conn.Close()
 			}
-			time.Sleep(2 * time.Millisecond)
+			time.Sleep(25 * time.Millisecond)
 		}
 	}()
 
@@ -304,6 +334,84 @@ func TestStallWatchdogRestartsStalledWorker(t *testing.T) {
 func processAlive(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// TestReloadStopsOldWorkerBeforeStartingNew proves the host reload is stop-old-
+// first, so at most one worker generation is ever live: the old worker records its
+// stop before the replacement records its start, and the running count is never
+// above one. This is the single-writer property that prevents two workers from
+// mutating the pool at once.
+func TestReloadStopsOldWorkerBeforeStartingNew(t *testing.T) {
+	eventsPath := filepath.Join(t.TempDir(), "events.log")
+	t.Setenv(workerEventsEnv, eventsPath)
+
+	h := startHarness(t, hostsupervisor.Options{Log: nil})
+	firstPID := h.supervisor.CurrentWorkerPID()
+
+	h.supervisor.RequestReload()
+
+	deadline := time.Now().Add(harnessTimeout)
+	for {
+		current := h.supervisor.CurrentWorkerPID()
+		if current > 0 && current != firstPID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reload did not promote a new worker before deadline")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	events := readWorkerEvents(t, eventsPath)
+	stopFirst := indexOfEvent(events, "stop:1")
+	startSecond := indexOfEvent(events, "start:2")
+	if stopFirst < 0 || startSecond < 0 {
+		t.Fatalf("events = %v, want both stop:1 and start:2", events)
+	}
+	if stopFirst >= startSecond {
+		t.Fatalf("events = %v, want stop:1 (index %d) before start:2 (index %d)", events, stopFirst, startSecond)
+	}
+
+	// The running count, incremented on each start and decremented on each stop, must
+	// never exceed one, so two worker generations are never live at the same time.
+	running := 0
+	for _, event := range events {
+		if strings.HasPrefix(event, "start:") {
+			running++
+		}
+		if strings.HasPrefix(event, "stop:") {
+			running--
+		}
+		if running > 1 {
+			t.Fatalf("events = %v, two workers were live at once", events)
+		}
+	}
+}
+
+func readWorkerEvents(t *testing.T, path string) []string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read events: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+	events := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			events = append(events, trimmed)
+		}
+	}
+	return events
+}
+
+func indexOfEvent(events []string, target string) int {
+	for index, event := range events {
+		if event == target {
+			return index
+		}
+	}
+	return -1
 }
 
 // TestReloadDrainsOldWorker proves the old worker is stopped after the replacement

@@ -36,6 +36,12 @@ const (
 	// workerExitBuffer sizes the worker-exit channel so a burst of superseded
 	// workers draining during a swap never blocks a wait goroutine.
 	workerExitBuffer = 16
+	// reloadRespawnAttempts bounds how many times a reload retries spawning a
+	// replacement after the old worker has already stopped, before the supervisor
+	// gives up and exits so launchd restarts the whole service.
+	reloadRespawnAttempts = 3
+	// reloadRespawnBackoff is the pause between replacement spawn attempts.
+	reloadRespawnBackoff = time.Second
 )
 
 // WorkerSpec describes one worker invocation the supervisor is about to spawn. The
@@ -205,7 +211,9 @@ func (s *Supervisor) supervise(ctx context.Context) error {
 				return fatalErr
 			}
 		case <-s.reloadCh:
-			s.replaceWorker(ctx)
+			if err := s.replaceWorker(ctx); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -251,57 +259,95 @@ func (s *Supervisor) markCurrent(generation uint64) {
 	s.mu.Unlock()
 }
 
-// replaceWorker spawns a replacement worker over the same listener, waits for it
-// to serve, then promotes it and drains the old worker. On any failure before the
-// replacement serves it rolls back, leaving the old worker current and serving.
-func (s *Supervisor) replaceWorker(ctx context.Context) {
+// replaceWorker reloads the worker stop-old-first, so at most one worker ever
+// mutates the pool. Unlike the guest, whose old worker is read-only while it
+// drains, the host worker owns the pool mutations (adopt, dispatch, warm, reap),
+// so two live workers would double-bind jobs onto one slot and recycle VMs out from
+// under each other. It stops the old worker and waits for it to fully exit, which
+// quiesces its accept loop and its reconcile, dispatch, warm, and reap loops and
+// detaches (does not kill) its running-job drains, then brings up the replacement,
+// which re-adopts every VM and resumes every drain from its cursor. The supervisor
+// keeps the listener open throughout, so connections that arrive during the brief
+// swap queue in the kernel backlog and are served by the replacement rather than
+// refused. It returns a fatal error only when no replacement can be brought up
+// after the old worker is gone, so the supervisor exits and launchd restarts it.
+func (s *Supervisor) replaceWorker(ctx context.Context) error {
 	s.mu.Lock()
 	if s.state != StateSteady {
 		state := s.state
 		s.mu.Unlock()
 		s.log.WarnContext(ctx, "host supervisor reload skipped: not steady", "state", state.String())
-		return
+		return nil
 	}
 	s.state = StateReplacing
 	oldGeneration := s.currentGeneration
+	s.superseded[oldGeneration] = struct{}{}
 	s.mu.Unlock()
 
-	generation, readyRead, err := s.spawn(os.Environ())
-	if err != nil {
-		s.revertReplacing(generation)
-		s.log.WarnContext(ctx, "host supervisor reload spawn failed; keeping current worker", "err", err)
-		return
-	}
-	defer func() { _ = readyRead.Close() }()
+	// Stop the old worker and block until it has fully exited, so no second worker
+	// begins mutating the pool while the old one still owns it.
+	s.stopAndWaitGeneration(oldGeneration)
 
-	if err := s.waitReplacementReady(ctx, readyRead); err != nil {
-		s.stopGeneration(generation)
-		s.revertReplacing(generation)
-		s.log.WarnContext(ctx, "host supervisor reload rolled back; kept current worker", "err", err, "failed_generation", generation)
-		return
-	}
-
-	s.mu.Lock()
-	if oldGeneration != 0 {
-		s.superseded[oldGeneration] = struct{}{}
-	}
-	s.currentGeneration = generation
-	s.pendingGeneration = 0
-	s.state = StateSteady
-	s.lastProgress = s.now()
-	s.mu.Unlock()
-
-	s.log.InfoContext(ctx, "host supervisor worker replaced; draining old", "new_generation", generation, "old_generation", oldGeneration, "new_pid", s.CurrentWorkerPID())
-	s.stopGeneration(oldGeneration)
+	return s.bringUpReplacement(ctx, oldGeneration)
 }
 
-func (s *Supervisor) revertReplacing(generation uint64) {
+// bringUpReplacement spawns a replacement worker and promotes it once it serves. It
+// retries a bounded number of times because the old worker is already gone, so the
+// service has no worker until one comes up; if none does, it returns a fatal error
+// so the supervisor exits and launchd restarts the whole service.
+func (s *Supervisor) bringUpReplacement(ctx context.Context, oldGeneration uint64) error {
+	var served uint64
+	for attempt := 1; attempt <= reloadRespawnAttempts; attempt++ {
+		generation, ok := s.trySpawnReplacement(ctx, attempt)
+		if ok {
+			served = generation
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("hostsupervisor: reload cancelled before a worker came up: %w", ctx.Err())
+		case <-time.After(reloadRespawnBackoff):
+		}
+	}
+	if served == 0 {
+		err := fmt.Errorf("hostsupervisor: no replacement worker came up after %d attempts", reloadRespawnAttempts)
+		s.log.ErrorContext(ctx, "host supervisor reload failed; exiting for restart", "err", err)
+		return err
+	}
+	s.markCurrent(served)
+	s.log.InfoContext(ctx, "host supervisor worker reloaded", "new_generation", served, "old_generation", oldGeneration, "new_pid", s.CurrentWorkerPID())
+	return nil
+}
+
+// trySpawnReplacement makes one attempt to spawn a replacement worker and wait for
+// it to serve, returning the generation and whether it served. It stops a spawned
+// worker that never serves, so a failed attempt leaves no stray process. The caller
+// logs the eventual success or the final give-up, so the success log stays out of
+// the retry loop.
+func (s *Supervisor) trySpawnReplacement(ctx context.Context, attempt int) (uint64, bool) {
+	generation, readyRead, err := s.spawn(os.Environ())
+	if err != nil {
+		s.log.ErrorContext(ctx, "host supervisor replacement spawn failed", "err", err, "attempt", attempt)
+		return 0, false
+	}
+	readyErr := s.waitReplacementReady(ctx, readyRead)
+	_ = readyRead.Close()
+	if readyErr != nil {
+		s.stopAndWaitGeneration(generation)
+		s.clearPending(generation)
+		s.log.ErrorContext(ctx, "host supervisor replacement did not serve", "err", readyErr, "attempt", attempt, "failed_generation", generation)
+		return 0, false
+	}
+	return generation, true
+}
+
+// clearPending drops a pending generation without changing the replacement state,
+// used between reload attempts so the next spawn reserves a fresh generation while
+// the supervisor stays in the replacing phase until a worker serves.
+func (s *Supervisor) clearPending(generation uint64) {
 	s.mu.Lock()
 	if s.pendingGeneration == generation {
 		s.pendingGeneration = 0
-	}
-	if s.state == StateReplacing {
-		s.state = StateSteady
 	}
 	s.mu.Unlock()
 }
@@ -386,7 +432,7 @@ func (s *Supervisor) spawn(baseEnv []string) (uint64, *os.File, error) {
 	extraFiles, env, cleanup, err := s.buildInherit(baseEnv, generation, readyWrite, progressWrite)
 	if err != nil {
 		closeFiles(readyRead, readyWrite, progressRead, progressWrite)
-		s.revertReplacing(generation)
+		s.clearPending(generation)
 		return 0, nil, err
 	}
 	spec := WorkerSpec{
@@ -398,7 +444,7 @@ func (s *Supervisor) spawn(baseEnv []string) (uint64, *os.File, error) {
 	if err := s.startWorker(generation, spec); err != nil {
 		cleanup()
 		closeFiles(readyRead, progressRead)
-		s.revertReplacing(generation)
+		s.clearPending(generation)
 		return 0, nil, err
 	}
 	cleanup()
@@ -552,6 +598,34 @@ func (s *Supervisor) stopGeneration(generation uint64) {
 			_ = handle.cmd.Process.Kill()
 		}
 	})
+}
+
+// stopAndWaitGeneration signals a worker generation to stop and blocks until it has
+// fully exited, force-killing it after the stop timeout. Blocking until the process
+// is gone is what guarantees single-writer pool ownership across a reload: the next
+// worker is not spawned until the old one has quiesced. The wait goroutine still
+// delivers the exit to the exit channel, so the supervise loop accounts for it.
+func (s *Supervisor) stopAndWaitGeneration(generation uint64) {
+	if generation == 0 {
+		return
+	}
+	s.mu.Lock()
+	handle := s.workers[generation]
+	s.mu.Unlock()
+	if handle == nil || handle.cmd.Process == nil {
+		return
+	}
+	_ = handle.cmd.Process.Signal(syscall.SIGTERM)
+	timer := time.NewTimer(s.opts.WorkerStopTimeout)
+	defer timer.Stop()
+	select {
+	case <-handle.done:
+		return
+	case <-timer.C:
+		_ = handle.cmd.Process.Kill()
+	}
+	// A SIGKILL always reaps, so the wait goroutine closes done promptly.
+	<-handle.done
 }
 
 // forgetWorker drops a generation from the worker and supersession tables, used
