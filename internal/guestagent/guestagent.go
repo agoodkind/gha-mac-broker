@@ -5,6 +5,7 @@ package guestagent
 import (
 	"context"
 	"net/http"
+	"sync"
 
 	"connectrpc.com/connect"
 	"goodkind.io/gha-mac-broker/internal/guestexec"
@@ -17,7 +18,6 @@ const (
 	protocolMajor       = uint32(1)
 	defaultAgentBuild   = "dev"
 	defaultSlotCount    = uint32(1)
-	phase0Shell         = "/bin/sh"
 	capabilityRunJob    = "run-job"
 	capabilityReattach  = "reattach"
 	capabilityDrain     = "drain"
@@ -35,13 +35,17 @@ type ChildLauncher interface {
 	Run(spec guestexec.ExecSpec) (guestexec.Outcome, error)
 }
 
-// Options configures the Phase 0 guest-agent service.
+// Options configures the guest-agent service.
 type Options struct {
 	SlotCount         uint32
 	BootID            string
 	AgentBuild        string
 	GoldenFingerprint string
 	ChildLauncher     ChildLauncher
+	// SpecBuilder assembles the runner ExecSpec and runs per-slot setup for each
+	// RunJob. When nil the handler uses the production runner executor, which
+	// clones the runner, seeds the slot HOME, and sets the slot keychain.
+	SpecBuilder SpecBuilder
 }
 
 // Handler implements GuestAgentService over a guest execution registry.
@@ -52,6 +56,12 @@ type Handler struct {
 	agentBuild        string
 	goldenFingerprint string
 	childLauncher     ChildLauncher
+	specBuilder       SpecBuilder
+	// slotLocksMu guards slotLocks; each slot lock serializes admission, per-slot
+	// prep, and start for one slot, so two concurrent RunJobs for the same slot
+	// cannot both run destructive prepareSlot before either records the execution.
+	slotLocksMu sync.Mutex
+	slotLocks   map[uint32]*sync.Mutex
 }
 
 var _ guestprotoconnect.GuestAgentServiceHandler = (*Handler)(nil)
@@ -79,6 +89,10 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 	if agentBuild == "" {
 		agentBuild = defaultAgentBuild
 	}
+	specBuilder := options.SpecBuilder
+	if specBuilder == nil {
+		specBuilder = newRunnerExecutor()
+	}
 	return &Handler{
 		registry:          registry,
 		slotCount:         slotCount,
@@ -86,7 +100,24 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 		agentBuild:        agentBuild,
 		goldenFingerprint: options.GoldenFingerprint,
 		childLauncher:     options.ChildLauncher,
+		specBuilder:       specBuilder,
+		slotLocksMu:       sync.Mutex{},
+		slotLocks:         make(map[uint32]*sync.Mutex),
 	}
+}
+
+// slotLock returns the lock that serializes admission, prep, and start for slot,
+// creating it on first use. The returned lock is stable for the slot's lifetime,
+// so every RunJob for that slot contends on the same lock.
+func (handler *Handler) slotLock(slot uint32) *sync.Mutex {
+	handler.slotLocksMu.Lock()
+	defer handler.slotLocksMu.Unlock()
+	lock, found := handler.slotLocks[slot]
+	if !found {
+		lock = &sync.Mutex{}
+		handler.slotLocks[slot] = lock
+	}
+	return lock
 }
 
 // NewHTTPHandler mounts a guest-agent service on the generated ConnectRPC path.
@@ -118,19 +149,46 @@ func (handler *Handler) Hello(
 	return connect.NewResponse(response), nil
 }
 
-// RunJob starts or reuses a registry execution using the request ID as the
-// idempotency key.
+// RunJob builds the runner ExecSpec through the spec builder, which prepares the
+// slot and returns the absolute run.sh launch, then starts or reuses a registry
+// execution using the request ID as the idempotency key.
 func (handler *Handler) RunJob(
-	_ context.Context,
+	ctx context.Context,
 	request *connect.Request[guestproto.RunJobRequest],
 ) (*connect.Response[guestproto.RunJobResponse], error) {
-	spec := guestexec.ExecSpec{
+	jobRequest := JobRequest{
 		ExecutionID: request.Msg.GetExecutionId(),
 		Slot:        request.Msg.GetSlot(),
 		Meta:        protoMetaToExec(request.Msg.GetMeta()),
-		Command:     phase0Shell,
-		Args:        []string{"-c", phase0Script(request.Msg.GetJitConfig())},
+		JitConfig:   request.Msg.GetJitConfig(),
 		Env:         copyEnvironment(request.Msg.GetEnv()),
+	}
+	// Serialize admission, prep, and start per slot for the whole critical section,
+	// so two concurrent RunJobs for the same slot cannot both pass admission and
+	// both run destructive prepareSlot before either records the execution. The
+	// lock is released on every return path, and never held across the job run.
+	slotLock := handler.slotLock(jobRequest.Slot)
+	slotLock.Lock()
+	defer slotLock.Unlock()
+	// Peek admission before any destructive per-slot prep. Build runs prepareSlot,
+	// which rm -rf's and re-clones the slot's runner dir, HOME, and keychain, so an
+	// idempotent retry of a live execution or a job routed to a busy slot must be
+	// rejected here rather than wiping a co-tenant runner out from under it. The
+	// authoritative admission still happens under the registry lock at Register.
+	admission, admitErr := handler.registry.CheckAdmission(guestexec.ExecSpec{
+		ExecutionID: jobRequest.ExecutionID,
+		Slot:        jobRequest.Slot,
+	})
+	if admitErr != nil {
+		return nil, mapRegistryError(admitErr)
+	}
+	if admission != guestexec.OutcomeAccepted {
+		response := &guestproto.RunJobResponse{Outcome: outcomeToProto(admission)}
+		return connect.NewResponse(response), nil
+	}
+	spec, err := handler.specBuilder.Build(ctx, jobRequest)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	outcome, err := handler.startExecution(spec)
 	if err != nil {

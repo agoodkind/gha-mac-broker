@@ -174,6 +174,23 @@ func (r *Registry) Start(spec ExecSpec) (Outcome, error) {
 	return OutcomeAccepted, nil
 }
 
+// CheckAdmission reports the outcome the registry would return for spec's
+// execution ID and slot without launching, recording, or mutating anything. It
+// lets a caller decide whether to run expensive or destructive per-slot
+// preparation before Start or Register, so an idempotent duplicate of a live
+// execution or a conflicting slot never triggers that work. The authoritative
+// admission still happens under the lock in Register, so a concurrent race that
+// slips past this peek is still caught there.
+func (r *Registry) CheckAdmission(spec ExecSpec) (Outcome, error) {
+	if spec.ExecutionID == "" {
+		return OutcomeUnspecified, fmt.Errorf("guestexec: execution ID is required")
+	}
+	r.mu.Lock()
+	outcome, _, err := r.checkAdmissionLocked(spec)
+	r.mu.Unlock()
+	return outcome, err
+}
+
 // checkAdmissionLocked reports the outcome of admitting spec and whether the
 // caller should proceed to record it. It must run under r.mu. proceed is true
 // only for OutcomeAccepted; every other outcome carries the reason a new
