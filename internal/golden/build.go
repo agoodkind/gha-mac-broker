@@ -43,6 +43,10 @@ const (
 	// runnerTarballTimeout bounds the host-side runner tarball fetch used only to
 	// compute the fingerprint digest.
 	runnerTarballTimeout = 10 * time.Minute
+	// goldenStagingSuffix names the staging image a build snapshots and verifies
+	// before it replaces the live golden, so a failed rebuild never destroys the
+	// existing golden.
+	goldenStagingSuffix = "-staging"
 )
 
 // tarter is the VM substrate the builder drives; *tart.Tart satisfies it. It is
@@ -79,17 +83,19 @@ func WithBaseStager(s BaseStager) Option {
 
 // Builder builds and self-verifies the golden image.
 type Builder struct {
-	vm           tarter
-	base         BaseStager
-	runnerDigest runnerTarballDigester
+	vm            tarter
+	base          BaseStager
+	runnerDigest  runnerTarballDigester
+	resolveRunner func(ctx context.Context) (string, error)
 }
 
 // New returns a Builder driving the given VM substrate.
 func New(vm tarter, opts ...Option) *Builder {
 	builder := &Builder{
-		vm:           vm,
-		base:         nil,
-		runnerDigest: downloadRunnerTarballDigest,
+		vm:            vm,
+		base:          nil,
+		runnerDigest:  downloadRunnerTarballDigest,
+		resolveRunner: ResolveRunnerVersion,
 	}
 	for _, opt := range opts {
 		opt(builder)
@@ -146,34 +152,60 @@ func NameForImage(image string) string {
 	return strings.TrimRight(builder.String(), "-")
 }
 
-// EnsureGolden builds the derived golden for an image only when it is absent.
+// EnsureGolden builds the derived golden for an image unless the existing golden
+// already carries the fingerprint the current binary and config would bake. It
+// reads the baked fingerprint out of the present golden and rebuilds when it
+// differs or cannot be read, so a golden baked by an older binary is replaced
+// rather than silently kept. A matching golden is a no-op, so the command stays
+// idempotent.
 func (b *Builder) EnsureGolden(ctx context.Context, opts EnsureOptions) (string, error) {
 	if opts.Image == "" {
 		return "", fmt.Errorf("golden: image is required")
 	}
 	goldenName := NameForImage(opts.Image)
+	buildVM := opts.BuildVM
+	if buildVM == "" {
+		buildVM = goldenName + "-build"
+	}
+
 	names, err := b.vm.List(ctx)
 	if err != nil {
 		slog.ErrorContext(ctx, "list VMs failed", "err", err)
 		return "", fmt.Errorf("golden: list VMs: %w", err)
 	}
+
+	// Compute the expected fingerprint only when a golden already exists, so the
+	// idempotency check pays the runner-tarball fetch. The absent-golden path
+	// goes straight to Build, which computes the same fingerprint from the same
+	// inputs, so a fresh build never fetches the runner tarball twice.
+	runnerVersion := opts.RunnerVersion
 	if slices.Contains(names, goldenName) {
-		slog.InfoContext(ctx, "golden present; skipping build", "golden", goldenName, "image", opts.Image)
-		return goldenName, nil
+		expected, resolvedVersion, fpErr := b.expectedFingerprint(ctx, Options{
+			BaseImage:     opts.Image,
+			GoldenName:    goldenName,
+			BuildVM:       buildVM,
+			RunnerVersion: opts.RunnerVersion,
+			BinaryPath:    "",
+		})
+		if fpErr != nil {
+			return "", fpErr
+		}
+		runnerVersion = resolvedVersion
+		baked, bakedErr := b.bakedFingerprint(ctx, goldenName)
+		if bakedErr == nil && baked == expected {
+			slog.InfoContext(ctx, "golden fingerprint current; skipping build", "golden", goldenName, "fingerprint", expected)
+			return goldenName, nil
+		}
+		if bakedErr != nil {
+			slog.InfoContext(ctx, "golden stale; rebuilding", "golden", goldenName, "read_err", bakedErr, "expected", expected)
+		} else {
+			slog.InfoContext(ctx, "golden stale; rebuilding", "golden", goldenName, "baked", baked, "expected", expected)
+		}
+		// The stale golden stays in place until Build snapshots, verifies, and
+		// promotes its replacement, so a failed rebuild leaves the pool a working
+		// golden to clone.
 	}
 
-	runnerVersion := opts.RunnerVersion
-	if runnerVersion == "" {
-		resolved, resolveErr := ResolveRunnerVersion(ctx)
-		if resolveErr != nil {
-			return "", resolveErr
-		}
-		runnerVersion = resolved
-	}
-	buildVM := opts.BuildVM
-	if buildVM == "" {
-		buildVM = goldenName + "-build"
-	}
 	if err := b.Build(ctx, Options{
 		BaseImage:     opts.Image,
 		GoldenName:    goldenName,
@@ -185,6 +217,86 @@ func (b *Builder) EnsureGolden(ctx context.Context, opts EnsureOptions) (string,
 		return "", fmt.Errorf("golden: ensure %s: %w", goldenName, err)
 	}
 	return goldenName, nil
+}
+
+// expectedFingerprint computes the golden fingerprint the current binary and
+// config would bake for opts, resolving the runner version when it is empty and
+// returning the resolved version so the caller can pass it to Build unchanged. It
+// shares the fingerprint assembly with stageProvisionInputs, so the idempotency
+// check and the build path can never compute different fingerprints for the same
+// inputs.
+func (b *Builder) expectedFingerprint(ctx context.Context, opts Options) (fingerprint, runnerVersion string, err error) {
+	_, fingerprint, runnerVersion, _, err = b.fingerprintFor(ctx, opts)
+	return fingerprint, runnerVersion, err
+}
+
+// fingerprintFor resolves the baked-binary path, the runner version, the runner
+// tarball digest, and the baked-binary digest for opts, then folds them plus the
+// guest-supervisor plist payload into the golden fingerprint. It returns each
+// resolved input so both the build path and the check path can reuse the exact
+// same computation.
+func (b *Builder) fingerprintFor(ctx context.Context, opts Options) (binaryPath, fingerprint, runnerVersion, runnerDigest string, err error) {
+	binaryPath = opts.BinaryPath
+	if binaryPath == "" {
+		exe, exeErr := os.Executable()
+		if exeErr != nil {
+			slog.ErrorContext(ctx, "resolve executable for golden fingerprint failed", "err", exeErr)
+			return "", "", "", "", fmt.Errorf("golden: resolve executable: %w", exeErr)
+		}
+		binaryPath = exe
+	}
+	runnerVersion = opts.RunnerVersion
+	if runnerVersion == "" {
+		resolved, resolveErr := b.resolveRunner(ctx)
+		if resolveErr != nil {
+			return "", "", "", "", resolveErr
+		}
+		runnerVersion = resolved
+	}
+	runnerDigest, err = b.runnerDigest(ctx, runnerVersion)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	binaryDigest, err := sha256File(ctx, binaryPath)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	fingerprint = Fingerprint(FingerprintInputs{
+		BaseImageRef:        opts.BaseImage,
+		RunnerVersion:       runnerVersion,
+		RunnerTarballDigest: runnerDigest,
+		BinaryDigest:        binaryDigest,
+		Payloads: []PayloadDigest{
+			{Name: GuestSupervisorPlistLabel, Digest: sha256Bytes(GuestSupervisorPlist())},
+		},
+	})
+	return binaryPath, fingerprint, runnerVersion, runnerDigest, nil
+}
+
+// bakedFingerprint reads the fingerprint baked into an existing golden by cloning
+// and booting a throwaway clone and catting the baked fingerprint file, then
+// tearing the clone down. A clone, boot, read, or empty-file failure returns an
+// error, which the caller treats as stale so the golden is rebuilt.
+func (b *Builder) bakedFingerprint(ctx context.Context, goldenName string) (string, error) {
+	cloneName := goldenName + "-fpcheck"
+	boot, err := b.cloneAndBoot(ctx, goldenName, cloneName, false, nil)
+	if err != nil {
+		return "", fmt.Errorf("golden: read baked fingerprint of %s: %w", goldenName, err)
+	}
+	defer func() {
+		_ = boot.Process.Kill()
+		b.teardown(ctx, cloneName)
+	}()
+	out, err := b.vm.Exec(ctx, cloneName, "cat", FingerprintPath)
+	if err != nil {
+		slog.WarnContext(ctx, "read baked fingerprint failed", "err", err, "golden", goldenName)
+		return "", fmt.Errorf("golden: read baked fingerprint from %s: %w", goldenName, err)
+	}
+	baked := strings.TrimSpace(string(out))
+	if baked == "" {
+		return "", fmt.Errorf("golden: baked fingerprint on %s is empty", goldenName)
+	}
+	return baked, nil
 }
 
 // runnerRelease is the subset of the actions/runner latest-release API response
@@ -225,7 +337,7 @@ func ResolveRunnerVersion(ctx context.Context) (string, error) {
 func (b *Builder) Build(ctx context.Context, opts Options) error {
 	slog.InfoContext(ctx, "building golden", "base", opts.BaseImage, "golden", opts.GoldenName, "runner", opts.RunnerVersion)
 
-	scratchDir, mountBinary, fingerprint, runnerDigest, err := b.stageProvisionInputs(ctx, opts)
+	scratchDir, mountBinary, fingerprint, runnerVersion, runnerDigest, err := b.stageProvisionInputs(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -247,7 +359,7 @@ func (b *Builder) Build(ctx context.Context, opts Options) error {
 		return err
 	}
 
-	if err := b.provision(ctx, opts.BuildVM, opts.RunnerVersion, runnerDigest, mountBinary, fingerprint); err != nil {
+	if err := b.provision(ctx, opts.BuildVM, runnerVersion, runnerDigest, mountBinary, fingerprint); err != nil {
 		_ = boot.Process.Kill()
 		b.teardown(ctx, opts.BuildVM)
 		return err
@@ -260,58 +372,60 @@ func (b *Builder) Build(ctx context.Context, opts Options) error {
 	}
 	_ = boot.Process.Kill()
 
-	if err := b.snapshot(ctx, opts.BuildVM, opts.GoldenName); err != nil {
+	// Snapshot to a staging image and verify it before it replaces the live
+	// golden, so a clone, boot, or verify failure leaves the existing golden
+	// intact instead of destroying it.
+	staging := opts.GoldenName + goldenStagingSuffix
+	if err := b.snapshot(ctx, opts.BuildVM, staging); err != nil {
 		return err
 	}
+	if err := b.verify(ctx, staging, opts.BuildVM+"-verify", fingerprint); err != nil {
+		b.teardown(ctx, staging)
+		return err
+	}
+	return b.promote(ctx, staging, opts.GoldenName)
+}
 
-	return b.verify(ctx, opts.GoldenName, opts.BuildVM+"-verify", fingerprint)
+// promote replaces the live golden with the verified staging image using a fast
+// copy-on-write clone, then drops the staging image. The golden is absent only
+// for the moment between the delete and the clone, which is far safer than
+// deleting it before the replacement is built and proven.
+func (b *Builder) promote(ctx context.Context, staging, golden string) error {
+	if err := b.vm.Delete(ctx, golden); err != nil {
+		slog.DebugContext(ctx, "delete old golden before promote (ignored if absent)", "err", err, "golden", golden)
+	}
+	if err := b.vm.Clone(ctx, staging, golden, false); err != nil {
+		slog.ErrorContext(ctx, "promote staging to golden failed", "err", err, "golden", golden, "staging", staging)
+		return fmt.Errorf("golden: promote %s to %s: %w", staging, golden, err)
+	}
+	if err := b.vm.Delete(ctx, staging); err != nil {
+		slog.WarnContext(ctx, "delete staging after promote failed", "err", err, "staging", staging)
+	}
+	return nil
 }
 
 // stageProvisionInputs prepares a host scratch dir holding the guest binary to
-// mount into the build VM, and computes the golden fingerprint host-side from the
-// base ref, runner version, runner-tarball digest, baked-binary digest, and each
-// baked payload digest. The fingerprint is a pure function of these inputs, so it
-// is unit-testable without a VM.
-func (b *Builder) stageProvisionInputs(ctx context.Context, opts Options) (scratchDir, mountBinary, fingerprint, runnerDigest string, err error) {
-	binaryPath := opts.BinaryPath
-	if binaryPath == "" {
-		exe, exeErr := os.Executable()
-		if exeErr != nil {
-			slog.ErrorContext(ctx, "resolve executable for golden bake failed", "err", exeErr)
-			return "", "", "", "", fmt.Errorf("golden: resolve executable: %w", exeErr)
-		}
-		binaryPath = exe
+// mount into the build VM, and computes the golden fingerprint host-side via
+// fingerprintFor, the same helper the idempotency check uses, so the built
+// image's fingerprint equals the one EnsureGolden expects. The fingerprint is a
+// pure function of its inputs, so it is unit-testable without a VM.
+func (b *Builder) stageProvisionInputs(ctx context.Context, opts Options) (scratchDir, mountBinary, fingerprint, runnerVersion, runnerDigest string, err error) {
+	binaryPath, fingerprint, runnerVersion, runnerDigest, err := b.fingerprintFor(ctx, opts)
+	if err != nil {
+		return "", "", "", "", "", err
 	}
 	scratchDir, err = os.MkdirTemp("", "gha-golden-provision-")
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("golden: create provision scratch dir: %w", err)
+		slog.ErrorContext(ctx, "create provision scratch dir failed", "err", err)
+		return "", "", "", "", "", fmt.Errorf("golden: create provision scratch dir: %w", err)
 	}
 	scratchBinary := filepath.Join(scratchDir, provisionBinaryName)
 	if err := copyFileMode(ctx, binaryPath, scratchBinary, 0o755); err != nil {
 		_ = os.RemoveAll(scratchDir)
-		return "", "", "", "", err
+		return "", "", "", "", "", err
 	}
-	tarballDigest, err := b.runnerDigest(ctx, opts.RunnerVersion)
-	if err != nil {
-		_ = os.RemoveAll(scratchDir)
-		return "", "", "", "", err
-	}
-	binaryDigest, err := sha256File(ctx, scratchBinary)
-	if err != nil {
-		_ = os.RemoveAll(scratchDir)
-		return "", "", "", "", err
-	}
-	fingerprint = Fingerprint(FingerprintInputs{
-		BaseImageRef:        opts.BaseImage,
-		RunnerVersion:       opts.RunnerVersion,
-		RunnerTarballDigest: tarballDigest,
-		BinaryDigest:        binaryDigest,
-		Payloads: []PayloadDigest{
-			{Name: GuestSupervisorPlistLabel, Digest: sha256Bytes(GuestSupervisorPlist())},
-		},
-	})
 	mountBinary = tartSharedMountRoot + "/" + provisionMountName + "/" + provisionBinaryName
-	return scratchDir, mountBinary, fingerprint, tarballDigest, nil
+	return scratchDir, mountBinary, fingerprint, runnerVersion, runnerDigest, nil
 }
 
 // provision lands the all-Go provisioner into the booted build VM and runs it.
@@ -350,6 +464,15 @@ func (b *Builder) provision(ctx context.Context, name, runnerVersion, runnerDige
 			slog.ErrorContext(ctx, "provision step failed", "err", err, "vm", name, "step", argv[0])
 			return fmt.Errorf("golden: provision %s on %s: %w", argv[0], name, err)
 		}
+	}
+	// The provisioner writes the runner, baked binary, supervisor plist, and
+	// fingerprint through the guest page cache. The build stops and clones this VM
+	// almost immediately, before macOS flushes those pages, so the snapshot can
+	// miss them and fail verify with a missing fingerprint. A guest sync forces
+	// the writes to the virtual disk before the snapshot captures it.
+	if _, err := b.vm.Exec(ctx, name, "sync"); err != nil {
+		slog.ErrorContext(ctx, "guest sync after provision failed", "err", err, "vm", name)
+		return fmt.Errorf("golden: sync guest filesystem on %s: %w", name, err)
 	}
 	return nil
 }
