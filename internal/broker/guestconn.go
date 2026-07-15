@@ -8,9 +8,16 @@ import (
 	"strings"
 	"time"
 
+	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/guestclient"
 	"goodkind.io/gha-mac-broker/internal/guestsupervisor"
+	"goodkind.io/gha-mac-broker/internal/guesttransport"
 )
+
+// guestDialSubcommand is the broker binary's subcommand, run inside the guest
+// via `tart exec`, that relays the exec stdio channel to the guest-agent
+// loopback listener.
+const guestDialSubcommand = "guest-dial"
 
 // guestClientAdapter adapts the concrete guestclient.Client to the guestConn
 // interface the binder depends on. It embeds the client so its already-wrapped
@@ -21,8 +28,8 @@ type guestClientAdapter struct {
 	*guestclient.Client
 }
 
-func newGuestClientAdapter(ctx context.Context, address string, token string) guestConn {
-	return guestClientAdapter{Client: guestclient.New(ctx, address, token)}
+func newGuestClientAdapter(ctx context.Context, dial guesttransport.GuestDialer, token string) guestConn {
+	return guestClientAdapter{Client: guestclient.New(ctx, dial, token)}
 }
 
 func (a guestClientAdapter) JobStatus(ctx context.Context, executionID string, fromSequence uint64) (jobStatusStream, error) {
@@ -34,9 +41,10 @@ func (a guestClientAdapter) JobStatus(ctx context.Context, executionID string, f
 	return stream, nil
 }
 
-// resolveGuest resolves and caches a VM's guest-agent client. It resolves the
-// NAT IP, reads the per-boot token over the tart-exec control channel, dials the
-// agent, and confirms Hello answers with a compatible protocol before caching.
+// resolveGuest resolves and caches a VM's guest-agent client. It reads the
+// per-boot token over the tart guest-agent channel, dials the agent over that
+// same channel (no guest NAT IP), and confirms Hello answers with a compatible
+// protocol before caching.
 func (b *Binder) resolveGuest(ctx context.Context, vm *WarmVM) (guestConn, error) {
 	// Hold the per-VM lock across the whole resolution, so concurrent callers for
 	// the same VM dial exactly once: the first resolves and caches, the rest see
@@ -48,22 +56,22 @@ func (b *Binder) resolveGuest(ctx context.Context, vm *WarmVM) (guestConn, error
 		return vm.guestConn, nil
 	}
 
-	ip, err := b.vm.IP(ctx, vm.Name)
-	if err != nil {
-		slog.WarnContext(ctx, "resolve guest ip failed", "err", err, "vm", vm.Name)
-		return nil, fmt.Errorf("broker: resolve guest ip for %s: %w", vm.Name, err)
-	}
-	address := net.JoinHostPort(ip, guestAgentPort)
 	token, err := b.readGuestToken(ctx, vm.Name)
 	if err != nil {
 		return nil, err
 	}
-	client := b.dialGuest(ctx, address, token)
+	// Reach the guest agent over the tart guest-agent channel by running the
+	// guest-dial relay, which bridges the exec stdio to the agent's loopback
+	// listener. This avoids dialing the guest NAT IP, whose bridge route stays
+	// unreachable from the host until well after the guest boots.
+	dial := func(dialCtx context.Context) (net.Conn, error) {
+		return b.vm.ExecConn(dialCtx, vm.Name, golden.BakedBinaryPath, guestDialSubcommand)
+	}
+	client := b.dialGuest(ctx, dial, token)
 	if err := b.waitForGuestHello(ctx, client, vm.Name); err != nil {
 		return nil, err
 	}
 
-	vm.guestAddr = address
 	vm.guestConn = client
 	return vm.guestConn, nil
 }

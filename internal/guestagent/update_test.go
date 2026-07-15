@@ -190,7 +190,7 @@ func TestUpdateAgentRejectsEmptyFrameFlood(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	transport := guesttransport.DialContext(ctx, address, updateTestToken)
+	transport := guesttransport.DialContext(ctx, tcpDialer(address), updateTestToken)
 	service := guestprotoconnect.NewGuestAgentServiceClient(
 		transport.HTTPClient(),
 		"http://"+address,
@@ -439,7 +439,7 @@ func sendUpdate(
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	transport := guesttransport.DialContext(ctx, address, updateTestToken)
+	transport := guesttransport.DialContext(ctx, tcpDialer(address), updateTestToken)
 	service := guestprotoconnect.NewGuestAgentServiceClient(
 		transport.HTTPClient(),
 		"http://"+address,

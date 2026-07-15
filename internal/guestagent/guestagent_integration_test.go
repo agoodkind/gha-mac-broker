@@ -51,7 +51,7 @@ func TestJobStatusReconnectDoesNotCancelExecution(t *testing.T) {
 
 	firstClient := guestclient.New(
 		ctx,
-		listener.Addr().String(),
+		tcpDialer(listener.Addr().String()),
 		testBootToken,
 	)
 	hello, err := firstClient.Hello(ctx)
@@ -100,7 +100,7 @@ func TestJobStatusReconnectDoesNotCancelExecution(t *testing.T) {
 
 	secondClient := guestclient.New(
 		ctx,
-		listener.Addr().String(),
+		tcpDialer(listener.Addr().String()),
 		testBootToken,
 	)
 	secondStream, err := secondClient.JobStatus(ctx, executionID, cursor)
@@ -278,4 +278,13 @@ func joinedProtoLogs(events []*guestproto.JobStatusEvent) string {
 		}
 	}
 	return builder.String()
+}
+
+// tcpDialer adapts a TCP address to a guesttransport.GuestDialer so the guest
+// agent tests dial a real listener. Production dials over tart exec instead.
+func tcpDialer(address string) guesttransport.GuestDialer {
+	return func(ctx context.Context) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "tcp", address)
+	}
 }

@@ -16,7 +16,17 @@ import (
 	"goodkind.io/gha-mac-broker/internal/guestclient"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
 	"goodkind.io/gha-mac-broker/internal/guestsupervisor"
+	"goodkind.io/gha-mac-broker/internal/guesttransport"
 )
+
+// tcpDialer adapts a TCP address to a guesttransport.GuestDialer so the guest
+// worker tests dial a real listener. Production dials over tart exec instead.
+func tcpDialer(address string) guesttransport.GuestDialer {
+	return func(ctx context.Context) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "tcp", address)
+	}
+}
 
 // startHarnessSlots brings up a supervisor and its first re-exec'd worker with a
 // given boot slot count, so the ConfigureSlots tests can start from one or two
@@ -74,7 +84,7 @@ func waitHelloSlots(t *testing.T, addr string, want uint32) {
 	defer cancel()
 	deadline := time.Now().Add(harnessTimeout)
 	for {
-		client := guestclient.New(ctx, addr, harnessToken)
+		client := guestclient.New(ctx, tcpDialer(addr), harnessToken)
 		hello, err := client.Hello(ctx)
 		if err == nil && slotsCover(hello.GetSlots(), want) {
 			return
@@ -91,7 +101,7 @@ func waitHelloSlots(t *testing.T, addr string, want uint32) {
 func helloAdvertises(addr string, count uint32) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	client := guestclient.New(ctx, addr, harnessToken)
+	client := guestclient.New(ctx, tcpDialer(addr), harnessToken)
 	hello, err := client.Hello(ctx)
 	if err != nil {
 		return false
@@ -123,7 +133,7 @@ func TestConfigureSlotsGrowsAndHelloAdvertisesN(t *testing.T) {
 	defer cancel()
 	h := startHarnessSlots(t, 1)
 
-	client := guestclient.New(ctx, h.addr, harnessToken)
+	client := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 	response, err := client.ConfigureSlots(ctx, 2)
 	if err != nil {
 		t.Fatalf("ConfigureSlots(2): %v", err)
@@ -143,7 +153,7 @@ func TestConfigureSlotsNoOpWhenEqual(t *testing.T) {
 	h := startHarnessSlots(t, 1)
 	spawnsBefore := h.spawnCount.Load()
 
-	client := guestclient.New(ctx, h.addr, harnessToken)
+	client := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 	response, err := client.ConfigureSlots(ctx, 1)
 	if err != nil {
 		t.Fatalf("ConfigureSlots(1): %v", err)
@@ -171,7 +181,7 @@ func TestConfigureSlotsGrowsWhileJobRunning(t *testing.T) {
 	gate := filepath.Join(t.TempDir(), "gate")
 	script := fmt.Sprintf("echo A; while [ ! -f '%s' ]; do sleep 0.05; done; echo B", gate)
 
-	client := guestclient.New(ctx, h.addr, harnessToken)
+	client := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 	runResponse, err := client.RunJob(ctx, &guestproto.RunJobRequest{
 		ExecutionId: "grow-job",
 		Slot:        0,
@@ -205,7 +215,7 @@ func TestConfigureSlotsGrowsWhileJobRunning(t *testing.T) {
 		t.Fatalf("write gate: %v", err)
 	}
 
-	resumeClient := guestclient.New(ctx, h.addr, harnessToken)
+	resumeClient := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 	resumeStream, err := resumeClient.JobStatus(ctx, "grow-job", cursor)
 	if err != nil {
 		t.Fatalf("resume job status: %v", err)
@@ -237,7 +247,7 @@ func TestConfigureSlotsRedrivesAfterFailedReload(t *testing.T) {
 	spawnsBefore := h.spawnCount.Load()
 	h.failNext.Store(true)
 
-	firstClient := guestclient.New(ctx, h.addr, harnessToken)
+	firstClient := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 	if _, err := firstClient.ConfigureSlots(ctx, 2); err != nil {
 		t.Fatalf("first ConfigureSlots(2): %v", err)
 	}
@@ -259,7 +269,7 @@ func TestConfigureSlotsRedrivesAfterFailedReload(t *testing.T) {
 	healed := false
 	for time.Now().Before(deadline) {
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, 3*time.Second)
-		retryClient := guestclient.New(attemptCtx, h.addr, harnessToken)
+		retryClient := guestclient.New(attemptCtx, tcpDialer(h.addr), harnessToken)
 		_, err := retryClient.ConfigureSlots(attemptCtx, 2)
 		attemptCancel()
 		if err == nil && helloAdvertises(h.addr, 2) {
@@ -290,7 +300,7 @@ func TestConfigureSlotsShrinkBelowBusyRejected(t *testing.T) {
 	gate := filepath.Join(t.TempDir(), "gate")
 	script := fmt.Sprintf("echo A; while [ ! -f '%s' ]; do sleep 0.05; done; echo B", gate)
 
-	client := guestclient.New(ctx, h.addr, harnessToken)
+	client := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 	runResponse, err := client.RunJob(ctx, &guestproto.RunJobRequest{
 		ExecutionId: "busy-slot-1",
 		Slot:        1,

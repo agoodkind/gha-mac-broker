@@ -60,7 +60,7 @@ func TestUnaryAuthentication(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			clientTransport := DialContext(
 				context.Background(),
-				listener.Addr().String(),
+				tcpDialer(listener.Addr().String()),
 				testCase.token,
 			)
 			clientOptions := make([]connect.ClientOption, 0, 1)
@@ -130,7 +130,7 @@ func TestServerStreamAuthenticationAndMessages(t *testing.T) {
 		waitForServer(t, serverDone)
 	})
 
-	clientTransport := DialContext(context.Background(), listener.Addr().String(), testToken)
+	clientTransport := DialContext(context.Background(), tcpDialer(listener.Addr().String()), testToken)
 	client := connect.NewClient[wrapperspb.StringValue, wrapperspb.StringValue](
 		clientTransport.HTTPClient(),
 		fmt.Sprintf("http://%s%s", listener.Addr(), testStreamProcedure),
@@ -227,7 +227,7 @@ func newUnaryClient(
 	token string,
 ) *connect.Client[wrapperspb.StringValue, wrapperspb.StringValue] {
 	t.Helper()
-	clientTransport := DialContext(ctx, address, token)
+	clientTransport := DialContext(ctx, tcpDialer(address), token)
 	return connect.NewClient[wrapperspb.StringValue, wrapperspb.StringValue](
 		clientTransport.HTTPClient(),
 		fmt.Sprintf("http://%s%s", address, testUnaryProcedure),
@@ -272,5 +272,14 @@ func waitForServer(t *testing.T, done <-chan error) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve() did not stop within 5 seconds")
+	}
+}
+
+// tcpDialer adapts a TCP address to a GuestDialer so the transport tests exercise
+// DialContext against a real listener. Production dials over tart exec instead.
+func tcpDialer(address string) GuestDialer {
+	return func(ctx context.Context) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "tcp", address)
 	}
 }
