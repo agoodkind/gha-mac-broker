@@ -41,6 +41,15 @@ func TestRenderLaunchd(t *testing.T) {
 			t.Errorf("launchd output missing %q\n%s", want, rendered)
 		}
 	}
+	// The installed unit must run the host supervisor role, which binds the
+	// listener and supervises the swappable worker, not the single-process serve
+	// role. serve stays a manual fallback and must not be the managed service.
+	if !strings.Contains(rendered, "<string>supervisor</string>") {
+		t.Errorf("launchd output must run the supervisor role\n%s", rendered)
+	}
+	if strings.Contains(rendered, "<string>serve</string>") {
+		t.Errorf("launchd output must not run the serve role\n%s", rendered)
+	}
 	assertNoMarkers(t, rendered)
 }
 
