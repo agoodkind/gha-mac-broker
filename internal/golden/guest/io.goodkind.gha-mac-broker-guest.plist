@@ -5,18 +5,31 @@
 <dict>
   <key>Label</key>
   <string>io.goodkind.gha-mac-broker-guest</string>
+  <!-- Run as the runner user (admin), not root. The provisioner installs the
+       actions runner under this user's home (build.go resolves it via printenv
+       HOME, which runs as admin), and the runner refuses to run as root, so the
+       guest agent must run as admin with HOME set. A root LaunchDaemon leaves
+       HOME empty and every RunJob fails with "base home is empty". -->
+  <key>UserName</key>
+  <string>admin</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/gha-mac-broker</string>
     <string>guest-supervisor</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/admin</string>
+  </dict>
   <key>KeepAlive</key>
   <true/>
   <key>RunAtLoad</key>
   <true/>
+  <!-- /var/log is root-only; admin writes the log to a world-writable path. -->
   <key>StandardOutPath</key>
-  <string>/var/log/gha-mac-broker-guest.log</string>
+  <string>/tmp/gha-mac-broker-guest.log</string>
   <key>StandardErrorPath</key>
-  <string>/var/log/gha-mac-broker-guest.log</string>
+  <string>/tmp/gha-mac-broker-guest.log</string>
 </dict>
 </plist>
