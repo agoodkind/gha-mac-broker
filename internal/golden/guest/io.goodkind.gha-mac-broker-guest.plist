@@ -17,10 +17,19 @@
     <string>/usr/local/bin/gha-mac-broker</string>
     <string>guest-supervisor</string>
   </array>
+  <!-- The runner inherits this process's environment (guestexec mergedEnvironment
+       merges os.Environ() with per-slot overrides), and a LaunchDaemon starts with
+       only the minimal launchd PATH (/usr/bin:/bin:/usr/sbin:/sbin). That finds
+       system swift/xcodebuild/git but NOT /opt/homebrew/bin, so a job that runs
+       brew (e.g. installing swift-format/swiftlint) fails with exit 127. Set the
+       runner user's login-shell PATH so brew-installed and rbenv-shimmed tools
+       resolve the same way they do in a developer login session. -->
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
     <string>/Users/admin</string>
+    <key>PATH</key>
+    <string>/Users/admin/.rbenv/shims:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>KeepAlive</key>
   <true/>
