@@ -20,6 +20,7 @@
 //	guest-supervisor   run the durable guest-side supervisor of runner processes
 //	guest-worker       run one swappable guest-worker generation (supervisor spawns it)
 //	golden-provision   provision a golden build VM from inside it (host-invoked)
+//	guest-dial         relay the tart-exec stdio channel to the guest-agent loopback listener (host-invoked)
 package main
 
 import (
@@ -76,6 +77,7 @@ const (
 	commandGuestSuper  commandName = "guest-supervisor"
 	commandGuestWorker commandName = "guest-worker"
 	commandGoldenProv  commandName = "golden-provision"
+	commandGuestDial   commandName = "guest-dial"
 
 	brokerBinaryName = "gha-mac-broker"
 )
@@ -150,6 +152,8 @@ func main() {
 		err = runGuestWorker(ctx, args)
 	case commandGoldenProv:
 		err = runGoldenProvision(ctx, args)
+	case commandGuestDial:
+		err = runGuestDial(ctx, args)
 	default:
 		usage()
 		os.Exit(2)
@@ -161,7 +165,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|supervisor|status|build-golden|install|uninstall|update|deploy|guest-agent|guest-supervisor|guest-worker|golden-provision> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|supervisor|status|build-golden|install|uninstall|update|deploy|guest-agent|guest-supervisor|guest-worker|golden-provision|guest-dial> [flags]")
 }
 
 func writeUserLine(writer io.Writer, line string) {

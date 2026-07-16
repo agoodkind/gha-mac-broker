@@ -2,12 +2,12 @@
 // The Binder can clone, boot, and ready a VM (Warm), run a single ephemeral
 // GitHub Actions job on it through the in-VM guest agent (RunJob), and tear it
 // down (Teardown). Job execution goes over the guest agent's authenticated
-// HTTP/2 channel, so a broker restart no longer kills a running job: the guest
-// keeps the runner alive and the host re-adopts it. The one-shot tart-exec
-// control channel still handles VM readiness, `tart ip`, and reading the
-// per-boot guest token. BindOnce composes the steps into one synchronous call
-// for the bind CLI. The pool drives Warm and Teardown directly; the webhook
-// server drives RunJob.
+// HTTP/2 channel, tunneled through the tart guest-agent exec channel so it needs
+// no guest IP, and a broker restart no longer kills a running job: the guest
+// keeps the runner alive and the host re-adopts it. The tart-exec control
+// channel also handles VM readiness and reading the per-boot guest token.
+// BindOnce composes the steps into one synchronous call for the bind CLI. The
+// pool drives Warm and Teardown directly; the webhook server drives RunJob.
 package broker
 
 import (
@@ -28,6 +28,7 @@ import (
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
+	"goodkind.io/gha-mac-broker/internal/guesttransport"
 	"goodkind.io/gha-mac-broker/internal/tart"
 )
 
@@ -63,9 +64,6 @@ var slotReconfigureTimeout = 30 * time.Second
 // replacement completes.
 var slotReconfigureInterval = 500 * time.Millisecond
 
-// guestAgentPort is the fixed TCP port the guest agent listens on inside the VM.
-const guestAgentPort = "53931"
-
 // hostProtocolMajor is the guest-agent protocol version this host speaks. A
 // mismatch means the VM runs an incompatible agent and is skipped.
 const hostProtocolMajor = uint32(1)
@@ -100,9 +98,8 @@ type WarmVM struct {
 	// Image is the approved Cirrus tag this VM was cloned for.
 	Image string
 	boot  *exec.Cmd
-	// guestMu guards the cached guest endpoint fields.
+	// guestMu guards the cached guest endpoint.
 	guestMu   sync.Mutex
-	guestAddr string
 	guestConn guestConn
 }
 
@@ -136,9 +133,9 @@ type Binder struct {
 	cfg   *config.Config
 	gh    *ghapp.Client
 	vm    *tart.Tart
-	// dialGuest builds a guest-agent client for an address and token. It is a
-	// field so tests can stub the transport.
-	dialGuest func(ctx context.Context, address string, token string) guestConn
+	// dialGuest builds a guest-agent client from a connection dialer and token.
+	// It is a field so tests can stub the transport.
+	dialGuest func(ctx context.Context, dial guesttransport.GuestDialer, token string) guestConn
 	// guestFor resolves and caches the guest client for a VM. It is the single
 	// seam tests override to return a stub without a real VM.
 	guestFor func(ctx context.Context, vm *WarmVM) (guestConn, error)
@@ -218,7 +215,7 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 		return nil, err
 	}
 
-	vm := &WarmVM{Name: vmName, Image: image, boot: bootCmd, guestMu: sync.Mutex{}, guestAddr: "", guestConn: nil}
+	vm := &WarmVM{Name: vmName, Image: image, boot: bootCmd, guestMu: sync.Mutex{}, guestConn: nil}
 	// Confirm the guest agent is up and cache its endpoint before serving. This
 	// replaces the old post-boot runner-slot clone as the readiness gate.
 	client, err := b.guestFor(ctx, vm)
@@ -712,7 +709,7 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 	idleCandidates := make([]adoptionCandidate, 0, len(names))
 	normalizedSlotCount := normalizeSlotCount(slotCount)
 	for _, name := range names {
-		vm := &WarmVM{Name: name, Image: image, boot: nil, guestMu: sync.Mutex{}, guestAddr: "", guestConn: nil}
+		vm := &WarmVM{Name: name, Image: image, boot: nil, guestMu: sync.Mutex{}, guestConn: nil}
 		client, err := b.guestFor(ctx, vm)
 		if err != nil {
 			slog.WarnContext(ctx, "skip running vm adoption after guest resolve failure", "err", err, "vm", name)

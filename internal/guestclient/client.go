@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	"connectrpc.com/connect"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
@@ -14,17 +13,24 @@ import (
 	"goodkind.io/gha-mac-broker/internal/guesttransport"
 )
 
+// guestBaseURL is a fixed pseudo-authority for the ConnectRPC client. The
+// transport dials over `tart exec` through the dialer's DialContext, so the host
+// portion of this URL never routes a connection; it only satisfies ConnectRPC's
+// URL construction.
+const guestBaseURL = "http://guest"
+
 // Client is a token-authenticated host-side guest-agent client.
 type Client struct {
 	service guestprotoconnect.GuestAgentServiceClient
 }
 
-// New creates a guest-agent client for an h2c TCP address.
-func New(ctx context.Context, address string, token string) *Client {
-	transport := guesttransport.DialContext(ctx, address, token)
+// New creates a guest-agent client whose transport connections come from dial,
+// which reaches the guest agent over the tart guest-agent channel.
+func New(ctx context.Context, dial guesttransport.GuestDialer, token string) *Client {
+	transport := guesttransport.DialContext(ctx, dial, token)
 	service := guestprotoconnect.NewGuestAgentServiceClient(
 		transport.HTTPClient(),
-		baseURL(address),
+		guestBaseURL,
 		connect.WithInterceptors(transport.Interceptor()),
 	)
 	return &Client{service: service}
@@ -130,11 +136,4 @@ func (client *Client) CancelJob(ctx context.Context, executionID string) error {
 		return fmt.Errorf("guestclient cancel job: %w", err)
 	}
 	return nil
-}
-
-func baseURL(address string) string {
-	if strings.HasPrefix(address, "http://") || strings.HasPrefix(address, "https://") {
-		return strings.TrimRight(address, "/")
-	}
-	return "http://" + address
 }

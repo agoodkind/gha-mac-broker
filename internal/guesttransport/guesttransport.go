@@ -32,9 +32,22 @@ type Client struct {
 	interceptor connect.Interceptor
 }
 
-// DialContext configures a ConnectRPC transport for unencrypted HTTP/2.
-func DialContext(_ context.Context, _ string, token string) *Client {
-	transport := &http.Transport{}
+// GuestDialer establishes one transport connection to the guest agent. The
+// broker supplies a dialer that runs the guest-dial relay over `tart exec`, so
+// the HTTP/2 client reaches the guest agent over the guest-agent channel with no
+// dependence on the guest's NAT IP or the host bridge route.
+type GuestDialer func(ctx context.Context) (net.Conn, error)
+
+// DialContext configures a ConnectRPC transport for unencrypted HTTP/2 whose
+// connections come from dial instead of a TCP address. The transport reuses one
+// connection across many requests, so dial is invoked only when the HTTP/2
+// client needs a fresh connection.
+func DialContext(_ context.Context, dial GuestDialer, token string) *Client {
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _ string, _ string) (net.Conn, error) {
+			return dial(ctx)
+		},
+	}
 	transport.Protocols = new(http.Protocols)
 	transport.Protocols.SetUnencryptedHTTP2(true)
 	return &Client{

@@ -137,7 +137,7 @@ func (h *harness) waitServing(t *testing.T) int {
 		}
 		pid := h.supervisor.CurrentWorkerPID()
 		if pid > 0 {
-			client := guestclient.New(ctx, h.addr, harnessToken)
+			client := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 			if _, err := client.Hello(ctx); err == nil {
 				return pid
 			}
@@ -201,7 +201,7 @@ func TestReloadKeepsRunnerAliveAndResumesStream(t *testing.T) {
 	gate := filepath.Join(t.TempDir(), "gate")
 	script := fmt.Sprintf("echo A; while [ ! -f '%s' ]; do sleep 0.05; done; echo B", gate)
 
-	client := guestclient.New(ctx, h.addr, harnessToken)
+	client := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 	runResponse, err := client.RunJob(ctx, &guestproto.RunJobRequest{
 		ExecutionId: "job-1",
 		Slot:        0,
@@ -232,7 +232,7 @@ func TestReloadKeepsRunnerAliveAndResumesStream(t *testing.T) {
 		t.Fatalf("write gate: %v", err)
 	}
 
-	resumeClient := guestclient.New(ctx, h.addr, harnessToken)
+	resumeClient := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 	resumeStream, err := resumeClient.JobStatus(ctx, "job-1", cursor)
 	if err != nil {
 		t.Fatalf("resume job status: %v", err)
@@ -258,7 +258,7 @@ func TestZeroJobReload(t *testing.T) {
 
 	h.reloadAndWait(t, h.supervisor.CurrentWorkerPID())
 
-	client := guestclient.New(ctx, h.addr, harnessToken)
+	client := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 	hello, err := client.Hello(ctx)
 	if err != nil {
 		t.Fatalf("hello after zero-job reload: %v", err)
@@ -304,7 +304,7 @@ func TestReloadRollsBackWhenReplacementFails(t *testing.T) {
 	gate := filepath.Join(t.TempDir(), "gate")
 	script := fmt.Sprintf("echo A; while [ ! -f '%s' ]; do sleep 0.05; done; echo B", gate)
 
-	client := guestclient.New(ctx, h.addr, harnessToken)
+	client := guestclient.New(ctx, tcpDialer(h.addr), harnessToken)
 	runResponse, err := client.RunJob(ctx, &guestproto.RunJobRequest{
 		ExecutionId: "job-rollback",
 		Slot:        0,

@@ -49,11 +49,7 @@ func runGuestSupervisor(ctx context.Context, args []string) error {
 	}
 	resolvedListenAddr := *listenAddr
 	if resolvedListenAddr == "" {
-		resolved, err := defaultGuestAgentListenAddr()
-		if err != nil {
-			return err
-		}
-		resolvedListenAddr = resolved
+		resolvedListenAddr = defaultGuestAgentListenAddr()
 	}
 
 	listenConfig := net.ListenConfig{}
