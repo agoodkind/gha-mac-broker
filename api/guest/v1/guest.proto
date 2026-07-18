@@ -12,7 +12,6 @@ service GuestAgentService {
   rpc Drain(DrainRequest) returns (DrainResponse);
   rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   rpc UpdateAgent(stream UpdateAgentRequest) returns (UpdateAgentResponse);
-  rpc ConfigureSlots(ConfigureSlotsRequest) returns (ConfigureSlotsResponse);
 }
 
 message HelloRequest {}
@@ -150,19 +149,4 @@ message UpdateAgentHeader {
 // UpdateAgentResponse reports the version the guest accepted and placed.
 message UpdateAgentResponse {
   string accepted_version = 1;
-}
-
-// ConfigureSlotsRequest asks the guest to serve slot_count execution slots. The
-// host sends its configured jobs_per_vm so a guest that booted with the default
-// single slot grows to the pool's slot count before it serves.
-message ConfigureSlotsRequest {
-  uint32 slot_count = 1;
-}
-
-// ConfigureSlotsResponse echoes the slot count the guest applied and the slot
-// inventory it now exposes, so the host can confirm the requested slots are
-// present.
-message ConfigureSlotsResponse {
-  uint32 slot_count = 1;
-  repeated SlotInfo slots = 2;
 }

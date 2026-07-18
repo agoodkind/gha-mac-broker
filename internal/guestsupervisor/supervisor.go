@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -98,20 +97,6 @@ type Supervisor struct {
 	log           *slog.Logger
 	controlSocket *net.UnixListener
 
-	// desiredSlotCount is the target execution slot count each new worker
-	// generation is spawned with. It starts from Options.SlotCount and a set_slots
-	// control op updates it, so a retry after a failed reload still spawns the
-	// target count. It is read on the worker-spawn path (assembleEnv) and written
-	// on the control path without the supervisor lock.
-	desiredSlotCount atomic.Uint32
-	// servingSlotCount is the slot count the live worker generation actually
-	// serves. It is committed only when a worker generation attaches (becomes
-	// current), so a failed-and-rolled-back reload leaves it at the old value
-	// rather than durably reporting a count the live worker does not serve. The
-	// set_slots no-op check compares against this, so a retry after a failed reload
-	// re-drives the reload instead of short-circuiting.
-	servingSlotCount atomic.Uint32
-
 	mu                sync.Mutex
 	state             State
 	generationCounter uint64
@@ -138,8 +123,6 @@ func New(opts Options) *Supervisor {
 		opts:              opts,
 		log:               log,
 		controlSocket:     nil,
-		desiredSlotCount:  atomic.Uint32{},
-		servingSlotCount:  atomic.Uint32{},
 		mu:                sync.Mutex{},
 		state:             StateBooting,
 		generationCounter: 0,
@@ -154,8 +137,6 @@ func New(opts Options) *Supervisor {
 		firstReady:        make(chan struct{}),
 		firstOnce:         sync.Once{},
 	}
-	supervisor.desiredSlotCount.Store(opts.SlotCount)
-	supervisor.servingSlotCount.Store(opts.SlotCount)
 	return supervisor
 }
 
@@ -500,7 +481,7 @@ func (s *Supervisor) assembleEnv(
 		EnvListenerFD:        strconv.Itoa(listenerFD),
 		EnvReadyFD:           strconv.Itoa(readyFD),
 		EnvGeneration:        strconv.FormatUint(generation, 10),
-		EnvSlots:             strconv.FormatUint(uint64(s.desiredSlotCount.Load()), 10),
+		EnvSlots:             strconv.FormatUint(uint64(s.opts.SlotCount), 10),
 		EnvToken:             s.opts.Token,
 		EnvGoldenFingerprint: s.opts.GoldenFingerprint,
 		EnvPipeFDs:           pipeJSON,
@@ -566,9 +547,6 @@ func (s *Supervisor) handleControl(ctx context.Context, conn *net.UnixConn) {
 		s.handleAckExit(conn, request)
 	case opReplaceWorker:
 		s.handleReplaceWorker(conn, request, files)
-	case opSetSlots:
-		closeFiles(files)
-		s.handleSetSlots(conn, request)
 	default:
 		closeFiles(files)
 		s.replyError(conn, fmt.Errorf("unsupported control op %q", request.Op))
@@ -598,13 +576,6 @@ func (s *Supervisor) handleAttach(conn *net.UnixConn, request controlRequest) {
 		s.currentGeneration = request.Generation
 		s.pendingGeneration = 0
 		s.state = StateSteady
-		// Commit the serving count only now that a generation is current and
-		// serving. A failed reload never reaches this promotion, so servingSlotCount
-		// stays at the old value and the set_slots no-op check re-drives a retry. The
-		// promoting worker was spawned from the desired count; a single host with a
-		// constant jobs_per_vm view is the only set_slots writer, so no newer desired
-		// was stored between this worker's spawn and its attach.
-		s.servingSlotCount.Store(s.desiredSlotCount.Load())
 	default:
 		s.mu.Unlock()
 		s.replyError(conn, fmt.Errorf("attach from stale generation %d (current %d, pending %d)",
