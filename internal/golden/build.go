@@ -2,7 +2,7 @@
 // clones a Cirrus base image, boots it, and runs an all-Go golden-provision
 // subcommand over the tart-exec vsock channel (no SSH, no IP): the provisioner
 // installs the GitHub Actions runner (unconfigured), bakes the guest broker
-// binary and the guest-supervisor LaunchDaemon, and persists a golden
+// binary and the guest-agent LaunchDaemon, and persists a golden
 // fingerprint. The builder then host-side stops the VM, snapshots the golden,
 // and verifies a fresh clone so a broken image can never ship silently.
 package golden
@@ -232,7 +232,7 @@ func (b *Builder) expectedFingerprint(ctx context.Context, opts Options) (finger
 
 // fingerprintFor resolves the baked-binary path, the runner version, the runner
 // tarball digest, and the baked-binary digest for opts, then folds them plus the
-// guest-supervisor plist payload into the golden fingerprint. It returns each
+// guest-agent plist payload into the golden fingerprint. It returns each
 // resolved input so both the build path and the check path can reuse the exact
 // same computation.
 func (b *Builder) fingerprintFor(ctx context.Context, opts Options) (binaryPath, fingerprint, runnerVersion, runnerDigest string, err error) {
@@ -267,7 +267,7 @@ func (b *Builder) fingerprintFor(ctx context.Context, opts Options) (binaryPath,
 		RunnerTarballDigest: runnerDigest,
 		BinaryDigest:        binaryDigest,
 		Payloads: []PayloadDigest{
-			{Name: GuestSupervisorPlistLabel, Digest: sha256Bytes(GuestSupervisorPlist())},
+			{Name: GuestAgentPlistLabel, Digest: sha256Bytes(GuestAgentPlist())},
 		},
 	})
 	return binaryPath, fingerprint, runnerVersion, runnerDigest, nil
@@ -549,7 +549,7 @@ func (b *Builder) stopBuildVM(ctx context.Context, name string) error {
 }
 
 // verify clones the freshly built golden, boots it, and confirms the runner, the
-// guest-supervisor launchd unit, and the baked fingerprint are present and the
+// guest-agent launchd unit, and the baked fingerprint are present and the
 // fingerprint matches the computed value, failing loudly otherwise. It also
 // asserts the retired watchdog script was not baked. The verify VM is always torn
 // down.
@@ -592,13 +592,13 @@ func (b *Builder) verify(ctx context.Context, golden, verifyVM, fingerprint stri
 		return fmt.Errorf("golden: verify %s: baked fingerprint %q does not match computed %q", golden, bakedFingerprint, fingerprint)
 	}
 
-	if _, err := b.vm.Exec(ctx, verifyVM, "test", "-f", GuestSupervisorPlistPath); err != nil {
-		slog.ErrorContext(ctx, "verify failed: supervisor plist missing", "err", err, "golden", golden)
-		return fmt.Errorf("golden: verify %s: supervisor plist missing: %w", golden, err)
+	if _, err := b.vm.Exec(ctx, verifyVM, "test", "-f", GuestAgentPlistPath); err != nil {
+		slog.ErrorContext(ctx, "verify failed: guest agent plist missing", "err", err, "golden", golden)
+		return fmt.Errorf("golden: verify %s: guest agent plist missing: %w", golden, err)
 	}
-	if _, err := b.vm.Exec(ctx, verifyVM, "sudo", "launchctl", "print", "system/"+GuestSupervisorPlistLabel); err != nil {
-		slog.ErrorContext(ctx, "verify failed: supervisor unit not loaded", "err", err, "golden", golden)
-		return fmt.Errorf("golden: verify %s: guest-supervisor unit not loaded: %w", golden, err)
+	if _, err := b.vm.Exec(ctx, verifyVM, "sudo", "launchctl", "print", "system/"+GuestAgentPlistLabel); err != nil {
+		slog.ErrorContext(ctx, "verify failed: guest agent unit not loaded", "err", err, "golden", golden)
+		return fmt.Errorf("golden: verify %s: guest-agent unit not loaded: %w", golden, err)
 	}
 	if _, err := b.vm.Exec(ctx, verifyVM, "test", "!", "-e", LegacyWatchdogScriptPath); err != nil {
 		slog.ErrorContext(ctx, "verify failed: watchdog shell script was baked", "err", err, "golden", golden)

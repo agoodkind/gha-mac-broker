@@ -68,6 +68,16 @@ type JobMeta struct {
 	RunnerName string
 }
 
+// ExitReport is one waitpid result the supervisor goroutine delivers to the
+// registry. PID identifies the reaped child; ExitCode and Message describe how
+// it ended. Registry.ReportExit carries it to the running execution that owns
+// the pid so the execution completes with a terminal result.
+type ExitReport struct {
+	PID      int
+	ExitCode int
+	Message  string
+}
+
 // Options configures a Registry.
 type Options struct {
 	Retention         time.Duration

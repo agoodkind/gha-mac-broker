@@ -20,8 +20,9 @@ const (
 	// the fallback when no supervisor is present to reload the worker in place;
 	// adoption still reattaches jobs after the restart.
 	ActionServiceRestart
-	// ActionGuestReload reloads the guest agent in place per VM via UpdateAgent and
-	// the guest supervisor, so no VM recycles and running jobs survive.
+	// ActionGuestReload marks a guest fingerprint change that keeps a compatible
+	// protocol. The deploy command reports it and holds it for the operator rather
+	// than touching the pool.
 	ActionGuestReload
 	// ActionGoldenRebuildRecycle rebuilds the golden image and rolls the pool one
 	// VM at a time. It is the only action that destroys VMs.

@@ -195,8 +195,8 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read baked plist: %v", err)
 	}
-	if !bytes.Equal(plist, golden.GuestSupervisorPlist()) {
-		t.Fatal("baked plist does not match embedded supervisor plist")
+	if !bytes.Equal(plist, golden.GuestAgentPlist()) {
+		t.Fatal("baked plist does not match embedded guest agent plist")
 	}
 
 	fingerprint, err := os.ReadFile(paths.fingerprintDest)
