@@ -31,10 +31,9 @@ var (
 	ErrExecutionNotFound = errors.New("guestexec: execution not found")
 )
 
-// deadlineReader is satisfied by pipe read ends (*os.File) whose blocked Read a
-// past deadline can interrupt without consuming bytes. Freeze uses it to stop a
-// capture goroutine at a read boundary so the next worker generation resumes
-// from the same offset.
+// deadlineReader is satisfied by pipe read ends (*os.File) whose read deadline
+// can be set. captureOutput clears any deadline on entry so a reader reads from
+// its current offset rather than tripping a stale deadline.
 type deadlineReader interface {
 	SetReadDeadline(time.Time) error
 }
@@ -81,17 +80,16 @@ type execution struct {
 	// duplicate report never blocks and never drives a second completion.
 	exitReport chan ExitReport
 	reapOnce   sync.Once
-	// stopped is closed only by Freeze. It releases the capture, heartbeat, and
-	// supervisor goroutines at a boundary so the next worker generation can take
-	// over the execution without those goroutines racing it.
+	// stopped, when closed, releases the capture, heartbeat, and supervisor
+	// goroutines at a read boundary without completing the execution. No live path
+	// closes it now that the worker snapshot handoff is gone, so it stays open for
+	// the execution's life.
 	stopped      chan struct{}
 	readers      *sync.WaitGroup
 	stdoutReader io.ReadCloser
 	stderrReader io.ReadCloser
-	// supervised is closed when the supervisor goroutine returns, whether it
-	// reaped the execution to completion or stopped for a freeze. Freeze awaits it
-	// so a snapshot is never taken while a reap is mid-flight, which would capture
-	// an unrestorable exitReported-but-still-running state.
+	// supervised is closed when the supervisor goroutine returns after reaping the
+	// execution to completion.
 	supervised chan struct{}
 }
 
@@ -124,11 +122,10 @@ func New(options Options) *Registry {
 	return registry
 }
 
-// Start launches a fresh execution or reports the idempotent outcome. It is a
-// convenience for the in-package guest-agent path: it forks the process with
-// Launch, hands the read ends to Register, and runs a supervisor goroutine that
-// waits the child and reports its exit. In PR3 the guest-supervisor process owns
-// the fork and waitpid and calls Register and ReportExit directly.
+// Start launches a fresh execution or reports the idempotent outcome. It is the
+// guest-agent RunJob path: it forks the process with Launch, hands the read ends
+// to Register, and runs a supervisor goroutine that waits the child and reports
+// its exit.
 func (r *Registry) Start(spec ExecSpec) (Outcome, error) {
 	if spec.ExecutionID == "" {
 		return OutcomeUnspecified, fmt.Errorf("guestexec: execution ID is required")
@@ -299,8 +296,7 @@ func (r *Registry) Register(
 // ReportExit delivers a waitpid result to the running execution that owns pid,
 // which drains its output to EOF and emits a single terminal result. It is safe
 // for an unknown, already-reaped, or expired pid: the call is a no-op and never
-// panics, so a duplicate report or a reload-time re-delivery cannot double-emit
-// a terminal.
+// panics, so a duplicate report cannot double-emit a terminal.
 func (r *Registry) ReportExit(pid int, exitCode int, message string) {
 	r.mu.Lock()
 	execState := r.executionByPIDLocked(pid)
@@ -459,10 +455,9 @@ func (r *Registry) executionByPIDLocked(pid int) *execution {
 }
 
 // superviseExecution awaits the caller's exit report, then completes the
-// execution. Freeze releases it early through stopped so the next worker
-// generation, not this goroutine, drives the execution to completion. Closing
-// supervised on return lets Freeze know the goroutine has settled, so a snapshot
-// never lands in the middle of a reap.
+// execution. Closing stopped would release it early without completing the
+// execution, though no live path does that now. Closing supervised on return
+// signals that the goroutine has settled.
 func (r *Registry) superviseExecution(execState *execution) {
 	defer close(execState.supervised)
 	select {
@@ -557,8 +552,8 @@ func captureOutput(
 	stopped <-chan struct{},
 ) {
 	defer readers.Done()
-	// Clear any past freeze deadline so a read end handed over by Restore resumes
-	// reading instead of tripping the deadline again.
+	// Clear any past read deadline so the reader reads from its current offset
+	// instead of tripping a stale deadline again.
 	if dr, ok := reader.(deadlineReader); ok {
 		_ = dr.SetReadDeadline(time.Time{})
 	}
@@ -566,7 +561,7 @@ func captureOutput(
 	for {
 		select {
 		case <-stopped:
-			// Frozen: leave the reader open for the next worker generation.
+			// Released without completing: leave the reader open.
 			return
 		default:
 		}
@@ -577,8 +572,8 @@ func captureOutput(
 		}
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				// Freeze interrupted a blocked read without consuming bytes. Leave
-				// the reader open so the next generation resumes from this offset.
+				// A read deadline interrupted a blocked read without consuming bytes.
+				// Leave the reader open so a later read resumes from this offset.
 				return
 			}
 			_ = reader.Close()

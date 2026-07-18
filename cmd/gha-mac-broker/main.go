@@ -16,9 +16,7 @@
 //	uninstall          remove the installed service unit
 //	update             check, apply, or show release update state
 //	deploy             pick and apply the least-destructive reconcile action
-//	guest-agent        alias that runs the guest supervisor
-//	guest-supervisor   run the durable guest-side supervisor of runner processes
-//	guest-worker       run one swappable guest-worker generation (supervisor spawns it)
+//	guest-agent        run the single sticky guest-side daemon of runner processes
 //	golden-provision   provision a golden build VM from inside it (host-invoked)
 //	guest-dial         relay the tart-exec stdio channel to the guest-agent loopback listener (host-invoked)
 //	guest-write-slots  write the pool slot count to the guest slot-count file (host-invoked at warm)
@@ -75,8 +73,6 @@ const (
 	commandUpdate        commandName = "update"
 	commandDeploy        commandName = "deploy"
 	commandGuestAgent    commandName = "guest-agent"
-	commandGuestSuper    commandName = "guest-supervisor"
-	commandGuestWorker   commandName = "guest-worker"
 	commandGoldenProv    commandName = "golden-provision"
 	commandGuestDial     commandName = "guest-dial"
 	commandGuestWriteSlt commandName = "guest-write-slots"
@@ -148,10 +144,6 @@ func main() {
 		err = runDeploy(ctx, args)
 	case commandGuestAgent:
 		err = runGuestAgent(ctx, args)
-	case commandGuestSuper:
-		err = runGuestSupervisor(ctx, args)
-	case commandGuestWorker:
-		err = runGuestWorker(ctx, args)
 	case commandGoldenProv:
 		err = runGoldenProvision(ctx, args)
 	case commandGuestDial:
@@ -169,7 +161,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|supervisor|status|build-golden|install|uninstall|update|deploy|guest-agent|guest-supervisor|guest-worker|golden-provision|guest-dial|guest-write-slots> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|supervisor|status|build-golden|install|uninstall|update|deploy|guest-agent|golden-provision|guest-dial|guest-write-slots> [flags]")
 }
 
 func writeUserLine(writer io.Writer, line string) {

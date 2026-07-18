@@ -27,9 +27,8 @@ type LaunchedProcess struct {
 // handle plus the read ends of its captured stdout and stderr. The child is a
 // group leader, so its process group ID equals its PID. The write ends stay
 // attached to the child, so the read ends reach EOF only after the child exits
-// and the registry drains them. The supervisor package calls this in PR3; for
-// now Registry.Start calls it so the in-package guest-agent path still spawns a
-// real process.
+// and the registry drains them. Registry.Start calls it so the guest-agent
+// RunJob path spawns a real process.
 func Launch(spec ExecSpec) (*LaunchedProcess, error) {
 	if spec.Command == "" {
 		return nil, fmt.Errorf("guestexec: command is required")

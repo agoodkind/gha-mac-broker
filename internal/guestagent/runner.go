@@ -71,9 +71,9 @@ type JobRequest struct {
 }
 
 // SpecBuilder turns a RunJob request into an ExecSpec, running any per-slot
-// guest setup as a side effect before the supervisor forks the process. The
-// supervisor owns the fork and wait, so a builder only assembles the spec and
-// prepares the slot; it never launches a process.
+// guest setup as a side effect before the runner process is forked. The registry
+// owns the fork and wait, so a builder only assembles the spec and prepares the
+// slot; it never launches a process.
 type SpecBuilder interface {
 	Build(ctx context.Context, request JobRequest) (guestexec.ExecSpec, error)
 }

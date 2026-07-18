@@ -9,7 +9,7 @@ func baseFingerprintInputs() FingerprintInputs {
 		RunnerTarballDigest: "aaaa",
 		BinaryDigest:        "bbbb",
 		Payloads: []PayloadDigest{
-			{Name: "guest-supervisor.plist", Digest: "cccc"},
+			{Name: "guest-agent.plist", Digest: "cccc"},
 		},
 	}
 }
@@ -59,7 +59,7 @@ func TestFingerprintChangesWhenAnyInputChanges(t *testing.T) {
 			in.BinaryDigest = "zzzz"
 		},
 		"payload digest": func(in *FingerprintInputs) {
-			in.Payloads = []PayloadDigest{{Name: "guest-supervisor.plist", Digest: "dddd"}}
+			in.Payloads = []PayloadDigest{{Name: "guest-agent.plist", Digest: "dddd"}}
 		},
 		"payload name": func(in *FingerprintInputs) {
 			in.Payloads = []PayloadDigest{{Name: "renamed.plist", Digest: "cccc"}}

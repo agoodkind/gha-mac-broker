@@ -1,6 +1,5 @@
-// This file carries no build constraint so the host broker can import the
-// shared guest-token path const on any platform while the rest of the
-// supervisor package stays unix-only.
+// The token helpers carry no build constraint so the host broker can import the
+// shared guest-token path constant on any platform.
 
 package guestsupervisor
 
@@ -14,9 +13,9 @@ import (
 	"strings"
 )
 
-// TokenPath is the fixed 0600 file the guest-supervisor writes the per-boot
-// bearer token to at startup. The host reads it once over the tart-exec control
-// channel (`tart exec <vm> cat <TokenPath>`) and dials the guest agent with it.
+// TokenPath is the fixed 0600 file the guest agent writes the per-boot bearer
+// token to at startup. The host reads it once over the tart-exec control channel
+// (`tart exec <vm> cat <TokenPath>`) and dials the guest agent with it.
 const TokenPath = "/tmp/gha-guest-token" // #nosec G101 -- path only, not a secret.
 
 // tokenFileMode keeps the boot token readable only by its owner.

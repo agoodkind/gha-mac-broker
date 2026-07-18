@@ -1,7 +1,7 @@
-// This file carries no build constraint so the host broker can import the
-// shared slot-count path const on any platform while the rest of the supervisor
-// package stays unix-only.
-
+// Package guestsupervisor holds the boot-scoped bearer token and the VM-warm
+// slot-count helpers the host seeds and the single guest-agent daemon reads at
+// startup. It carries no build constraint so the host broker can import the
+// shared token and slot-count path constants on any platform.
 package guestsupervisor
 
 import (

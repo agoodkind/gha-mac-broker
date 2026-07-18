@@ -1191,207 +1191,6 @@ func (*CancelJobResponse) Descriptor() ([]byte, []int) {
 	return file_guest_v1_guest_proto_rawDescGZIP(), []int{18}
 }
 
-// UpdateAgentRequest streams a replacement guest binary to a running agent. The
-// caller sends exactly one header first, then the binary bytes as data chunks.
-type UpdateAgentRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Types that are valid to be assigned to Chunk:
-	//
-	//	*UpdateAgentRequest_Header
-	//	*UpdateAgentRequest_Data
-	Chunk         isUpdateAgentRequest_Chunk `protobuf_oneof:"chunk"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *UpdateAgentRequest) Reset() {
-	*x = UpdateAgentRequest{}
-	mi := &file_guest_v1_guest_proto_msgTypes[19]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *UpdateAgentRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*UpdateAgentRequest) ProtoMessage() {}
-
-func (x *UpdateAgentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_guest_v1_guest_proto_msgTypes[19]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use UpdateAgentRequest.ProtoReflect.Descriptor instead.
-func (*UpdateAgentRequest) Descriptor() ([]byte, []int) {
-	return file_guest_v1_guest_proto_rawDescGZIP(), []int{19}
-}
-
-func (x *UpdateAgentRequest) GetChunk() isUpdateAgentRequest_Chunk {
-	if x != nil {
-		return x.Chunk
-	}
-	return nil
-}
-
-func (x *UpdateAgentRequest) GetHeader() *UpdateAgentHeader {
-	if x != nil {
-		if x, ok := x.Chunk.(*UpdateAgentRequest_Header); ok {
-			return x.Header
-		}
-	}
-	return nil
-}
-
-func (x *UpdateAgentRequest) GetData() []byte {
-	if x != nil {
-		if x, ok := x.Chunk.(*UpdateAgentRequest_Data); ok {
-			return x.Data
-		}
-	}
-	return nil
-}
-
-type isUpdateAgentRequest_Chunk interface {
-	isUpdateAgentRequest_Chunk()
-}
-
-type UpdateAgentRequest_Header struct {
-	Header *UpdateAgentHeader `protobuf:"bytes,1,opt,name=header,proto3,oneof"`
-}
-
-type UpdateAgentRequest_Data struct {
-	Data []byte `protobuf:"bytes,2,opt,name=data,proto3,oneof"`
-}
-
-func (*UpdateAgentRequest_Header) isUpdateAgentRequest_Chunk() {}
-
-func (*UpdateAgentRequest_Data) isUpdateAgentRequest_Chunk() {}
-
-// UpdateAgentHeader declares the incoming binary and the detached ed25519
-// signature the guest verifies before it trusts the bytes. The signature is
-// over the tuple (version || big-endian uint64 size || sha256), and the host
-// holds the private key whose public half is baked into the guest binary.
-type UpdateAgentHeader struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	Version          string                 `protobuf:"bytes,1,opt,name=version,proto3" json:"version,omitempty"`
-	Size             uint64                 `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`
-	Sha256           []byte                 `protobuf:"bytes,3,opt,name=sha256,proto3" json:"sha256,omitempty"`
-	Ed25519Signature []byte                 `protobuf:"bytes,4,opt,name=ed25519_signature,json=ed25519Signature,proto3" json:"ed25519_signature,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
-}
-
-func (x *UpdateAgentHeader) Reset() {
-	*x = UpdateAgentHeader{}
-	mi := &file_guest_v1_guest_proto_msgTypes[20]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *UpdateAgentHeader) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*UpdateAgentHeader) ProtoMessage() {}
-
-func (x *UpdateAgentHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_guest_v1_guest_proto_msgTypes[20]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use UpdateAgentHeader.ProtoReflect.Descriptor instead.
-func (*UpdateAgentHeader) Descriptor() ([]byte, []int) {
-	return file_guest_v1_guest_proto_rawDescGZIP(), []int{20}
-}
-
-func (x *UpdateAgentHeader) GetVersion() string {
-	if x != nil {
-		return x.Version
-	}
-	return ""
-}
-
-func (x *UpdateAgentHeader) GetSize() uint64 {
-	if x != nil {
-		return x.Size
-	}
-	return 0
-}
-
-func (x *UpdateAgentHeader) GetSha256() []byte {
-	if x != nil {
-		return x.Sha256
-	}
-	return nil
-}
-
-func (x *UpdateAgentHeader) GetEd25519Signature() []byte {
-	if x != nil {
-		return x.Ed25519Signature
-	}
-	return nil
-}
-
-// UpdateAgentResponse reports the version the guest accepted and placed.
-type UpdateAgentResponse struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	AcceptedVersion string                 `protobuf:"bytes,1,opt,name=accepted_version,json=acceptedVersion,proto3" json:"accepted_version,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
-}
-
-func (x *UpdateAgentResponse) Reset() {
-	*x = UpdateAgentResponse{}
-	mi := &file_guest_v1_guest_proto_msgTypes[21]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *UpdateAgentResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*UpdateAgentResponse) ProtoMessage() {}
-
-func (x *UpdateAgentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_guest_v1_guest_proto_msgTypes[21]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use UpdateAgentResponse.ProtoReflect.Descriptor instead.
-func (*UpdateAgentResponse) Descriptor() ([]byte, []int) {
-	return file_guest_v1_guest_proto_rawDescGZIP(), []int{21}
-}
-
-func (x *UpdateAgentResponse) GetAcceptedVersion() string {
-	if x != nil {
-		return x.AcceptedVersion
-	}
-	return ""
-}
-
 var File_guest_v1_guest_proto protoreflect.FileDescriptor
 
 const file_guest_v1_guest_proto_rawDesc = "" +
@@ -1479,26 +1278,14 @@ const file_guest_v1_guest_proto_rawDesc = "" +
 	"\x11active_executions\x18\x02 \x01(\rR\x10activeExecutions\"5\n" +
 	"\x10CancelJobRequest\x12!\n" +
 	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\"\x13\n" +
-	"\x11CancelJobResponse\"n\n" +
-	"\x12UpdateAgentRequest\x129\n" +
-	"\x06header\x18\x01 \x01(\v2\x1f.gha.guest.v1.UpdateAgentHeaderH\x00R\x06header\x12\x14\n" +
-	"\x04data\x18\x02 \x01(\fH\x00R\x04dataB\a\n" +
-	"\x05chunk\"\x86\x01\n" +
-	"\x11UpdateAgentHeader\x12\x18\n" +
-	"\aversion\x18\x01 \x01(\tR\aversion\x12\x12\n" +
-	"\x04size\x18\x02 \x01(\x04R\x04size\x12\x16\n" +
-	"\x06sha256\x18\x03 \x01(\fR\x06sha256\x12+\n" +
-	"\x11ed25519_signature\x18\x04 \x01(\fR\x10ed25519Signature\"@\n" +
-	"\x13UpdateAgentResponse\x12)\n" +
-	"\x10accepted_version\x18\x01 \x01(\tR\x0facceptedVersion2\x98\x04\n" +
+	"\x11CancelJobResponse2\xc2\x03\n" +
 	"\x11GuestAgentService\x12@\n" +
 	"\x05Hello\x12\x1a.gha.guest.v1.HelloRequest\x1a\x1b.gha.guest.v1.HelloResponse\x12C\n" +
 	"\x06RunJob\x12\x1b.gha.guest.v1.RunJobRequest\x1a\x1c.gha.guest.v1.RunJobResponse\x12K\n" +
 	"\tJobStatus\x12\x1e.gha.guest.v1.JobStatusRequest\x1a\x1c.gha.guest.v1.JobStatusEvent0\x01\x12I\n" +
 	"\bReattach\x12\x1d.gha.guest.v1.ReattachRequest\x1a\x1e.gha.guest.v1.ReattachResponse\x12@\n" +
 	"\x05Drain\x12\x1a.gha.guest.v1.DrainRequest\x1a\x1b.gha.guest.v1.DrainResponse\x12L\n" +
-	"\tCancelJob\x12\x1e.gha.guest.v1.CancelJobRequest\x1a\x1f.gha.guest.v1.CancelJobResponse\x12T\n" +
-	"\vUpdateAgent\x12 .gha.guest.v1.UpdateAgentRequest\x1a!.gha.guest.v1.UpdateAgentResponse(\x01B;Z9goodkind.io/gha-mac-broker/internal/guestproto;guestprotob\x06proto3"
+	"\tCancelJob\x12\x1e.gha.guest.v1.CancelJobRequest\x1a\x1f.gha.guest.v1.CancelJobResponseB;Z9goodkind.io/gha-mac-broker/internal/guestproto;guestprotob\x06proto3"
 
 var (
 	file_guest_v1_guest_proto_rawDescOnce sync.Once
@@ -1513,7 +1300,7 @@ func file_guest_v1_guest_proto_rawDescGZIP() []byte {
 }
 
 var file_guest_v1_guest_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_guest_v1_guest_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
+var file_guest_v1_guest_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_guest_v1_guest_proto_goTypes = []any{
 	(RunJobResponse_Outcome)(0), // 0: gha.guest.v1.RunJobResponse.Outcome
 	(LogChunk_Stream)(0),        // 1: gha.guest.v1.LogChunk.Stream
@@ -1536,14 +1323,11 @@ var file_guest_v1_guest_proto_goTypes = []any{
 	(*DrainResponse)(nil),       // 18: gha.guest.v1.DrainResponse
 	(*CancelJobRequest)(nil),    // 19: gha.guest.v1.CancelJobRequest
 	(*CancelJobResponse)(nil),   // 20: gha.guest.v1.CancelJobResponse
-	(*UpdateAgentRequest)(nil),  // 21: gha.guest.v1.UpdateAgentRequest
-	(*UpdateAgentHeader)(nil),   // 22: gha.guest.v1.UpdateAgentHeader
-	(*UpdateAgentResponse)(nil), // 23: gha.guest.v1.UpdateAgentResponse
-	nil,                         // 24: gha.guest.v1.RunJobRequest.EnvEntry
+	nil,                         // 21: gha.guest.v1.RunJobRequest.EnvEntry
 }
 var file_guest_v1_guest_proto_depIdxs = []int32{
 	4,  // 0: gha.guest.v1.HelloResponse.slots:type_name -> gha.guest.v1.SlotInfo
-	24, // 1: gha.guest.v1.RunJobRequest.env:type_name -> gha.guest.v1.RunJobRequest.EnvEntry
+	21, // 1: gha.guest.v1.RunJobRequest.env:type_name -> gha.guest.v1.RunJobRequest.EnvEntry
 	6,  // 2: gha.guest.v1.RunJobRequest.meta:type_name -> gha.guest.v1.JobMeta
 	0,  // 3: gha.guest.v1.RunJobResponse.outcome:type_name -> gha.guest.v1.RunJobResponse.Outcome
 	10, // 4: gha.guest.v1.JobStatusEvent.phase:type_name -> gha.guest.v1.PhaseChange
@@ -1553,26 +1337,23 @@ var file_guest_v1_guest_proto_depIdxs = []int32{
 	1,  // 8: gha.guest.v1.LogChunk.stream:type_name -> gha.guest.v1.LogChunk.Stream
 	16, // 9: gha.guest.v1.ReattachResponse.executions:type_name -> gha.guest.v1.ExecutionState
 	6,  // 10: gha.guest.v1.ExecutionState.meta:type_name -> gha.guest.v1.JobMeta
-	22, // 11: gha.guest.v1.UpdateAgentRequest.header:type_name -> gha.guest.v1.UpdateAgentHeader
-	2,  // 12: gha.guest.v1.GuestAgentService.Hello:input_type -> gha.guest.v1.HelloRequest
-	5,  // 13: gha.guest.v1.GuestAgentService.RunJob:input_type -> gha.guest.v1.RunJobRequest
-	8,  // 14: gha.guest.v1.GuestAgentService.JobStatus:input_type -> gha.guest.v1.JobStatusRequest
-	14, // 15: gha.guest.v1.GuestAgentService.Reattach:input_type -> gha.guest.v1.ReattachRequest
-	17, // 16: gha.guest.v1.GuestAgentService.Drain:input_type -> gha.guest.v1.DrainRequest
-	19, // 17: gha.guest.v1.GuestAgentService.CancelJob:input_type -> gha.guest.v1.CancelJobRequest
-	21, // 18: gha.guest.v1.GuestAgentService.UpdateAgent:input_type -> gha.guest.v1.UpdateAgentRequest
-	3,  // 19: gha.guest.v1.GuestAgentService.Hello:output_type -> gha.guest.v1.HelloResponse
-	7,  // 20: gha.guest.v1.GuestAgentService.RunJob:output_type -> gha.guest.v1.RunJobResponse
-	9,  // 21: gha.guest.v1.GuestAgentService.JobStatus:output_type -> gha.guest.v1.JobStatusEvent
-	15, // 22: gha.guest.v1.GuestAgentService.Reattach:output_type -> gha.guest.v1.ReattachResponse
-	18, // 23: gha.guest.v1.GuestAgentService.Drain:output_type -> gha.guest.v1.DrainResponse
-	20, // 24: gha.guest.v1.GuestAgentService.CancelJob:output_type -> gha.guest.v1.CancelJobResponse
-	23, // 25: gha.guest.v1.GuestAgentService.UpdateAgent:output_type -> gha.guest.v1.UpdateAgentResponse
-	19, // [19:26] is the sub-list for method output_type
-	12, // [12:19] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	2,  // 11: gha.guest.v1.GuestAgentService.Hello:input_type -> gha.guest.v1.HelloRequest
+	5,  // 12: gha.guest.v1.GuestAgentService.RunJob:input_type -> gha.guest.v1.RunJobRequest
+	8,  // 13: gha.guest.v1.GuestAgentService.JobStatus:input_type -> gha.guest.v1.JobStatusRequest
+	14, // 14: gha.guest.v1.GuestAgentService.Reattach:input_type -> gha.guest.v1.ReattachRequest
+	17, // 15: gha.guest.v1.GuestAgentService.Drain:input_type -> gha.guest.v1.DrainRequest
+	19, // 16: gha.guest.v1.GuestAgentService.CancelJob:input_type -> gha.guest.v1.CancelJobRequest
+	3,  // 17: gha.guest.v1.GuestAgentService.Hello:output_type -> gha.guest.v1.HelloResponse
+	7,  // 18: gha.guest.v1.GuestAgentService.RunJob:output_type -> gha.guest.v1.RunJobResponse
+	9,  // 19: gha.guest.v1.GuestAgentService.JobStatus:output_type -> gha.guest.v1.JobStatusEvent
+	15, // 20: gha.guest.v1.GuestAgentService.Reattach:output_type -> gha.guest.v1.ReattachResponse
+	18, // 21: gha.guest.v1.GuestAgentService.Drain:output_type -> gha.guest.v1.DrainResponse
+	20, // 22: gha.guest.v1.GuestAgentService.CancelJob:output_type -> gha.guest.v1.CancelJobResponse
+	17, // [17:23] is the sub-list for method output_type
+	11, // [11:17] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_guest_v1_guest_proto_init() }
@@ -1586,17 +1367,13 @@ func file_guest_v1_guest_proto_init() {
 		(*JobStatusEvent_Heartbeat)(nil),
 		(*JobStatusEvent_Result)(nil),
 	}
-	file_guest_v1_guest_proto_msgTypes[19].OneofWrappers = []any{
-		(*UpdateAgentRequest_Header)(nil),
-		(*UpdateAgentRequest_Data)(nil),
-	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_guest_v1_guest_proto_rawDesc), len(file_guest_v1_guest_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   23,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

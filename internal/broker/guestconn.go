@@ -82,8 +82,8 @@ func (b *Binder) resolveGuest(ctx context.Context, vm *WarmVM) (guestConn, error
 }
 
 // readGuestToken reads the per-boot guest token file over the tart-exec channel,
-// retrying within the readiness window because the supervisor writes it shortly
-// after the vsock channel comes up. The guest-supervisor runs as root and writes
+// retrying within the readiness window because the guest agent writes it shortly
+// after the vsock channel comes up. The guest agent runs as root and writes
 // the token file mode 0600, so tart-exec (which runs as the unprivileged admin
 // user) must read it through sudo; a plain cat gets permission denied and the
 // read would otherwise loop until the readiness deadline.

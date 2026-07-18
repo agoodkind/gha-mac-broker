@@ -4,10 +4,7 @@ package guestagent
 
 import (
 	"context"
-	"crypto/ed25519"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sync"
 
 	"connectrpc.com/connect"
@@ -18,23 +15,21 @@ import (
 )
 
 const (
-	protocolMajor            = uint32(1)
-	defaultAgentBuild        = "dev"
-	defaultSlotCount         = uint32(1)
-	capabilityRunJob         = "run-job"
-	capabilityReattach       = "reattach"
-	capabilityDrain          = "drain"
-	capabilityCancelJob      = "cancel-job"
-	capabilityUpdateAgent    = "update-agent"
+	protocolMajor       = uint32(1)
+	defaultAgentBuild   = "dev"
+	defaultSlotCount    = uint32(1)
+	capabilityRunJob    = "run-job"
+	capabilityReattach  = "reattach"
+	capabilityDrain     = "drain"
+	capabilityCancelJob = "cancel-job"
 )
 
 var processBootID = generateBootID()
 
-// ChildLauncher launches a runner outside the worker process and records it in
-// the worker's registry, returning the admission outcome. The guest-worker
-// supplies a supervisor-backed launcher so the durable supervisor stays the
-// runner's parent; when it is nil the handler forks in-process through the
-// registry, preserving the single-process guest-agent path.
+// ChildLauncher launches a runner and records it in the registry, returning the
+// admission outcome. It is a test seam: production leaves it nil so RunJob forks
+// the runner in-process through Registry.Start, and a test injects a launcher to
+// occupy a slot without forking a real process.
 type ChildLauncher interface {
 	Run(spec guestexec.ExecSpec) (guestexec.Outcome, error)
 }
@@ -50,19 +45,6 @@ type Options struct {
 	// RunJob. When nil the handler uses the production runner executor, which
 	// clones the runner, seeds the slot HOME, and sets the slot keychain.
 	SpecBuilder SpecBuilder
-	// Reloader triggers the in-VM worker reload onto a freshly placed binary
-	// after UpdateAgent verifies and installs it. When nil, UpdateAgent reports
-	// CodeUnimplemented, so a build without update wiring simply refuses updates.
-	Reloader AgentReloader
-	// InstallDir is the directory UpdateAgent streams the temp binary into and
-	// renames the versioned binary within. It must sit on the same filesystem as
-	// the running binary so the rename stays atomic. When empty it defaults to
-	// the directory holding the running executable.
-	InstallDir string
-	// UpdatePublicKey overrides the baked ed25519 public key UpdateAgent trusts
-	// for the detached signature. When nil the handler uses the compile-time
-	// baked key. Tests inject a known key here.
-	UpdatePublicKey ed25519.PublicKey
 }
 
 // Handler implements GuestAgentService over a guest execution registry.
@@ -74,10 +56,6 @@ type Handler struct {
 	goldenFingerprint string
 	childLauncher     ChildLauncher
 	specBuilder       SpecBuilder
-	reloader          AgentReloader
-	installDir        string
-	currentBinary     string
-	updatePublicKey   ed25519.PublicKey
 	// slotLocksMu guards slotLocks; each slot lock serializes admission, per-slot
 	// prep, and start for one slot, so two concurrent RunJobs for the same slot
 	// cannot both run destructive prepareSlot before either records the execution.
@@ -114,18 +92,6 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 	if specBuilder == nil {
 		specBuilder = newRunnerExecutor()
 	}
-	currentBinary := ""
-	if executable, err := os.Executable(); err == nil {
-		currentBinary = executable
-	}
-	installDir := options.InstallDir
-	if installDir == "" && currentBinary != "" {
-		installDir = filepath.Dir(currentBinary)
-	}
-	updatePublicKey := options.UpdatePublicKey
-	if updatePublicKey == nil {
-		updatePublicKey = updateSigningPublicKey
-	}
 	return &Handler{
 		registry:          registry,
 		slotCount:         slotCount,
@@ -134,10 +100,6 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 		goldenFingerprint: options.GoldenFingerprint,
 		childLauncher:     options.ChildLauncher,
 		specBuilder:       specBuilder,
-		reloader:          options.Reloader,
-		installDir:        installDir,
-		currentBinary:     currentBinary,
-		updatePublicKey:   updatePublicKey,
 		slotLocksMu:       sync.Mutex{},
 		slotLocks:         make(map[uint32]*sync.Mutex),
 	}
@@ -179,7 +141,6 @@ func (handler *Handler) Hello(
 			capabilityReattach,
 			capabilityDrain,
 			capabilityCancelJob,
-			capabilityUpdateAgent,
 		},
 		Slots:             handler.slots(),
 		GoldenFingerprint: handler.goldenFingerprint,
@@ -236,9 +197,9 @@ func (handler *Handler) RunJob(
 	return connect.NewResponse(response), nil
 }
 
-// startExecution routes an execution to the supervisor-backed launcher when one
-// is configured, so the durable supervisor forks and waits the runner. Without a
-// launcher it forks in-process through the registry.
+// startExecution forks the runner in-process through the registry, which owns
+// the fork, the pipe read ends, and the waitpid loop. A test may inject a
+// ChildLauncher to record an execution without forking; production leaves it nil.
 func (handler *Handler) startExecution(spec guestexec.ExecSpec) (guestexec.Outcome, error) {
 	if handler.childLauncher != nil {
 		return handler.childLauncher.Run(spec)
