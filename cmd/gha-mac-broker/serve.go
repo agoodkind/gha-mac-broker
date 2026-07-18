@@ -19,9 +19,9 @@ import (
 )
 
 // runServe runs the single-process daemon: it binds the listener directly and
-// serves without a supervisor, so nothing breaks before a supervisor launchd unit
-// exists. The supervisor and worker roles share the same serving core through
-// serveDaemon; serve just acquires its own listener and signals no readiness.
+// serves in one process under launchd KeepAlive, which relaunches it wholesale on
+// death. It is the only serving role; there is no host supervisor or swappable
+// worker.
 func runServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	configPath := fs.String("config", "", "path to broker config TOML (default: XDG path)")
@@ -32,31 +32,13 @@ func runServe(ctx context.Context, args []string) error {
 	if *configPath == "" {
 		*configPath = config.DefaultConfigPath()
 	}
-	return serveDaemon(ctx, *configPath, serveComponents{
-		acquireListener: listenTCP,
-		onReady:         nil,
-		stampProgress:   nil,
-	})
-}
-
-// serveComponents are the seams that differ between the single-process serve role
-// and the supervisor-spawned worker role: how the listener is acquired, whether to
-// signal readiness once serving, and how to stamp reconcile progress.
-type serveComponents struct {
-	// acquireListener binds or inherits the listener for the given address.
-	acquireListener func(ctx context.Context, addr string) (net.Listener, error)
-	// onReady, when set, is called once the server is serving, so a worker can
-	// signal its supervisor over the readiness pipe.
-	onReady func()
-	// stampProgress, when set, is called after each reconcile pass, so a worker can
-	// heartbeat the supervisor's stall watchdog.
-	stampProgress func()
+	return serveDaemon(ctx, *configPath)
 }
 
 // serveDaemon loads config, builds the pool and HTTP server, starts the fill and
-// reconcile loops, and serves on the supplied listener until SIGINT or SIGTERM
-// triggers a graceful shutdown. It is the shared core of serve and worker.
-func serveDaemon(ctx context.Context, configPath string, components serveComponents) error {
+// reconcile loops, and serves on its own bound listener until SIGINT or SIGTERM
+// triggers a graceful shutdown.
+func serveDaemon(ctx context.Context, configPath string) error {
 	initialConfigModTime := configInitialModTime(ctx, configPath)
 
 	cfg, gh, err := loadDeps(ctx, configPath)
@@ -93,7 +75,7 @@ func serveDaemon(ctx context.Context, configPath string, components serveCompone
 	sampler := newHostStatsSampler(cfg, p)
 	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, hostedTracker, sampler)
 
-	listener, err := components.acquireListener(ctx, cfg.ListenAddr)
+	listener, err := listenTCP(ctx, cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
@@ -101,12 +83,12 @@ func serveDaemon(ctx context.Context, configPath string, components serveCompone
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	startServeLoops(ctx, stop, cfg, gh, p, components.stampProgress)
+	startServeLoops(ctx, stop, cfg, gh, p)
 	startBrokerConfigReloadWatcher(ctx, configPath, initialConfigModTime, binder, p, srv, sampler)
 	startHostedLoadReconcile(ctx, gh, hostedTracker, cfg.Labels)
 	sampler.Start(ctx)
 
-	serveErr := httpServe(ctx, listener, srv, components.onReady)
+	serveErr := httpServe(ctx, listener, srv, nil)
 
 	shutCtx, shutCancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 	defer shutCancel()
@@ -115,10 +97,10 @@ func serveDaemon(ctx context.Context, configPath string, components serveCompone
 }
 
 // httpServe serves handler on an already-bound listener and shuts down gracefully
-// on ctx cancel. It uses [net.Listen] plus Serve rather than ListenAndServe so a
-// parent supervisor can own the listener descriptor and hand it to the worker, and
-// it sets no WriteTimeout because the /status stream is long-lived. onReady, when
-// set, is called once serving so a worker can signal its supervisor.
+// on ctx cancel. It takes the listener as a seam rather than binding one itself, so
+// a test can hand it an injected listener, and it sets no WriteTimeout because the
+// /status stream is long-lived. onReady, when set, is called once the server is
+// serving, so a caller can synchronize on readiness.
 func httpServe(ctx context.Context, listener net.Listener, handler http.Handler, onReady func()) error {
 	httpSrv := &http.Server{
 		Handler:           handler,
@@ -162,8 +144,7 @@ func httpServe(ctx context.Context, listener net.Listener, handler http.Handler,
 	return nil
 }
 
-// listenTCP binds a TCP listener on addr, the single-process serve path where no
-// supervisor owns the descriptor.
+// listenTCP binds a TCP listener on addr for the serve daemon.
 func listenTCP(ctx context.Context, addr string) (net.Listener, error) {
 	var listenConfig net.ListenConfig
 	listener, err := listenConfig.Listen(ctx, "tcp", addr)

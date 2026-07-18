@@ -313,12 +313,17 @@ func (g *fakeGitHub) RunnerCalls() []string {
 }
 
 // fakeSlotProber reports which slots are running per VM, from one call per VM.
+// When blocking is armed, RunningSlots signals it entered a probe and then blocks
+// until released or until the caller's context is done, so a test can prove a
+// caller does not wait on an in-flight guest probe.
 type fakeSlotProber struct {
 	mu       sync.Mutex
 	running  map[string]map[int]bool
 	probeErr map[string]error
 	calls    []string
 	onProbe  func()
+	started  chan string
+	block    chan struct{}
 }
 
 func newFakeSlotProber() *fakeSlotProber {
@@ -328,18 +333,32 @@ func newFakeSlotProber() *fakeSlotProber {
 		probeErr: make(map[string]error),
 		calls:    nil,
 		onProbe:  nil,
+		started:  nil,
+		block:    nil,
 	}
 }
 
-func (p *fakeSlotProber) RunningSlots(_ context.Context, vm *broker.WarmVM) (map[int]bool, error) {
+func (p *fakeSlotProber) RunningSlots(ctx context.Context, vm *broker.WarmVM) (map[int]bool, error) {
 	p.mu.Lock()
 	p.calls = append(p.calls, vm.Name)
 	err := p.probeErr[vm.Name]
 	slots := p.running[vm.Name]
 	hook := p.onProbe
+	started := p.started
+	block := p.block
 	p.mu.Unlock()
 	if hook != nil {
 		hook()
+	}
+	if started != nil {
+		started <- vm.Name
+	}
+	if block != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-block:
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -349,6 +368,26 @@ func (p *fakeSlotProber) RunningSlots(_ context.Context, vm *broker.WarmVM) (map
 		out[slot] = running
 	}
 	return out, nil
+}
+
+// armBlockingProbe makes every RunningSlots call announce it started on the
+// returned channel and then block honoring ctx, until releaseProbe is called.
+func (p *fakeSlotProber) armBlockingProbe() <-chan string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.started = make(chan string, len(p.running)+len(p.probeErr)+4)
+	p.block = make(chan struct{})
+	return p.started
+}
+
+// releaseProbe unblocks every probe currently or later blocked in RunningSlots.
+func (p *fakeSlotProber) releaseProbe() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.block != nil {
+		close(p.block)
+		p.block = nil
+	}
 }
 
 func (p *fakeSlotProber) SetRunning(vmName string, slotIndex int, running bool) {
@@ -585,6 +624,110 @@ func TestStatusReportsSlotViewsForMultiSlotWorker(t *testing.T) {
 	calls := prober.Calls()
 	if len(calls) != 1 || calls[0] != "vm-slots" {
 		t.Fatalf("prober calls = %v, want [vm-slots]", calls)
+	}
+}
+
+// TestSnapshotReturnsWhileReconcileGuestProbeBlocks proves the pool never holds
+// p.mu across a guest RPC on the reconcile/health path: a reap probe blocks in a
+// guest RunningSlots call, and a concurrent Snapshot must still return promptly.
+// This is the /status-block invariant: /capacity reads Snapshot, so a frozen
+// guest probe in flight must not park the pool mutex.
+func TestSnapshotReturnsWhileReconcileGuestProbeBlocks(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	options := testOptions(clock, 1)
+	options.PickupTimeout = time.Minute
+	options.MaxBind = time.Hour
+	prober := newFakeSlotProber()
+	prober.SetRunning("vm-busy", 0, true)
+	started := prober.armBlockingProbe()
+	pool := New(options, newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+
+	pool.mu.Lock()
+	pool.started = true
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-options.PickupTimeout-time.Second), 0, 42, nil)
+	pool.mu.Unlock()
+
+	reconcileDone := make(chan struct{})
+	go func() {
+		_ = pool.Reconcile(context.Background())
+		close(reconcileDone)
+	}()
+
+	// Wait until the reap has entered the guest probe, so a guest RPC is in flight
+	// with p.mu released.
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reap did not enter the guest probe")
+	}
+
+	snapshotResult := make(chan Snapshot, 1)
+	go func() { snapshotResult <- pool.Snapshot() }()
+	select {
+	case snapshot := <-snapshotResult:
+		if snapshot.Busy != 1 {
+			t.Fatalf("snapshot busy = %d, want 1 while a guest probe is in flight", snapshot.Busy)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Snapshot blocked behind an in-flight guest probe; p.mu held across a guest RPC")
+	}
+
+	prober.releaseProbe()
+	select {
+	case <-reconcileDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Reconcile did not finish after the probe was released")
+	}
+}
+
+// TestStatusBoundsFrozenGuestProbe proves /status stays responsive while a guest
+// is frozen: the running-slots probe never returns, but Status returns within its
+// bound and reports the busy worker with an unknown (nil) active-job field rather
+// than blocking on the frozen guest.
+func TestStatusBoundsFrozenGuestProbe(t *testing.T) {
+	restore := statusProbeTimeout
+	statusProbeTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { statusProbeTimeout = restore })
+
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	clock := newMutableClock(now)
+	prober := newFakeSlotProber()
+	prober.SetRunning("vm-busy", 0, true)
+	// Arm the block and never release it, so the guest probe stays frozen for the
+	// life of the test.
+	prober.armBlockingProbe()
+	t.Cleanup(prober.releaseProbe)
+	pool := New(testOptions(clock, 1), newFakeWarmer(), newFakeRunner(1), newFakeGitHub(), prober)
+
+	pool.mu.Lock()
+	pool.started = true
+	pool.states[0] = busyWorkerState("vm-busy", now.Add(-time.Hour), now.Add(-time.Minute), 0, 42, nil)
+	pool.mu.Unlock()
+
+	type statusResult struct {
+		snapshot Snapshot
+		workers  []WorkerView
+	}
+	done := make(chan statusResult, 1)
+	go func() {
+		snapshot, workers := pool.Status(context.Background())
+		done <- statusResult{snapshot: snapshot, workers: workers}
+	}()
+
+	select {
+	case result := <-done:
+		if result.snapshot.Busy != 1 {
+			t.Fatalf("snapshot busy = %d, want 1", result.snapshot.Busy)
+		}
+		if result.workers[0].ActiveJob != nil {
+			t.Fatalf("active job = %v, want nil when the guest probe times out", result.workers[0].ActiveJob)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Status blocked on a frozen guest probe beyond its bound")
+	}
+	if calls := prober.Calls(); len(calls) != 1 || calls[0] != "vm-busy" {
+		t.Fatalf("prober calls = %v, want [vm-busy]", calls)
 	}
 }
 
