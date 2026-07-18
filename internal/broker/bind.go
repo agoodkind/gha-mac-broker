@@ -726,6 +726,15 @@ func (b *Binder) List(ctx context.Context) ([]string, error) {
 // slot busy when a running execution names it. It does not clone, delete, or
 // rewrite runner-slot directories.
 func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit int) ([]AdoptedVM, error) {
+	// Bound the whole adoption pass so a single frozen guest cannot stall worker
+	// startup. Adoption resolves each running VM's guest with a Hello whose own
+	// readinessTimeout is 90s, but the host supervisor kills a worker that does
+	// not serve within 30s. A frozen guest would then crash-loop the worker and
+	// take down the pool. This deadline (below the supervisor's) cancels a stuck
+	// Hello, the unreachable candidate is skipped, and the worker serves in time.
+	// A whole-pass deadline also stops sequential per-VM waits from multiplying.
+	ctx, cancel := context.WithTimeout(ctx, checkAliveTimeout)
+	defer cancel()
 	entries, err := b.vm.ListVMs(ctx)
 	if err != nil {
 		slog.WarnContext(ctx, "list tart vms failed", "err", err)
