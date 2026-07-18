@@ -6,13 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -130,44 +128,8 @@ func postWebhook(t *testing.T, ctx context.Context, addr string, secret []byte, 
 	return resp
 }
 
-func TestReloadOrRestartPrefersSupervisorReload(t *testing.T) {
+func TestReloadOrRestartRestartsManagedService(t *testing.T) {
 	restoreReloadSeams(t)
-	hostSupervisorPID = func() (int, bool) { return 4242, true }
-	var signaledPID int
-	var signaledSig syscall.Signal
-	signalProcess = func(pid int, sig syscall.Signal) error {
-		signaledPID = pid
-		signaledSig = sig
-		return nil
-	}
-	restartCalled := false
-	restartManagedService = func(_ context.Context) (bool, error) {
-		restartCalled = true
-		return true, nil
-	}
-
-	changed, err := reloadOrRestart(context.Background())
-	if err != nil {
-		t.Fatalf("reloadOrRestart: %v", err)
-	}
-	if !changed {
-		t.Fatal("changed = false, want true after a worker reload")
-	}
-	if signaledPID != 4242 || signaledSig != syscall.SIGHUP {
-		t.Fatalf("signaled pid=%d sig=%v, want 4242 SIGHUP", signaledPID, signaledSig)
-	}
-	if restartCalled {
-		t.Fatal("service restart ran despite a live supervisor")
-	}
-}
-
-func TestReloadOrRestartFallsBackToServiceRestart(t *testing.T) {
-	restoreReloadSeams(t)
-	hostSupervisorPID = func() (int, bool) { return 0, false }
-	signalProcess = func(_ int, _ syscall.Signal) error {
-		t.Fatal("signalProcess called without a live supervisor")
-		return nil
-	}
 	restartCalled := false
 	restartManagedService = func(_ context.Context) (bool, error) {
 		restartCalled = true
@@ -183,30 +145,8 @@ func TestReloadOrRestartFallsBackToServiceRestart(t *testing.T) {
 	}
 }
 
-func TestReloadOrRestartFallsBackWhenSignalFails(t *testing.T) {
+func TestRunDeployPlansServiceRestartForHostChange(t *testing.T) {
 	restoreReloadSeams(t)
-	hostSupervisorPID = func() (int, bool) { return 4242, true }
-	signalProcess = func(_ int, _ syscall.Signal) error {
-		return fmt.Errorf("no such process")
-	}
-	restartCalled := false
-	restartManagedService = func(_ context.Context) (bool, error) {
-		restartCalled = true
-		return true, nil
-	}
-
-	changed, err := reloadOrRestart(context.Background())
-	if err != nil {
-		t.Fatalf("reloadOrRestart: %v", err)
-	}
-	if !changed || !restartCalled {
-		t.Fatalf("changed=%v restartCalled=%v, want both true after signal failure", changed, restartCalled)
-	}
-}
-
-func TestRunDeployPlansWorkerReloadWhenSupervisorPresent(t *testing.T) {
-	restoreReloadSeams(t)
-	hostSupervisorPID = func() (int, bool) { return 1234, true }
 
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
@@ -222,29 +162,8 @@ func TestRunDeployPlansWorkerReloadWhenSupervisorPresent(t *testing.T) {
 	if err := runDeployWithWriters(context.Background(), args, &stdout, &stderr); err != nil {
 		t.Fatalf("runDeployWithWriters: %v; stderr=%s", err, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "deploy plan: worker-reload") {
-		t.Fatalf("stdout = %q, want worker-reload plan", stdout.String())
-	}
-}
-
-func TestRunDeployPlansServiceRestartWithoutSupervisor(t *testing.T) {
-	restoreReloadSeams(t)
-	hostSupervisorPID = func() (int, bool) { return 0, false }
-
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.toml")
-	writeReloadConfig(t, configPath, 1)
-
-	var stdout strings.Builder
-	var stderr strings.Builder
-	args := []string{
-		"-config", configPath,
-		"-compiled-host-fingerprint", "host-new",
-		"-running-host-fingerprint", "host-old",
-	}
-	if err := runDeployWithWriters(context.Background(), args, &stdout, &stderr); err != nil {
-		t.Fatalf("runDeployWithWriters: %v; stderr=%s", err, stderr.String())
-	}
+	// With one serve daemon and no host supervisor, a host-only change always plans
+	// a full service restart rather than an in-place worker reload.
 	if !strings.Contains(stdout.String(), "deploy plan: service-restart") {
 		t.Fatalf("stdout = %q, want service-restart plan", stdout.String())
 	}
@@ -252,12 +171,8 @@ func TestRunDeployPlansServiceRestartWithoutSupervisor(t *testing.T) {
 
 func restoreReloadSeams(t *testing.T) {
 	t.Helper()
-	oldPID := hostSupervisorPID
-	oldSignal := signalProcess
 	oldRestart := restartManagedService
 	t.Cleanup(func() {
-		hostSupervisorPID = oldPID
-		signalProcess = oldSignal
 		restartManagedService = oldRestart
 	})
 }

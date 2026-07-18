@@ -7,34 +7,17 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"syscall"
 
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/deploy"
 )
 
-// hostSupervisorPID and signalProcess are the seams the reload path depends on, as
-// variables so tests can drive both the worker-reload and service-restart branches
-// without a running supervisor.
-var (
-	hostSupervisorPID = liveSupervisorPID
-	signalProcess     = syscall.Kill
-)
-
-// reloadOrRestart reconciles the running service with a freshly applied binary,
-// preferring the least-destructive action. It signals a live host supervisor to
-// swap its worker in place, which keeps the listener up and lets adoption reattach
-// running jobs; with no supervisor it falls back to the full service restart. Both
-// paths survive running jobs. It reports whether any managed service was acted on.
+// reloadOrRestart reconciles the running service with a freshly applied binary by
+// restarting the managed service. The single serve daemon runs under launchd
+// KeepAlive, which relaunches it after the restart, and adoption reattaches
+// running jobs on the new process. It reports whether a managed service was acted
+// on.
 func reloadOrRestart(ctx context.Context) (bool, error) {
-	if pid, ok := hostSupervisorPID(); ok {
-		err := signalProcess(pid, syscall.SIGHUP)
-		if err == nil {
-			slog.InfoContext(ctx, "worker reload signaled to host supervisor", "pid", pid)
-			return true, nil
-		}
-		slog.WarnContext(ctx, "worker reload signal failed; falling back to service restart", "err", err, "pid", pid)
-	}
 	return restartManagedService(ctx)
 }
 
@@ -74,7 +57,6 @@ func runDeployWithWriters(ctx context.Context, args []string, stdout io.Writer, 
 	if runningBaseRef == "" {
 		runningBaseRef = cfg.Tart.BaseImage
 	}
-	_, supervisorPresent := hostSupervisorPID()
 
 	inputs := deploy.Inputs{
 		CompiledBaseRef:          cfg.Tart.BaseImage,
@@ -85,7 +67,10 @@ func runDeployWithWriters(ctx context.Context, args []string, stdout io.Writer, 
 		GuestProtocolMajor:       clampUint32(*guestProtocol),
 		CompiledHostFingerprint:  *compiledHostFP,
 		RunningHostFingerprint:   *runningHostFP,
-		SupervisorPresent:        supervisorPresent,
+		// The host runs one serve daemon under launchd KeepAlive; there is no host
+		// supervisor to reload a worker in place, so a host change always restarts
+		// the managed service.
+		SupervisorPresent: false,
 	}
 	action := deploy.Decide(inputs)
 	writeUserLine(stdout, "deploy plan: "+action.String())

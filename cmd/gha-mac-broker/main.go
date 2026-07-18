@@ -8,9 +8,7 @@
 //	version            print version and exit
 //	jitconfig          mint a repo-scoped JIT runner config (proves App auth)
 //	bind               clone a warm VM, run one ephemeral job, tear it down
-//	serve              run the single-process HTTP daemon (no supervisor)
-//	supervisor         run the durable host supervisor owning the listener and worker lifecycle
-//	worker             run one swappable host worker generation (supervisor spawns it)
+//	serve              run the single-process HTTP daemon under launchd KeepAlive
 //	status             print the daemon pool status JSON
 //	install            scaffold config and secrets, build golden, install the service
 //	uninstall          remove the installed service unit
@@ -64,8 +62,6 @@ const (
 	commandJITConfig     commandName = "jitconfig"
 	commandBind          commandName = "bind"
 	commandServe         commandName = "serve"
-	commandSupervisor    commandName = "supervisor"
-	commandWorker        commandName = "worker"
 	commandStatus        commandName = "status"
 	commandBuildGolden   commandName = "build-golden"
 	commandInstall       commandName = "install"
@@ -126,10 +122,6 @@ func main() {
 		err = runBind(ctx, args)
 	case commandServe:
 		err = runServe(ctx, args)
-	case commandSupervisor:
-		err = runSupervisor(ctx, args)
-	case commandWorker:
-		err = runWorker(ctx, args)
 	case commandStatus:
 		err = runStatus(ctx, args)
 	case commandBuildGolden:
@@ -161,7 +153,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|supervisor|status|build-golden|install|uninstall|update|deploy|guest-agent|golden-provision|guest-dial|guest-write-slots> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|status|build-golden|install|uninstall|update|deploy|guest-agent|golden-provision|guest-dial|guest-write-slots> [flags]")
 }
 
 func writeUserLine(writer io.Writer, line string) {
@@ -744,11 +736,13 @@ func newRunToken(ctx context.Context) (string, error) {
 	return time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:]), nil
 }
 
-func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, p *runnerpool.Pool, onReconcile func()) {
+func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, p *runnerpool.Pool) {
 	startUpdateSchedulerInBackground(ctx, stop, slog.Default())
 	deleteStaleRunners(ctx, cfg, cleaner)
 	p.Start(ctx)
-	p.StartReconcile(ctx, 0, onReconcile)
+	// The single serve daemon runs under launchd KeepAlive, so there is no host
+	// supervisor reading a reconcile heartbeat; StartReconcile takes no onCycle.
+	p.StartReconcile(ctx, 0, nil)
 }
 
 // hostedLoadReconcileInterval is how often the in-progress hosted-macOS job
