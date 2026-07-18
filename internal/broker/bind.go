@@ -53,6 +53,14 @@ var drainTimeout = 30 * time.Second
 // before its terminal event.
 const drainReconnectBackoff = time.Second
 
+// drainIdleTimeout bounds silence on an open status stream. The guest emits a
+// heartbeat every heartbeatInterval (10s), so no event for this long means the
+// connection is dead or the guest execution is stalled with no terminal coming.
+// The drain then gives up and the pool recycles the VM. In-flight work is
+// disposable and the CI job retries, so killing a stalled drain is correct. It
+// is a var so tests can shorten it.
+var drainIdleTimeout = 45 * time.Second
+
 // slotReconfigureTimeout bounds the wait for a guest to serve the requested slot
 // count after ConfigureSlots. The guest applies the count by replacing its
 // worker, which is asynchronous, so the host re-Hellos until the inventory
@@ -411,6 +419,12 @@ func (b *Binder) drainJob(ctx context.Context, client guestConn, execID string, 
 	cursor := fromSeq
 	canceled, err := b.drainToTerminal(ctx, client, execID, vm, runLog, &cursor)
 	if !canceled {
+		if errors.Is(err, ErrDrainStalled) {
+			// A stalled drain is not a terminal job failure. The guest went silent
+			// with no terminal, so the pool must recycle the VM rather than free the
+			// slot for reuse on a dead or wedged guest.
+			return err
+		}
 		if err != nil {
 			// The job reached a terminal with a nonzero exit. Mark it so the pool can
 			// tell a terminal job failure (free the slot, keep the VM) from a resume
@@ -464,20 +478,33 @@ func (b *Binder) drainToTerminal(ctx context.Context, client guestConn, execID s
 		if contextDone(ctx) {
 			return true, nil
 		}
-		stream, err := client.JobStatus(ctx, execID, *cursor)
+		// Each attempt runs on its own child context so the idle watchdog can
+		// cancel just this stream read without tearing down the parent drain.
+		attemptCtx, cancelAttempt := context.WithCancelCause(ctx)
+		stream, err := client.JobStatus(attemptCtx, execID, *cursor)
 		if isExecutionNotFound(err) {
+			cancelAttempt(nil)
 			slog.WarnContext(ctx, "guest execution not found; freeing slot", "vm", vm.Name, "execution", execID)
 			return false, nil
 		}
 		if err != nil {
+			cancelAttempt(nil)
 			slog.WarnContext(ctx, "guest job status open failed; retrying", "err", err, "vm", vm.Name, "execution", execID)
 			sleepWithContext(ctx, drainReconnectBackoff)
 			continue
 		}
-		terminal, streamErr := drainStream(ctx, stream, runLog, cursor)
+		terminal, streamErr := drainStream(attemptCtx, cancelAttempt, stream, runLog, cursor)
 		_ = stream.Close()
+		// Read the cancellation cause before cancelAttempt(nil) overwrites it, so
+		// an idle-watchdog timeout is distinguishable from a natural stream end.
+		stalled := errors.Is(context.Cause(attemptCtx), errDrainIdle)
+		cancelAttempt(nil)
 		if terminal != nil {
 			return false, terminalToError(terminal, execID, vm)
+		}
+		if stalled {
+			slog.WarnContext(ctx, "guest status stream stalled; recycling vm", "vm", vm.Name, "execution", execID, "cursor", *cursor, "idle_timeout", drainIdleTimeout)
+			return false, ErrDrainStalled
 		}
 		if isExecutionNotFound(streamErr) {
 			slog.WarnContext(ctx, "guest execution not found mid-stream; freeing slot", "vm", vm.Name, "execution", execID)
@@ -504,9 +531,16 @@ func contextDone(ctx context.Context) bool {
 
 // drainStream consumes one status stream, mirroring log chunks to runLog and
 // advancing cursor on every event. It returns the terminal result if the stream
-// reaches one, or the stream error when it ends early.
-func drainStream(ctx context.Context, stream jobStatusStream, runLog *os.File, cursor *uint64) (*guestproto.TerminalResult, error) {
+// reaches one, or the stream error when it ends early. An idle watchdog cancels
+// the attempt context through cancelIdle when no event arrives for
+// drainIdleTimeout, so a silent stream cannot block the drain forever. The
+// watchdog resets on every event, including the guest's periodic heartbeat, so a
+// live job with regular heartbeats never trips it.
+func drainStream(ctx context.Context, cancelIdle context.CancelCauseFunc, stream jobStatusStream, runLog *os.File, cursor *uint64) (*guestproto.TerminalResult, error) {
+	idle := time.AfterFunc(drainIdleTimeout, func() { cancelIdle(errDrainIdle) })
+	defer idle.Stop()
 	for stream.Receive() {
+		idle.Reset(drainIdleTimeout)
 		event := stream.Msg()
 		*cursor = event.GetSequence()
 		if chunk := event.GetLog(); chunk != nil && runLog != nil {
@@ -520,8 +554,6 @@ func drainStream(ctx context.Context, stream jobStatusStream, runLog *os.File, c
 		if result := event.GetResult(); result != nil {
 			return result, nil
 		}
-		// Heartbeats keep the stream alive; there is no host read deadline because
-		// jobs run for hours. Stall detection lives in the reap loop, not here.
 	}
 	if err := stream.Err(); err != nil {
 		return nil, fmt.Errorf("broker: guest status stream: %w", err)
@@ -545,6 +577,17 @@ func sleepWithContext(ctx context.Context, delay time.Duration) {
 // (the inherited execution could never be reached), so it frees the slot instead
 // of recycling a healthy VM.
 var ErrJobTerminal = errors.New("broker: guest job reached terminal")
+
+// ErrDrainStalled marks a drain that gave up because its status stream went
+// silent past drainIdleTimeout with no terminal. The pool recycles the VM on
+// this error, tearing down the dead or stalled guest and re-warming clean rather
+// than hanging the slot forever.
+var ErrDrainStalled = errors.New("broker: guest status stream stalled")
+
+// errDrainIdle is the internal cancellation cause the idle watchdog attaches to
+// a drain attempt's context, so drainToTerminal can tell an idle-timeout from a
+// worker-shutdown or recycle cancel and return ErrDrainStalled.
+var errDrainIdle = errors.New("broker: guest status stream idle timeout")
 
 func terminalToError(terminal *guestproto.TerminalResult, execID string, vm *WarmVM) error {
 	if terminal.GetExitCode() == 0 {
