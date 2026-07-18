@@ -19,6 +19,11 @@ import (
 // loopback listener.
 const guestDialSubcommand = "guest-dial"
 
+// guestWriteSlotsSubcommand is the broker binary's subcommand, run inside the
+// guest via `tart exec` at warm, that writes the pool's slot count to the guest
+// slot-count file the supervisor reads at startup.
+const guestWriteSlotsSubcommand = "guest-write-slots"
+
 // guestClientAdapter adapts the concrete guestclient.Client to the guestConn
 // interface the binder depends on. It embeds the client so its already-wrapped
 // Hello, RunJob, Reattach, Drain, and CancelJob methods satisfy guestConn

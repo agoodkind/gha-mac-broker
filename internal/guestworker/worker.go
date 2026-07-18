@@ -437,26 +437,7 @@ func buildAgentHandler(cfg config, w *worker) http.Handler {
 		Reloader:          &agentReloader{worker: w},
 		InstallDir:        "",
 		UpdatePublicKey:   nil,
-		SlotConfigurer:    &supervisorSlotConfigurer{controlSocket: cfg.controlSocket},
 	})
-}
-
-// supervisorSlotConfigurer applies a host-requested slot count by asking the
-// durable supervisor over the control socket. The supervisor updates its slot
-// count and replaces the worker, so the new generation serves the new count.
-type supervisorSlotConfigurer struct {
-	controlSocket string
-}
-
-// ConfigureSlots forwards the requested count to the supervisor and returns the
-// applied count.
-func (c *supervisorSlotConfigurer) ConfigureSlots(ctx context.Context, slotCount uint32) (uint32, error) {
-	applied, err := guestsupervisor.ConfigureSlots(c.controlSocket, slotCount)
-	if err != nil {
-		slog.WarnContext(ctx, "guest worker configure slots failed", "slot_count", slotCount, "err", err)
-		return 0, fmt.Errorf("guestworker: configure slots: %w", err)
-	}
-	return applied, nil
 }
 
 // agentReloader adapts the worker's update trigger to the guest-agent

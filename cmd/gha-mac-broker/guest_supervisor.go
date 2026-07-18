@@ -12,12 +12,20 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/guestsupervisor"
 )
 
 const guestSupervisorSocketName = "gha-mac-broker-guest.sock"
+
+// slotCountAwaitTimeout bounds how long the supervisor waits at startup for the
+// host to seed the slot-count file at VM warm. The host seeds it shortly after
+// the guest exec channel answers, so this only has to cover the guest boot-to-
+// seed gap; on timeout the supervisor falls back to the -slots flag default so a
+// dev run or a never-seeded VM still serves.
+const slotCountAwaitTimeout = 180 * time.Second
 
 // runGuestSupervisor runs the durable guest-supervisor: it binds the Connect TCP
 // listener, then forks and supervises the swappable guest-worker, replacing the
@@ -47,6 +55,10 @@ func runGuestSupervisor(ctx context.Context, args []string) error {
 	if *slotCount > uint(^uint32(0)) {
 		return fmt.Errorf("guest-supervisor slot count %d exceeds uint32", *slotCount)
 	}
+	// The host seeds the pool's jobs_per_vm into the slot-count file at VM warm,
+	// so wait for it and serve that count for this guest's whole life. The -slots
+	// flag is only the fallback default for a dev run or a never-seeded VM.
+	slotCountValue := guestsupervisor.AwaitSlotCount(ctx, guestsupervisor.SlotCountPath, slotCountAwaitTimeout, uint32(*slotCount))
 	resolvedListenAddr := *listenAddr
 	if resolvedListenAddr == "" {
 		resolvedListenAddr = defaultGuestAgentListenAddr()
@@ -68,7 +80,7 @@ func runGuestSupervisor(ctx context.Context, args []string) error {
 		ControlSocketPath: *controlSocket,
 		Token:             token,
 		GoldenFingerprint: readGoldenFingerprint(ctx),
-		SlotCount:         uint32(*slotCount),
+		SlotCount:         slotCountValue,
 		WorkerCommand:     nil,
 		Log:               slog.Default(),
 	})
@@ -76,7 +88,7 @@ func runGuestSupervisor(ctx context.Context, args []string) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	slog.InfoContext(ctx, "guest supervisor starting", "addr", tcpListener.Addr().String(), "control_socket", *controlSocket)
+	slog.InfoContext(ctx, "guest supervisor starting", "addr", tcpListener.Addr().String(), "control_socket", *controlSocket, "slot_count", slotCountValue)
 	if err := supervisor.Run(ctx); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil

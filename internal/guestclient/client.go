@@ -62,23 +62,6 @@ func (client *Client) RunJob(
 	return response.Msg, nil
 }
 
-// ConfigureSlots asks the guest to serve slotCount execution slots and returns
-// the applied count and slot inventory.
-func (client *Client) ConfigureSlots(
-	ctx context.Context,
-	slotCount uint32,
-) (*guestproto.ConfigureSlotsResponse, error) {
-	response, err := client.service.ConfigureSlots(
-		ctx,
-		connect.NewRequest(&guestproto.ConfigureSlotsRequest{SlotCount: slotCount}),
-	)
-	if err != nil {
-		slog.WarnContext(ctx, "guestclient configure slots failed", "err", err, "slot_count", slotCount)
-		return nil, fmt.Errorf("guestclient configure slots: %w", err)
-	}
-	return response.Msg, nil
-}
-
 // JobStatus opens a status stream from the supplied resume cursor.
 func (client *Client) JobStatus(
 	ctx context.Context,

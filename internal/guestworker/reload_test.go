@@ -20,8 +20,18 @@ import (
 	"goodkind.io/gha-mac-broker/internal/guestclient"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
 	"goodkind.io/gha-mac-broker/internal/guestsupervisor"
+	"goodkind.io/gha-mac-broker/internal/guesttransport"
 	"goodkind.io/gha-mac-broker/internal/guestworker"
 )
+
+// tcpDialer adapts a TCP address to a guesttransport.GuestDialer so the guest
+// worker tests dial a real listener. Production dials over tart exec instead.
+func tcpDialer(address string) guesttransport.GuestDialer {
+	return func(ctx context.Context) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "tcp", address)
+	}
+}
 
 const (
 	workerMainEnv  = "GHA_GUEST_WORKER_TEST_MAIN"
