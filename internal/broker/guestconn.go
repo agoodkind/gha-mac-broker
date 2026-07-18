@@ -19,6 +19,11 @@ import (
 // loopback listener.
 const guestDialSubcommand = "guest-dial"
 
+// guestWriteSlotsSubcommand is the broker binary's subcommand, run inside the
+// guest via `tart exec` at warm, that writes the pool's slot count to the guest
+// slot-count file the supervisor reads at startup.
+const guestWriteSlotsSubcommand = "guest-write-slots"
+
 // guestClientAdapter adapts the concrete guestclient.Client to the guestConn
 // interface the binder depends on. It embeds the client so its already-wrapped
 // Hello, RunJob, Reattach, Drain, and CancelJob methods satisfy guestConn
@@ -77,8 +82,8 @@ func (b *Binder) resolveGuest(ctx context.Context, vm *WarmVM) (guestConn, error
 }
 
 // readGuestToken reads the per-boot guest token file over the tart-exec channel,
-// retrying within the readiness window because the supervisor writes it shortly
-// after the vsock channel comes up. The guest-supervisor runs as root and writes
+// retrying within the readiness window because the guest agent writes it shortly
+// after the vsock channel comes up. The guest agent runs as root and writes
 // the token file mode 0600, so tart-exec (which runs as the unprivileged admin
 // user) must read it through sudo; a plain cat gets permission denied and the
 // read would otherwise loop until the readiness deadline.

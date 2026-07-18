@@ -517,7 +517,7 @@ func TestProvisionLandsProvisionerViaDiscreteArgv(t *testing.T) {
 	}
 }
 
-func TestVerifyChecksFingerprintRunnerAndSupervisor(t *testing.T) {
+func TestVerifyChecksFingerprintRunnerAndGuestAgent(t *testing.T) {
 	s := &stubTart{provisionedFingerprint: "fpABC"}
 	b := New(s)
 	if err := b.verify(context.Background(), "gha-golden", "gha-golden-verify", "fpABC"); err != nil {
@@ -535,8 +535,8 @@ func TestVerifyChecksFingerprintRunnerAndSupervisor(t *testing.T) {
 	for _, want := range []string{
 		"test -f /Users/admin/actions-runner/run.sh",
 		"cat " + FingerprintPath,
-		"test -f " + GuestSupervisorPlistPath,
-		"launchctl print system/" + GuestSupervisorPlistLabel,
+		"test -f " + GuestAgentPlistPath,
+		"launchctl print system/" + GuestAgentPlistLabel,
 		"test ! -e " + LegacyWatchdogScriptPath,
 		"xcodebuild -version",
 	} {

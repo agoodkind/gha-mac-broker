@@ -13,8 +13,8 @@ import (
 
 // guestDialConnectTimeout bounds the loopback dial to the guest-agent listener.
 // The listener is a local socket in the same VM, so a healthy connect is
-// immediate; this only bounds the window while the guest-supervisor is still
-// binding after boot.
+// immediate; this only bounds the window while the guest agent is still binding
+// after boot.
 const guestDialConnectTimeout = 10 * time.Second
 
 // runGuestDial bridges the tart-exec stdio channel to the guest-agent's loopback

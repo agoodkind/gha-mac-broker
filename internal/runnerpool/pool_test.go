@@ -867,6 +867,46 @@ func TestReconfigureAppliesScalarsAndKeepsRunnerCountAndImage(t *testing.T) {
 	}
 }
 
+// TestReconfigureJobsPerVMRecyclesIdleVMAndRewarmsAtNewCount proves a jobs_per_vm
+// change recycles an idle VM whose slot count no longer matches and re-warms a
+// fresh one at the new count. This is how the pool applies a slot-count change
+// now that the guest slot count is fixed at warm rather than reconfigured live:
+// the existing shouldRecycle (slotCount != JobsPerVM) trigger tears the VM down
+// and the worker loop re-warms at the new JobsPerVM.
+func TestReconfigureJobsPerVMRecyclesIdleVMAndRewarmsAtNewCount(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newFakeRunner(1)
+	pool := New(testOptionsWithSlots(clock, 1, 1), warmer, runner, newFakeGitHub(), nil)
+	ctx := startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+
+	// The first VM warms at the original single slot.
+	waitFor(t, func() bool { return len(warmer.WarmSlotCounts()) == 1 })
+	firstVM := warmer.WarmNames()[0]
+	if got := warmer.WarmSlotCounts()[0]; got != 1 {
+		t.Fatalf("first warm slot count = %d, want 1", got)
+	}
+
+	// Raise jobs_per_vm to 2, so the idle VM's slot count no longer matches.
+	pool.Reconfigure(Options{JobsPerVM: 2})
+
+	if err := pool.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// The mismatched idle VM is torn down and a fresh one is warmed at two slots.
+	waitFor(t, func() bool { return len(warmer.WarmSlotCounts()) == 2 })
+	torn := warmer.TornNames()
+	if len(torn) != 1 || torn[0] != firstVM {
+		t.Fatalf("torn VMs = %v, want [%s]", torn, firstVM)
+	}
+	counts := warmer.WarmSlotCounts()
+	if counts[len(counts)-1] != 2 {
+		t.Fatalf("re-warm slot count = %d, want 2 at the new jobs_per_vm", counts[len(counts)-1])
+	}
+}
+
 func TestSlotRunJobPanicFreesSlot(t *testing.T) {
 	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
 	warmer := newFakeWarmer()

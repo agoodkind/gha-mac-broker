@@ -4,11 +4,7 @@ package guestagent
 
 import (
 	"context"
-	"crypto/ed25519"
-	"errors"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sync"
 
 	"connectrpc.com/connect"
@@ -19,35 +15,23 @@ import (
 )
 
 const (
-	protocolMajor            = uint32(1)
-	defaultAgentBuild        = "dev"
-	defaultSlotCount         = uint32(1)
-	capabilityRunJob         = "run-job"
-	capabilityReattach       = "reattach"
-	capabilityDrain          = "drain"
-	capabilityCancelJob      = "cancel-job"
-	capabilityUpdateAgent    = "update-agent"
-	capabilityConfigureSlots = "configure-slots"
+	protocolMajor       = uint32(1)
+	defaultAgentBuild   = "dev"
+	defaultSlotCount    = uint32(1)
+	capabilityRunJob    = "run-job"
+	capabilityReattach  = "reattach"
+	capabilityDrain     = "drain"
+	capabilityCancelJob = "cancel-job"
 )
 
 var processBootID = generateBootID()
 
-// ChildLauncher launches a runner outside the worker process and records it in
-// the worker's registry, returning the admission outcome. The guest-worker
-// supplies a supervisor-backed launcher so the durable supervisor stays the
-// runner's parent; when it is nil the handler forks in-process through the
-// registry, preserving the single-process guest-agent path.
+// ChildLauncher launches a runner and records it in the registry, returning the
+// admission outcome. It is a test seam: production leaves it nil so RunJob forks
+// the runner in-process through Registry.Start, and a test injects a launcher to
+// occupy a slot without forking a real process.
 type ChildLauncher interface {
 	Run(spec guestexec.ExecSpec) (guestexec.Outcome, error)
-}
-
-// SlotConfigurer applies a host-requested slot count. A worker cannot change its
-// own slot count, which is fixed at worker start, so the implementation asks the
-// durable supervisor to reconfigure and replace the worker. It returns the
-// applied count, or an error when the supervisor rejects the change (for example
-// a shrink below a running slot).
-type SlotConfigurer interface {
-	ConfigureSlots(ctx context.Context, slotCount uint32) (uint32, error)
 }
 
 // Options configures the guest-agent service.
@@ -61,24 +45,6 @@ type Options struct {
 	// RunJob. When nil the handler uses the production runner executor, which
 	// clones the runner, seeds the slot HOME, and sets the slot keychain.
 	SpecBuilder SpecBuilder
-	// Reloader triggers the in-VM worker reload onto a freshly placed binary
-	// after UpdateAgent verifies and installs it. When nil, UpdateAgent reports
-	// CodeUnimplemented, so a build without update wiring simply refuses updates.
-	Reloader AgentReloader
-	// InstallDir is the directory UpdateAgent streams the temp binary into and
-	// renames the versioned binary within. It must sit on the same filesystem as
-	// the running binary so the rename stays atomic. When empty it defaults to
-	// the directory holding the running executable.
-	InstallDir string
-	// UpdatePublicKey overrides the baked ed25519 public key UpdateAgent trusts
-	// for the detached signature. When nil the handler uses the compile-time
-	// baked key. Tests inject a known key here.
-	UpdatePublicKey ed25519.PublicKey
-	// SlotConfigurer applies a host-requested slot count by asking the supervisor
-	// to reconfigure and replace the worker. When nil, ConfigureSlots reports
-	// CodeUnimplemented, so a single-process guest-agent without a supervisor
-	// refuses slot reconfiguration.
-	SlotConfigurer SlotConfigurer
 }
 
 // Handler implements GuestAgentService over a guest execution registry.
@@ -90,11 +56,6 @@ type Handler struct {
 	goldenFingerprint string
 	childLauncher     ChildLauncher
 	specBuilder       SpecBuilder
-	reloader          AgentReloader
-	installDir        string
-	currentBinary     string
-	updatePublicKey   ed25519.PublicKey
-	slotConfigurer    SlotConfigurer
 	// slotLocksMu guards slotLocks; each slot lock serializes admission, per-slot
 	// prep, and start for one slot, so two concurrent RunJobs for the same slot
 	// cannot both run destructive prepareSlot before either records the execution.
@@ -131,18 +92,6 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 	if specBuilder == nil {
 		specBuilder = newRunnerExecutor()
 	}
-	currentBinary := ""
-	if executable, err := os.Executable(); err == nil {
-		currentBinary = executable
-	}
-	installDir := options.InstallDir
-	if installDir == "" && currentBinary != "" {
-		installDir = filepath.Dir(currentBinary)
-	}
-	updatePublicKey := options.UpdatePublicKey
-	if updatePublicKey == nil {
-		updatePublicKey = updateSigningPublicKey
-	}
 	return &Handler{
 		registry:          registry,
 		slotCount:         slotCount,
@@ -151,11 +100,6 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 		goldenFingerprint: options.GoldenFingerprint,
 		childLauncher:     options.ChildLauncher,
 		specBuilder:       specBuilder,
-		reloader:          options.Reloader,
-		installDir:        installDir,
-		currentBinary:     currentBinary,
-		updatePublicKey:   updatePublicKey,
-		slotConfigurer:    options.SlotConfigurer,
 		slotLocksMu:       sync.Mutex{},
 		slotLocks:         make(map[uint32]*sync.Mutex),
 	}
@@ -197,8 +141,6 @@ func (handler *Handler) Hello(
 			capabilityReattach,
 			capabilityDrain,
 			capabilityCancelJob,
-			capabilityUpdateAgent,
-			capabilityConfigureSlots,
 		},
 		Slots:             handler.slots(),
 		GoldenFingerprint: handler.goldenFingerprint,
@@ -255,9 +197,9 @@ func (handler *Handler) RunJob(
 	return connect.NewResponse(response), nil
 }
 
-// startExecution routes an execution to the supervisor-backed launcher when one
-// is configured, so the durable supervisor forks and waits the runner. Without a
-// launcher it forks in-process through the registry.
+// startExecution forks the runner in-process through the registry, which owns
+// the fork, the pipe read ends, and the waitpid loop. A test may inject a
+// ChildLauncher to record an execution without forking; production leaves it nil.
 func (handler *Handler) startExecution(spec guestexec.ExecSpec) (guestexec.Outcome, error) {
 	if handler.childLauncher != nil {
 		return handler.childLauncher.Run(spec)
@@ -335,40 +277,6 @@ func (handler *Handler) CancelJob(
 		return nil, mapRegistryError(err)
 	}
 	return connect.NewResponse(&guestproto.CancelJobResponse{}), nil
-}
-
-// ConfigureSlots applies a host-requested slot count. The worker's own slot
-// count is fixed at start, so the handler asks the supervisor to reconfigure and
-// replace the worker; a subsequent Hello (after the replacement is current)
-// advertises the applied slots. A shrink below a running slot is rejected as a
-// failed precondition, so the host leaves that VM as is rather than orphaning a
-// job.
-//
-// The returned slot_count and slots are the INTENDED (requested) inventory,
-// computed before the replacement worker is serving, not the currently-serving
-// set. The reload is asynchronous, so a consumer that needs the live inventory
-// must re-Hello; the host does. Do not trust the returned slots as live.
-func (handler *Handler) ConfigureSlots(
-	ctx context.Context,
-	request *connect.Request[guestproto.ConfigureSlotsRequest],
-) (*connect.Response[guestproto.ConfigureSlotsResponse], error) {
-	requested := request.Msg.GetSlotCount()
-	if requested == 0 {
-		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("guestagent: slot_count must be positive"))
-	}
-	if handler.slotConfigurer == nil {
-		return nil, connect.NewError(connect.CodeUnimplemented, errors.New("guestagent: slot reconfiguration unavailable"))
-	}
-	applied, err := handler.slotConfigurer.ConfigureSlots(ctx, requested)
-	if err != nil {
-		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
-	}
-	slots := make([]*guestproto.SlotInfo, 0, applied)
-	for slot := uint32(0); slot < applied; slot++ {
-		slots = append(slots, &guestproto.SlotInfo{Index: slot})
-	}
-	response := &guestproto.ConfigureSlotsResponse{SlotCount: applied, Slots: slots}
-	return connect.NewResponse(response), nil
 }
 
 func (handler *Handler) slots() []*guestproto.SlotInfo {

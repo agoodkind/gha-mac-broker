@@ -15,7 +15,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/gha-mac-broker</string>
-    <string>guest-supervisor</string>
+    <string>guest-agent</string>
   </array>
   <!-- The runner inherits this process's environment (guestexec mergedEnvironment
        merges os.Environ() with per-slot overrides), and a LaunchDaemon starts with

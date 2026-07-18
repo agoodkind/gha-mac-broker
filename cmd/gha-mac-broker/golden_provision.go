@@ -64,7 +64,7 @@ type provisionPaths struct {
 func defaultProvisionPaths(runnerDir string) provisionPaths {
 	return provisionPaths{
 		binaryDest:      golden.BakedBinaryPath,
-		plistDest:       golden.GuestSupervisorPlistPath,
+		plistDest:       golden.GuestAgentPlistPath,
 		fingerprintDest: golden.FingerprintPath,
 		watchdogScript:  golden.LegacyWatchdogScriptPath,
 		watchdogPlist:   golden.LegacyWatchdogPlistPath,
@@ -124,7 +124,7 @@ func runGoldenProvision(ctx context.Context, args []string) error {
 }
 
 // provisionGolden runs the provisioning steps in order: install the runner, bake
-// the guest binary and supervisor launchd unit, persist the fingerprint, and
+// the guest binary and guest-agent launchd unit, persist the fingerprint, and
 // delete the retired watchdog. Every file write is pure Go via os primitives; the
 // only external tools are xattr and codesign for the binary signature fixup.
 func provisionGolden(ctx context.Context, req provisionRequest) error {
@@ -134,9 +134,9 @@ func provisionGolden(ctx context.Context, req provisionRequest) error {
 	if err := installBakedBinary(ctx, req.binarySource, req.paths.binaryDest, req.sign); err != nil {
 		return err
 	}
-	if err := writeBakedFile(req.paths.plistDest, golden.GuestSupervisorPlist(), bakedFileMode); err != nil {
-		slog.ErrorContext(ctx, "write supervisor plist failed", "err", err, "dest", req.paths.plistDest)
-		return fmt.Errorf("golden-provision: write supervisor plist: %w", err)
+	if err := writeBakedFile(req.paths.plistDest, golden.GuestAgentPlist(), bakedFileMode); err != nil {
+		slog.ErrorContext(ctx, "write guest agent plist failed", "err", err, "dest", req.paths.plistDest)
+		return fmt.Errorf("golden-provision: write guest agent plist: %w", err)
 	}
 	if err := writeBakedFile(req.paths.fingerprintDest, []byte(req.fingerprint+"\n"), bakedFileMode); err != nil {
 		slog.ErrorContext(ctx, "write fingerprint failed", "err", err, "dest", req.paths.fingerprintDest)
@@ -461,7 +461,7 @@ func writeBakedFile(dest string, content []byte, mode os.FileMode) error {
 }
 
 // removeLegacyWatchdog deletes the retired watchdog script and its plist, so the
-// image never ships the old shell watchdog once the guest-supervisor unit owns
+// image never ships the old shell watchdog once the guest-agent unit owns
 // liveness. A missing file is not an error.
 func removeLegacyWatchdog(ctx context.Context, paths provisionPaths) error {
 	for _, path := range []string{paths.watchdogScript, paths.watchdogPlist} {

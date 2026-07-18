@@ -105,10 +105,6 @@ func (silentGuest) Drain(context.Context) (*guestproto.DrainResponse, error) {
 
 func (silentGuest) CancelJob(context.Context, string) error { return nil }
 
-func (silentGuest) ConfigureSlots(context.Context, uint32) (*guestproto.ConfigureSlotsResponse, error) {
-	return &guestproto.ConfigureSlotsResponse{}, nil
-}
-
 // TestDrainStreamIdleTimeoutCancelsAttempt proves the idle watchdog cancels the
 // attempt context with errDrainIdle when a stream stays silent past
 // drainIdleTimeout, so a dead connection cannot block the drain forever.
@@ -182,7 +178,6 @@ type stubGuest struct {
 	mu            sync.Mutex
 	hello         *guestproto.HelloResponse
 	helloErr      error
-	helloCalls    int
 	runResp       *guestproto.RunJobResponse
 	runErr        error
 	runRequests   []*guestproto.RunJobRequest
@@ -194,19 +189,6 @@ type stubGuest struct {
 	cancelErr     error
 	cancelCalls   []string
 	drainCalls    int
-	// configureErr, when set, makes ConfigureSlots fail, modeling a guest that
-	// cannot serve the requested count (for example a shrink below a busy slot).
-	configureErr error
-	// configureCalls records each requested slot count, so a test can assert the
-	// host asked the guest to grow before it gated on the inventory.
-	configureCalls []uint32
-	// grownSlots is set by a successful ConfigureSlots so a later default Hello
-	// advertises exactly that many slots, modeling a guest that grew its worker.
-	grownSlots uint32
-	// helloCallsAtConfigure records how many Hello calls preceded the first
-	// ConfigureSlots, so a test can prove ConfigureSlots ran before the gate.
-	helloCallsAtConfigure int
-	configuredOnce        bool
 }
 
 // defaultAdvertisedSlots is how many slots the stub's default Hello advertises,
@@ -215,18 +197,11 @@ const defaultAdvertisedSlots = 4
 
 func (g *stubGuest) Hello(_ context.Context) (*guestproto.HelloResponse, error) {
 	g.mu.Lock()
-	g.helloCalls++
-	grown := g.grownSlots
 	explicit := g.hello
 	helloErr := g.helloErr
 	g.mu.Unlock()
 	if helloErr != nil {
 		return nil, helloErr
-	}
-	// A guest that grew through ConfigureSlots advertises exactly the grown count,
-	// so the host gate sees the reconfigured inventory.
-	if grown > 0 {
-		return &guestproto.HelloResponse{ProtocolMajor: hostProtocolMajor, Slots: indexedSlots(grown)}, nil
 	}
 	if explicit != nil {
 		return explicit, nil
@@ -241,30 +216,6 @@ func indexedSlots(count uint32) []*guestproto.SlotInfo {
 		slots = append(slots, &guestproto.SlotInfo{Index: index})
 	}
 	return slots
-}
-
-func (g *stubGuest) ConfigureSlots(_ context.Context, slotCount uint32) (*guestproto.ConfigureSlotsResponse, error) {
-	g.mu.Lock()
-	g.configureCalls = append(g.configureCalls, slotCount)
-	if !g.configuredOnce {
-		g.helloCallsAtConfigure = g.helloCalls
-		g.configuredOnce = true
-	}
-	configureErr := g.configureErr
-	if configureErr == nil {
-		g.grownSlots = slotCount
-	}
-	g.mu.Unlock()
-	if configureErr != nil {
-		return nil, configureErr
-	}
-	return &guestproto.ConfigureSlotsResponse{SlotCount: slotCount, Slots: indexedSlots(slotCount)}, nil
-}
-
-func (g *stubGuest) configureRequests() []uint32 {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return append([]uint32(nil), g.configureCalls...)
 }
 
 func (g *stubGuest) RunJob(_ context.Context, request *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error) {
@@ -403,33 +354,6 @@ func TestRunJobNonzeroExitReturnsError(t *testing.T) {
 	}
 	if !errors.Is(err, ErrJobTerminal) {
 		t.Fatalf("RunJob error = %v, want wrapped ErrJobTerminal", err)
-	}
-}
-
-func TestVerifySlotInventoryRejectsMissingIndex(t *testing.T) {
-	binder := New(&config.Config{}, nil, tart.New("/nonexistent-tart"))
-	cases := map[string][]*guestproto.SlotInfo{
-		"sparse":    {{Index: 1}, {Index: 2}},
-		"duplicate": {{Index: 0}, {Index: 0}},
-	}
-	for name, slots := range cases {
-		t.Run(name, func(t *testing.T) {
-			guest := &stubGuest{hello: &guestproto.HelloResponse{ProtocolMajor: hostProtocolMajor, Slots: slots}}
-			if err := binder.verifySlotInventory(context.Background(), guest, "vm-x", 2); err == nil {
-				t.Fatalf("verifySlotInventory(%+v) = nil, want rejection for a missing configured index", slots)
-			}
-		})
-	}
-}
-
-func TestVerifySlotInventoryAcceptsAllIndicesPresent(t *testing.T) {
-	binder := New(&config.Config{}, nil, tart.New("/nonexistent-tart"))
-	guest := &stubGuest{hello: &guestproto.HelloResponse{
-		ProtocolMajor: hostProtocolMajor,
-		Slots:         []*guestproto.SlotInfo{{Index: 0}, {Index: 1}},
-	}}
-	if err := binder.verifySlotInventory(context.Background(), guest, "vm-x", 2); err != nil {
-		t.Fatalf("verifySlotInventory = %v, want nil when 0..1 are present", err)
 	}
 }
 
@@ -654,81 +578,6 @@ func TestAdoptMarksRunningExecutionSlotBusyWithResumeCursor(t *testing.T) {
 	}
 	if !slot.ObservedActive {
 		t.Fatalf("adopted slot observed active = false, want true")
-	}
-}
-
-func TestAdoptRejectsGuestThatCannotProvideSlots(t *testing.T) {
-	restore, restoreInterval := slotReconfigureTimeout, slotReconfigureInterval
-	slotReconfigureTimeout = 100 * time.Millisecond
-	slotReconfigureInterval = 10 * time.Millisecond
-	t.Cleanup(func() { slotReconfigureTimeout, slotReconfigureInterval = restore, restoreInterval })
-
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-tart")
-	writeListOnlyFakeTart(t, bin, `[{"Name":"pool-a-thin","State":"running"}]`)
-
-	// The guest boots with a single slot and cannot grow to the pool's two, so
-	// ConfigureSlots rejects it and adoption skips the VM.
-	guest := &stubGuest{
-		hello: &guestproto.HelloResponse{
-			ProtocolMajor: hostProtocolMajor,
-			Slots:         []*guestproto.SlotInfo{{Index: 0}},
-		},
-		configureErr: errors.New("guest cannot grow to two slots"),
-		reattach:     &guestproto.ReattachResponse{},
-	}
-	cfg := &config.Config{Tart: config.TartConfig{VMNamePrefix: "pool"}}
-	binder := New(cfg, nil, tart.New(bin))
-	binder.guestFor = func(_ context.Context, _ *WarmVM) (guestConn, error) {
-		return guest, nil
-	}
-	adopted, err := binder.Adopt(context.Background(), "image-a", 2, 2)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	if len(adopted) != 0 {
-		t.Fatalf("adopted = %+v, want none (guest cannot provide two slots)", adopted)
-	}
-	if got := guest.configureRequests(); len(got) != 1 || got[0] != 2 {
-		t.Fatalf("configure requests = %v, want a single request for 2 slots", got)
-	}
-}
-
-// TestEnsureSlotsGrowsGuestBeforeGate proves the host asks a fresh single-slot
-// guest to grow to the configured count before it gates on the slot inventory,
-// so a jobs_per_vm=2 bind succeeds against a guest that boots with one slot.
-func TestEnsureSlotsGrowsGuestBeforeGate(t *testing.T) {
-	guest := &stubGuest{
-		hello: &guestproto.HelloResponse{
-			ProtocolMajor: hostProtocolMajor,
-			Slots:         []*guestproto.SlotInfo{{Index: 0}},
-		},
-	}
-	binder := New(&config.Config{}, nil, tart.New("/nonexistent-tart"))
-	if err := binder.ensureSlots(context.Background(), guest, "vm-grow", 2); err != nil {
-		t.Fatalf("ensureSlots(2) = %v, want nil once the guest grows to two slots", err)
-	}
-	if got := guest.configureRequests(); len(got) != 1 || got[0] != 2 {
-		t.Fatalf("configure requests = %v, want a single request for 2 slots", got)
-	}
-	guest.mu.Lock()
-	helloBefore := guest.helloCallsAtConfigure
-	guest.mu.Unlock()
-	if helloBefore != 0 {
-		t.Fatalf("hello calls before ConfigureSlots = %d, want 0 (ConfigureSlots runs before the gate)", helloBefore)
-	}
-}
-
-// TestEnsureSlotsNoOpWhenAlreadyConfigured proves an already-configured guest is
-// a no-op grow: ConfigureSlots is idempotent and the gate passes.
-func TestEnsureSlotsNoOpWhenAlreadyConfigured(t *testing.T) {
-	guest := &stubGuest{}
-	binder := New(&config.Config{}, nil, tart.New("/nonexistent-tart"))
-	if err := binder.ensureSlots(context.Background(), guest, "vm-noop", 2); err != nil {
-		t.Fatalf("ensureSlots(2) = %v, want nil for an already-capable guest", err)
-	}
-	if got := guest.configureRequests(); len(got) != 1 || got[0] != 2 {
-		t.Fatalf("configure requests = %v, want a single request for 2 slots", got)
 	}
 }
 

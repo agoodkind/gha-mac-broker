@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,17 +62,6 @@ const drainReconnectBackoff = time.Second
 // is a var so tests can shorten it.
 var drainIdleTimeout = 45 * time.Second
 
-// slotReconfigureTimeout bounds the wait for a guest to serve the requested slot
-// count after ConfigureSlots. The guest applies the count by replacing its
-// worker, which is asynchronous, so the host re-Hellos until the inventory
-// covers every configured slot or this deadline elapses. It is a var so tests
-// can shorten it.
-var slotReconfigureTimeout = 30 * time.Second
-
-// slotReconfigureInterval paces the re-Hello poll while the guest worker
-// replacement completes.
-var slotReconfigureInterval = 500 * time.Millisecond
-
 // hostProtocolMajor is the guest-agent protocol version this host speaks. A
 // mismatch means the VM runs an incompatible agent and is skipped.
 const hostProtocolMajor = uint32(1)
@@ -94,7 +84,6 @@ type guestConn interface {
 	Reattach(ctx context.Context) (*guestproto.ReattachResponse, error)
 	Drain(ctx context.Context) (*guestproto.DrainResponse, error)
 	CancelJob(ctx context.Context, executionID string) error
-	ConfigureSlots(ctx context.Context, slotCount uint32) (*guestproto.ConfigureSlotsResponse, error)
 }
 
 // WarmVM is a booted VM whose guest agent answers Hello. Name is safe to read
@@ -223,20 +212,21 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 		return nil, err
 	}
 
-	vm := &WarmVM{Name: vmName, Image: image, boot: bootCmd, guestMu: sync.Mutex{}, guestConn: nil}
-	// Confirm the guest agent is up and cache its endpoint before serving. This
-	// replaces the old post-boot runner-slot clone as the readiness gate.
-	client, err := b.guestFor(ctx, vm)
-	if err != nil {
+	// Seed the pool's slot count into the guest before it serves. The guest
+	// supervisor waits for this file at startup, then spawns its single worker
+	// generation at that count and serves it for the VM's whole life. A
+	// jobs_per_vm change recycles the VM to a fresh one seeded with the new count.
+	if err := b.seedSlotCount(ctx, vmName, slotCount); err != nil {
 		_ = bootCmd.Process.Kill()
 		b.teardown(ctx, vmName)
 		return nil, err
 	}
-	// Ask the guest to serve the configured slot count, then reject it if the
-	// advertised inventory still does not cover every slot, so a later RunJob never
-	// targets a slot the guest does not have. A fresh guest boots with one slot and
-	// grows to the configured count here.
-	if err := b.ensureSlots(ctx, client, vmName, slotCount); err != nil {
+
+	vm := &WarmVM{Name: vmName, Image: image, boot: bootCmd, guestMu: sync.Mutex{}, guestConn: nil}
+	// Confirm the guest agent is up and cache its endpoint before serving. The
+	// guest answers Hello only after it reads the seeded slot count, so a
+	// successful resolve here means it is serving the configured slots.
+	if _, err := b.guestFor(ctx, vm); err != nil {
 		_ = bootCmd.Process.Kill()
 		b.teardown(ctx, vmName)
 		return nil, err
@@ -245,56 +235,14 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 	return vm, nil
 }
 
-// ensureSlots asks the guest to serve slotCount slots, then confirms the
-// advertised inventory covers them. A fresh guest booted with the default single
-// slot grows to slotCount; a guest a prior host already configured is a no-op.
-// The guest applies the count by replacing its worker, which is asynchronous, so
-// verifySlotInventory is re-Hello-polled until the new worker is current or the
-// deadline elapses. A guest that rejects the request (a shrink below a running
-// slot) surfaces the error here so the caller leaves the VM as is.
-func (b *Binder) ensureSlots(ctx context.Context, client guestConn, vmName string, slotCount int) error {
-	if _, err := client.ConfigureSlots(ctx, uint32(slotCount)); err != nil { // #nosec G115 -- slotCount is normalized to at least 1.
-		slog.WarnContext(ctx, "configure slots failed", "err", err, "vm", vmName, "slot_count", slotCount)
-		return fmt.Errorf("broker: configure %d slots on %s: %w", slotCount, vmName, err)
-	}
-	ctx, cancel := context.WithTimeout(ctx, slotReconfigureTimeout)
-	defer cancel()
-	ticker := time.NewTicker(slotReconfigureInterval)
-	defer ticker.Stop()
-	for {
-		err := b.verifySlotInventory(ctx, client, vmName, slotCount)
-		if err == nil {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return err
-		case <-ticker.C:
-		}
-	}
-}
-
-// verifySlotInventory rejects a guest whose advertised slot inventory does not
-// cover the configured slot count, so slots 0..slotCount-1 all exist before the
-// VM serves or is adopted.
-func (b *Binder) verifySlotInventory(ctx context.Context, client guestConn, vmName string, slotCount int) error {
-	response, err := client.Hello(ctx)
-	if err != nil {
-		slog.WarnContext(ctx, "slot inventory hello failed", "err", err, "vm", vmName)
-		return fmt.Errorf("broker: slot inventory hello on %s: %w", vmName, err)
-	}
-	advertised := make(map[uint32]struct{}, len(response.GetSlots()))
-	for _, slot := range response.GetSlots() {
-		advertised[slot.GetIndex()] = struct{}{}
-	}
-	// Require every configured index 0..slotCount-1 to be present, not just a
-	// matching count, so a sparse or duplicate inventory (say [1, 2] or [0, 0])
-	// cannot pass while host dispatch still targets a missing slot.
-	for slotIndex := range slotCount {
-		if _, ok := advertised[uint32(slotIndex)]; !ok { // #nosec G115 -- slot index is bounded and non-negative.
-			slog.WarnContext(ctx, "guest missing configured slot", "vm", vmName, "missing_slot", slotIndex, "advertised", len(advertised), "want", slotCount)
-			return fmt.Errorf("broker: guest %s missing slot %d of %d configured slots", vmName, slotIndex, slotCount)
-		}
+// seedSlotCount writes the pool's slot count into the guest's slot-count file
+// through a one-shot tart exec, so the guest supervisor reads it at startup and
+// serves that count for the VM's whole life. It runs after the exec channel is
+// ready and before the guest agent is expected to answer Hello.
+func (b *Binder) seedSlotCount(ctx context.Context, vmName string, slotCount int) error {
+	if _, err := b.vm.Exec(ctx, vmName, golden.BakedBinaryPath, guestWriteSlotsSubcommand, strconv.Itoa(slotCount)); err != nil {
+		slog.ErrorContext(ctx, "seed slot count failed", "err", err, "vm", vmName, "slot_count", slotCount)
+		return fmt.Errorf("broker: seed %d slots on %s: %w", slotCount, vmName, err)
 	}
 	return nil
 }
@@ -765,10 +713,6 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 		client, err := b.guestFor(ctx, vm)
 		if err != nil {
 			slog.WarnContext(ctx, "skip running vm adoption after guest resolve failure", "err", err, "vm", name)
-			continue
-		}
-		if err := b.ensureSlots(ctx, client, name, normalizedSlotCount); err != nil {
-			slog.WarnContext(ctx, "skip running vm adoption after slot inventory check", "err", err, "vm", name)
 			continue
 		}
 		// Bound each adoption Reattach so one unresponsive VM cannot block startup
