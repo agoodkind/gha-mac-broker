@@ -1542,3 +1542,31 @@ func TestRunnerNameBelongsToVMMatchesStaleSlotNameWithSingleSlot(t *testing.T) {
 		t.Fatal("stale slot runner name did not match single-slot VM name")
 	}
 }
+
+// TestNewJobDrainStallRecyclesVM proves a running job whose drain stalls (RunJob
+// returns broker.ErrDrainStalled) recycles its VM. The stalled VM is torn down
+// and a fresh one warmed, so a silent guest never strands the slot.
+func TestNewJobDrainStallRecyclesVM(t *testing.T) {
+	clock := newMutableClock(time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	warmer := newFakeWarmer()
+	runner := newBlockingRunner(1)
+	runner.runErr = broker.ErrDrainStalled
+	pool := New(testOptions(clock, 1), warmer, runner, newFakeGitHub(), nil)
+	ctx := startTestPool(t, pool)
+	waitFor(t, pool.Ready)
+	firstVM := warmer.WarmNames()[0]
+
+	if err := pool.Enqueue(ctx, Job{Repo: "owner/repo", JobID: 1001, RunID: 42}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	waitStarted(t, runner)
+	runner.Release()
+
+	waitFor(t, func() bool {
+		return len(warmer.WarmNames()) == 2
+	})
+	torn := warmer.TornNames()
+	if len(torn) != 1 || torn[0] != firstVM {
+		t.Fatalf("torn VMs after drain stall = %v, want [%s]", torn, firstVM)
+	}
+}

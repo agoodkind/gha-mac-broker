@@ -103,7 +103,7 @@ func (p *Pool) slotLoop(ctx context.Context, index int, slotIndex int, vm *broke
 			// a new job could dispatch onto a busy guest slot, so recycle the VM: it
 			// is torn down and re-warmed clean rather than serving new work here.
 			slog.WarnContext(ctx, "runnerpool resume job failed; recycling vm", "err", err, "vm", vm.Name, "slot", slotIndex, "execution", execID)
-			p.recycleWorkerAfterResumeFailure(index, slotIndex, vm, err)
+			p.recycleWorkerFreeingSlot(index, slotIndex, vm, err)
 			return
 		}
 	}
@@ -124,6 +124,13 @@ func (p *Pool) slotLoop(ctx context.Context, index int, slotIndex int, vm *broke
 		}()
 		if err != nil {
 			slog.WarnContext(ctx, "runnerpool job failed", "err", err, "repo", job.Repo, "job_id", job.JobID, "run_id", job.RunID, "vm", vm.Name, "slot", slotIndex)
+			if errors.Is(err, broker.ErrDrainStalled) {
+				// The guest status stream went silent with no terminal. Recycle the VM
+				// so the dead or wedged guest is torn down and re-warmed clean, rather
+				// than serving new work on a slot the host can no longer track.
+				p.recycleWorkerFreeingSlot(index, slotIndex, vm, err)
+				return
+			}
 		}
 	}
 }
@@ -156,12 +163,13 @@ func (p *Pool) claimResumeSlot(ctx context.Context, index int, slotIndex int, vm
 	return slot.executionID, slot.resumeCursor, jobCtx, cancel, len(state.slots), true
 }
 
-// recycleWorkerAfterResumeFailure frees the slot but marks the worker for
-// recycle, so an inherited execution that could not be resumed does not strand a
-// busy guest slot under a new job. Marking recycle stops waitForSlotJob from
-// dispatching new work, and the worker loop tears the VM down and re-warms clean
-// once its slots are idle.
-func (p *Pool) recycleWorkerAfterResumeFailure(index int, slotIndex int, vm *broker.WarmVM, err error) {
+// recycleWorkerFreeingSlot frees the slot and marks the worker for recycle, so a
+// guest slot the host can no longer track is not reused under a new job. This
+// covers an inherited execution that could not be resumed and a drain that
+// stalled with no terminal. Marking recycle stops waitForSlotJob from dispatching
+// new work, and the worker loop tears the VM down and re-warms clean once its
+// slots are idle.
+func (p *Pool) recycleWorkerFreeingSlot(index int, slotIndex int, vm *broker.WarmVM, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if index < 0 || index >= len(p.states) {

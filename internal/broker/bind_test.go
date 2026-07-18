@@ -42,6 +42,141 @@ func (s *stubStream) Msg() *guestproto.JobStatusEvent { return s.events[s.pos-1]
 func (s *stubStream) Err() error                      { return s.err }
 func (s *stubStream) Close() error                    { return nil }
 
+// blockingStream models a JobStatus stream that never delivers an event. Receive
+// blocks until done closes, matching how a real ConnectRPC server stream unblocks
+// Receive only when its client context is canceled.
+type blockingStream struct {
+	done <-chan struct{}
+}
+
+func (b *blockingStream) Receive() bool                   { <-b.done; return false }
+func (b *blockingStream) Msg() *guestproto.JobStatusEvent { return nil }
+func (b *blockingStream) Err() error                      { return nil }
+func (b *blockingStream) Close() error                    { return nil }
+
+// tickStream emits ticks empty (non-terminal) events spaced interval apart, then
+// ends. An empty event carries no log and no result, matching a heartbeat that
+// only proves the stream is alive, so it exercises the idle-watchdog reset.
+type tickStream struct {
+	interval time.Duration
+	ticks    int
+	sent     int
+}
+
+func (s *tickStream) Receive() bool {
+	if s.sent >= s.ticks {
+		return false
+	}
+	time.Sleep(s.interval)
+	s.sent++
+	return true
+}
+
+func (s *tickStream) Msg() *guestproto.JobStatusEvent {
+	return &guestproto.JobStatusEvent{Sequence: uint64(s.sent)}
+}
+func (s *tickStream) Err() error   { return nil }
+func (s *tickStream) Close() error { return nil }
+
+// silentGuest is a guestConn whose JobStatus opens a stream that never emits an
+// event. It binds the stream to the caller context, so the drain idle watchdog
+// canceling that context unblocks Receive exactly as the real client does.
+type silentGuest struct{}
+
+func (silentGuest) Hello(context.Context) (*guestproto.HelloResponse, error) {
+	return &guestproto.HelloResponse{ProtocolMajor: hostProtocolMajor}, nil
+}
+
+func (silentGuest) RunJob(context.Context, *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error) {
+	return &guestproto.RunJobResponse{}, nil
+}
+
+func (silentGuest) JobStatus(ctx context.Context, _ string, _ uint64) (jobStatusStream, error) {
+	return &blockingStream{done: ctx.Done()}, nil
+}
+
+func (silentGuest) Reattach(context.Context) (*guestproto.ReattachResponse, error) {
+	return &guestproto.ReattachResponse{}, nil
+}
+
+func (silentGuest) Drain(context.Context) (*guestproto.DrainResponse, error) {
+	return &guestproto.DrainResponse{Idle: true}, nil
+}
+
+func (silentGuest) CancelJob(context.Context, string) error { return nil }
+
+func (silentGuest) ConfigureSlots(context.Context, uint32) (*guestproto.ConfigureSlotsResponse, error) {
+	return &guestproto.ConfigureSlotsResponse{}, nil
+}
+
+// TestDrainStreamIdleTimeoutCancelsAttempt proves the idle watchdog cancels the
+// attempt context with errDrainIdle when a stream stays silent past
+// drainIdleTimeout, so a dead connection cannot block the drain forever.
+func TestDrainStreamIdleTimeoutCancelsAttempt(t *testing.T) {
+	restore := drainIdleTimeout
+	drainIdleTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { drainIdleTimeout = restore })
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	cursor := uint64(0)
+	terminal, _ := drainStream(ctx, cancel, &blockingStream{done: ctx.Done()}, nil, &cursor)
+	if terminal != nil {
+		t.Fatalf("terminal = %v, want nil", terminal)
+	}
+	if !errors.Is(context.Cause(ctx), errDrainIdle) {
+		t.Fatalf("cause = %v, want errDrainIdle", context.Cause(ctx))
+	}
+}
+
+// TestDrainStreamHeartbeatsResetIdleWatchdog proves a stream delivering regular
+// events faster than drainIdleTimeout never trips the watchdog, so a healthy
+// long-running job with 10s heartbeats is never killed by mistake.
+func TestDrainStreamHeartbeatsResetIdleWatchdog(t *testing.T) {
+	restore := drainIdleTimeout
+	drainIdleTimeout = 60 * time.Millisecond
+	t.Cleanup(func() { drainIdleTimeout = restore })
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	cursor := uint64(0)
+	// Six ticks 20ms apart span 120ms, twice drainIdleTimeout, so the watchdog
+	// only stays quiet if every tick resets it.
+	terminal, err := drainStream(ctx, cancel, &tickStream{interval: 20 * time.Millisecond, ticks: 6}, nil, &cursor)
+	if terminal != nil {
+		t.Fatalf("terminal = %v, want nil", terminal)
+	}
+	if err != nil {
+		t.Fatalf("err = %v, want nil for a natural stream end", err)
+	}
+	if errors.Is(context.Cause(ctx), errDrainIdle) {
+		t.Fatal("idle watchdog tripped despite regular events")
+	}
+}
+
+// TestDrainToTerminalReturnsErrDrainStalledOnSilentStream proves a silent stream
+// makes the drain give up with ErrDrainStalled rather than block or reconnect
+// forever, so the pool can recycle the VM.
+func TestDrainToTerminalReturnsErrDrainStalledOnSilentStream(t *testing.T) {
+	restore := drainIdleTimeout
+	drainIdleTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { drainIdleTimeout = restore })
+
+	binder := &Binder{}
+	vm := &WarmVM{Name: "vm-stall"}
+	cursor := uint64(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	canceled, err := binder.drainToTerminal(ctx, silentGuest{}, "exec-1", vm, nil, &cursor)
+	if canceled {
+		t.Fatal("canceled = true, want false; an idle timeout is not a parent cancel")
+	}
+	if !errors.Is(err, ErrDrainStalled) {
+		t.Fatalf("err = %v, want ErrDrainStalled", err)
+	}
+}
+
 // stubGuest is a scripted guestConn for host-side unit tests.
 type stubGuest struct {
 	mu            sync.Mutex
