@@ -157,7 +157,7 @@ func TestBuildEnvIsolatesSlotHomeTmpAndGit(t *testing.T) {
 	}
 }
 
-func TestBuildPreparesSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
+func TestBuildProvisionsSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
 	baseHome := t.TempDir()
 	writeGoldenRunner(t, baseHome)
 	// Two present warm caches and one absent, so seeding is by presence.
@@ -216,6 +216,68 @@ func TestBuildPreparesSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
 	}
 	if !sawDefaultKeychain {
 		t.Fatalf("security commands = %+v, want default-keychain set to the slot keychain", securityCommands)
+	}
+}
+
+func TestBuildProvisionsSlotOnceAcrossJobs(t *testing.T) {
+	baseHome := t.TempDir()
+	writeGoldenRunner(t, baseHome)
+	executor, stub := newTestExecutor(t, baseHome)
+	request := JobRequest{ExecutionID: "exec-10", Slot: 4, JitConfig: "jit"}
+
+	if _, err := executor.Build(context.Background(), request); err != nil {
+		t.Fatalf("first Build: %v", err)
+	}
+	firstCPCount := stub.count("cp")
+	firstSecurityCount := stub.count("security")
+	if firstCPCount == 0 || firstSecurityCount == 0 {
+		t.Fatalf(
+			"first Build command counts: cp = %d, security = %d, want provisioning commands",
+			firstCPCount,
+			firstSecurityCount,
+		)
+	}
+
+	request.ExecutionID = "exec-11"
+	if _, err := executor.Build(context.Background(), request); err != nil {
+		t.Fatalf("second Build: %v", err)
+	}
+	if got := stub.count("cp"); got != firstCPCount {
+		t.Fatalf("cp invocations after second Build = %d, want %d", got, firstCPCount)
+	}
+	if got := stub.count("security"); got != firstSecurityCount {
+		t.Fatalf("security invocations after second Build = %d, want %d", got, firstSecurityCount)
+	}
+}
+
+func TestBuildPreservesPopulatedSlotHomeAcrossJobs(t *testing.T) {
+	baseHome := t.TempDir()
+	writeGoldenRunner(t, baseHome)
+	executor, _ := newTestExecutor(t, baseHome)
+	request := JobRequest{ExecutionID: "exec-12", Slot: 5, JitConfig: "jit"}
+
+	if _, err := executor.Build(context.Background(), request); err != nil {
+		t.Fatalf("first Build: %v", err)
+	}
+	slotFile := filepath.Join(executor.slotHome(request.Slot), "job-cache", "state")
+	if err := os.MkdirAll(filepath.Dir(slotFile), 0o700); err != nil {
+		t.Fatalf("create populated slot home: %v", err)
+	}
+	const wantState = "persisted across jobs\n"
+	if err := os.WriteFile(slotFile, []byte(wantState), 0o600); err != nil {
+		t.Fatalf("populate slot home: %v", err)
+	}
+
+	request.ExecutionID = "exec-13"
+	if _, err := executor.Build(context.Background(), request); err != nil {
+		t.Fatalf("second Build: %v", err)
+	}
+	gotState, err := os.ReadFile(slotFile)
+	if err != nil {
+		t.Fatalf("read populated slot home after second Build: %v", err)
+	}
+	if string(gotState) != wantState {
+		t.Fatalf("slot home state = %q, want %q", gotState, wantState)
 	}
 }
 
