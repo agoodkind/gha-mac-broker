@@ -475,3 +475,70 @@ func TestListInstalledReposReadsAppInstallations(t *testing.T) {
 		t.Fatalf("repos = %v, want %v", repos, want)
 	}
 }
+
+func TestCancelActiveRunsForHeadSHACancelsOnlyActiveRuns(t *testing.T) {
+	pemKey, _ := testKeyPEM(t)
+	const headSHA = "abc123def456"
+	var cancelled []string
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/installation":
+			_ = json.NewEncoder(w).Encode(installationResponse{ID: 999})
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/999/access_tokens":
+			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "ghs_installationtoken"})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/actions/runs":
+			if got := r.URL.Query().Get("head_sha"); got != headSHA {
+				t.Errorf("head_sha query = %q, want %q", got, headSHA)
+			}
+			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
+				t.Errorf("runs list must use installation token, got %q", got)
+			}
+			_ = json.NewEncoder(w).Encode(runsByHeadResponse{
+				TotalCount: 3,
+				WorkflowRuns: []struct {
+					ID     int64  `json:"id"`
+					Status string `json:"status"`
+				}{
+					{ID: 321, Status: "in_progress"},
+					{ID: 322, Status: "queued"},
+					{ID: 999, Status: "completed"},
+				},
+			})
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/repos/agoodkind/lmd/actions/runs/") && strings.HasSuffix(r.URL.Path, "/cancel"):
+			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
+				t.Errorf("cancel must use installation token, got %q", got)
+			}
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/repos/agoodkind/lmd/actions/runs/"), "/cancel")
+			cancelled = append(cancelled, id)
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	})
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, r)
+			return recorder.Result(), nil
+		}),
+	}
+
+	client, err := New("12345", pemKey, WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client.apiBase = "https://api.github.test"
+
+	count, err := client.CancelActiveRunsForHeadSHA(context.Background(), "agoodkind/lmd", headSHA)
+	if err != nil {
+		t.Fatalf("CancelActiveRunsForHeadSHA: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("cancelled count = %d, want 2", count)
+	}
+	if strings.Join(cancelled, ",") != "321,322" {
+		t.Fatalf("cancelled runs = %v, want [321 322]; the completed run 999 must be skipped", cancelled)
+	}
+}
