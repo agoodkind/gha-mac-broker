@@ -483,11 +483,15 @@ func codesignAdhoc(ctx context.Context, path string) error {
 	xattrCmd := exec.CommandContext(ctx, "xattr", "-c", path)
 	if out, err := xattrCmd.CombinedOutput(); err != nil {
 		slog.WarnContext(ctx, "xattr clear returned nonzero; continuing", "err", err, "path", path, "output", strings.TrimSpace(string(out)))
+	} else {
+		slog.DebugContext(ctx, "xattr command output", "path", path, "output", strings.TrimSpace(string(out)))
 	}
 	signCmd := exec.CommandContext(ctx, "codesign", "-s", "-", "-f", path)
-	if out, err := signCmd.CombinedOutput(); err != nil {
+	out, err := signCmd.CombinedOutput()
+	if err != nil {
 		slog.ErrorContext(ctx, "codesign failed", "err", err, "path", path, "output", strings.TrimSpace(string(out)))
 		return fmt.Errorf("golden-provision: codesign %s: %w: %s", path, err, strings.TrimSpace(string(out)))
 	}
+	slog.DebugContext(ctx, "codesign command output", "path", path, "output", strings.TrimSpace(string(out)))
 	return nil
 }

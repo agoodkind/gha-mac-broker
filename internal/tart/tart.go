@@ -14,13 +14,17 @@ import (
 	"log/slog"
 	"net"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-const maxTeeTailBytes = 64 * 1024
+const (
+	maxTeeTailBytes  = 64 * 1024
+	redactedLogValue = "[redacted]"
+)
 
 // Per-operation deadlines bound the short-lived tart calls so a wedged
 // subprocess cannot block a caller forever. They are generous relative to real
@@ -73,12 +77,14 @@ func New(bin string) *Tart {
 // the caller's context cancellation tears the boot down. detachedCommand is the
 // deliberately detached path for warm VMs that outlive broker cancellation.
 func command(ctx context.Context, bin string, args ...string) *exec.Cmd {
-	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", strings.Join(args, " "))
+	loggedArgs, _ := tartCommandLogValues(args, nil)
+	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", loggedArgs)
 	return exec.CommandContext(ctx, bin, args...)
 }
 
 func detachedCommand(ctx context.Context, bin string, args ...string) *exec.Cmd {
-	slog.DebugContext(ctx, "tart detached command built", "bin", bin, "args", strings.Join(args, " "))
+	loggedArgs, _ := tartCommandLogValues(args, nil)
+	slog.DebugContext(ctx, "tart detached command built", "bin", bin, "args", loggedArgs)
 	// The detached tart run is the VM's long-lived hypervisor process, so it must
 	// survive broker context cancellation and carry no wall-clock ceiling. It dies
 	// only at teardown (Process.Kill plus tart stop and delete); a boot that never
@@ -140,15 +146,19 @@ func runProcessGroup(ctx context.Context, cmd *exec.Cmd) error {
 }
 
 func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error) {
-	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", strings.Join(args, " "))
+	loggedArgs, _ := tartCommandLogValues(args, nil)
+	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", loggedArgs)
 	cmd := exec.CommandContext(ctx, bin, args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := runProcessGroup(ctx, cmd); err != nil {
-		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", strings.Join(args, " "))
+		loggedArgs, loggedOutput := tartCommandLogValues(args, out.Bytes())
+		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", loggedArgs, "output", loggedOutput)
 		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out.String()))
 	}
+	loggedArgs, loggedOutput := tartCommandLogValues(args, out.Bytes())
+	slog.DebugContext(ctx, "tart command output", "args", loggedArgs, "output", loggedOutput)
 	return out.Bytes(), nil
 }
 
@@ -186,7 +196,8 @@ func (b *tailBuffer) Bytes() []byte {
 }
 
 func execRunnerTee(ctx context.Context, bin string, sink io.Writer, args ...string) ([]byte, error) {
-	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", strings.Join(args, " "))
+	loggedArgs, _ := tartCommandLogValues(args, nil)
+	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", loggedArgs)
 	cmd := exec.CommandContext(ctx, bin, args...)
 	out := newTailBuffer(maxTeeTailBytes)
 	writer := io.Writer(out)
@@ -196,11 +207,78 @@ func execRunnerTee(ctx context.Context, bin string, sink io.Writer, args ...stri
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 	if err := runProcessGroup(ctx, cmd); err != nil {
-		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", strings.Join(args, " "))
+		loggedArgs, loggedOutput := tartCommandLogValues(args, out.Bytes())
+		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", loggedArgs, "output", loggedOutput)
 		tail := string(out.Bytes())
 		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(tail))
 	}
+	loggedArgs, loggedOutput := tartCommandLogValues(args, out.Bytes())
+	slog.DebugContext(ctx, "tart command output", "args", loggedArgs, "output", loggedOutput)
 	return out.Bytes(), nil
+}
+
+func tartCommandLogValues(args []string, output []byte) (string, string) {
+	loggedArgs := strings.Join(args, " ")
+	loggedOutput := strings.TrimSpace(string(output))
+	redactArgs, redactOutput := tartCommandRedaction(args)
+	if redactArgs {
+		loggedArgs = redactedLogValue
+	}
+	if redactOutput {
+		loggedOutput = redactedLogValue
+	}
+	return loggedArgs, loggedOutput
+}
+
+func tartCommandRedaction(args []string) (bool, bool) {
+	if tartArgsContainSensitiveValue(args) {
+		return true, true
+	}
+	securityArgs := nestedSecurityArgs(args)
+	if !securityArgsContainSecret(securityArgs) {
+		return false, false
+	}
+	return true, !securityOutputIsDiagnostic(securityArgs)
+}
+
+func tartArgsContainSensitiveValue(args []string) bool {
+	for _, arg := range args {
+		lower := strings.ToLower(arg)
+		if strings.Contains(lower, "jitconfig") || strings.Contains(lower, "base64") ||
+			strings.Contains(lower, "p12") || strings.Contains(lower, "token") {
+			return true
+		}
+	}
+	return false
+}
+
+func nestedSecurityArgs(args []string) []string {
+	for index, arg := range args {
+		if filepath.Base(arg) == "security" {
+			return args[index+1:]
+		}
+	}
+	return nil
+}
+
+func securityArgsContainSecret(args []string) bool {
+	for _, arg := range args {
+		if arg == "import" || arg == "-P" || arg == "-p" {
+			return true
+		}
+	}
+	return false
+}
+
+func securityOutputIsDiagnostic(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	command := args[0]
+	return command == "create-keychain" || command == "default-keychain" ||
+		command == "list-keychains" || command == "unlock-keychain" ||
+		command == "set-keychain-settings" || command == "show-keychain-info" ||
+		command == "find-identity"
 }
 
 // listEntry is the subset of one `tart list --format json` record the broker
