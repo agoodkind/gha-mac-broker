@@ -90,15 +90,90 @@ type combinedOutputRunner interface {
 	CombinedOutput() ([]byte, error)
 }
 
-var commandRunner = func(ctx context.Context, name string, args ...string) combinedOutputRunner {
-	return command(ctx, name, args...)
+var commandRunner = command
+
+type loggedCombinedOutputRunner struct {
+	logResult func(output []byte, err error)
+	run       func() combinedOutputResult
 }
 
-// command builds an [exec.Cmd] for an external tool. Centralizing construction
+type combinedOutputResult struct {
+	output []byte
+	err    error
+}
+
+// command builds a logged runner for an external tool. Centralizing construction
 // keeps the single audited exec call site in one place.
-func command(ctx context.Context, name string, args ...string) *exec.Cmd {
-	slog.DebugContext(ctx, "install command built", "name", name, "args", strings.Join(args, " "))
-	return exec.CommandContext(ctx, name, args...)
+func command(ctx context.Context, name string, args ...string) combinedOutputRunner {
+	loggedArgs, _ := installCommandLogValues(name, args, nil)
+	slog.DebugContext(ctx, "install command built", "name", name, "args", loggedArgs)
+	cmd := exec.CommandContext(ctx, name, args...)
+	return &loggedCombinedOutputRunner{
+		logResult: func(output []byte, err error) {
+			loggedArgs, loggedOutput := installCommandLogValues(name, args, output)
+			if err != nil {
+				slog.ErrorContext(ctx, "install command failed", "name", name, "args", loggedArgs, "output", loggedOutput, "err", err)
+			} else {
+				slog.DebugContext(ctx, "install command output", "name", name, "args", loggedArgs, "output", loggedOutput)
+			}
+		},
+		run: func() combinedOutputResult {
+			output, err := cmd.CombinedOutput()
+			return combinedOutputResult{output: output, err: err}
+		},
+	}
+}
+
+func (r *loggedCombinedOutputRunner) CombinedOutput() ([]byte, error) {
+	result := r.run()
+	r.logResult(result.output, result.err)
+	return result.output, result.err
+}
+
+func installCommandLogValues(name string, args []string, output []byte) (string, string) {
+	loggedArgs := strings.Join(args, " ")
+	loggedOutput := strings.TrimSpace(string(output))
+	redactArgs, redactOutput := installCommandRedaction(name, args)
+	if redactArgs {
+		loggedArgs = "[redacted]"
+	}
+	if redactOutput {
+		loggedOutput = "[redacted]"
+	}
+	return loggedArgs, loggedOutput
+}
+
+func installCommandRedaction(name string, args []string) (bool, bool) {
+	for _, arg := range args {
+		lower := strings.ToLower(arg)
+		if strings.Contains(lower, "jitconfig") || strings.Contains(lower, "base64") ||
+			strings.Contains(lower, "p12") || strings.Contains(lower, "token") {
+			return true, true
+		}
+	}
+	if name != "security" {
+		return false, false
+	}
+	containsSecret := false
+	for _, arg := range args {
+		if arg == "import" || arg == "-P" || arg == "-p" {
+			containsSecret = true
+			break
+		}
+	}
+	if !containsSecret {
+		return false, false
+	}
+	if len(args) > 0 {
+		command := args[0]
+		if command == "create-keychain" || command == "default-keychain" ||
+			command == "list-keychains" || command == "unlock-keychain" ||
+			command == "set-keychain-settings" || command == "show-keychain-info" ||
+			command == "find-identity" {
+			return true, false
+		}
+	}
+	return true, true
 }
 
 func requireHostBinary(ctx context.Context, binary string, installHint string) error {
