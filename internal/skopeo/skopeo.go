@@ -17,7 +17,10 @@ import (
 // created with a non-positive value. ghcr throttles each connection, so more
 // concurrent streams raise the cold-pull rate above the containers/image
 // default of 6.
-const defaultParallelCopies = 16
+const (
+	defaultParallelCopies = 16
+	redactedLogValue      = "[redacted]"
+)
 
 // CommandRunner runs `skopeo <args...>` and returns combined output. It is a
 // field so tests can stub the CLI.
@@ -47,7 +50,8 @@ func New(bin string, parallelCopies int) *Client {
 // command builds an [exec.Cmd] for the skopeo binary. Centralizing construction
 // keeps the single audited exec call site in one place.
 func command(ctx context.Context, bin string, args ...string) *exec.Cmd {
-	slog.DebugContext(ctx, "skopeo command built", "bin", bin, "args", strings.Join(args, " "))
+	loggedArgs, _ := skopeoCommandLogValues(args, nil)
+	slog.DebugContext(ctx, "skopeo command built", "bin", bin, "args", loggedArgs)
 	return exec.CommandContext(ctx, bin, args...)
 }
 
@@ -57,10 +61,26 @@ func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error)
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		slog.ErrorContext(ctx, "skopeo command failed", "err", err, "args", strings.Join(args, " "))
+		loggedArgs, loggedOutput := skopeoCommandLogValues(args, out.Bytes())
+		slog.ErrorContext(ctx, "skopeo command failed", "err", err, "args", loggedArgs, "output", loggedOutput)
 		return out.Bytes(), fmt.Errorf("skopeo %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out.String()))
 	}
+	loggedArgs, loggedOutput := skopeoCommandLogValues(args, out.Bytes())
+	slog.DebugContext(ctx, "skopeo command output", "args", loggedArgs, "output", loggedOutput)
 	return out.Bytes(), nil
+}
+
+func skopeoCommandLogValues(args []string, output []byte) (string, string) {
+	loggedArgs := strings.Join(args, " ")
+	loggedOutput := strings.TrimSpace(string(output))
+	for _, arg := range args {
+		lower := strings.ToLower(arg)
+		if strings.Contains(lower, "jitconfig") || strings.Contains(lower, "base64") ||
+			strings.Contains(lower, "p12") || strings.Contains(lower, "token") {
+			return redactedLogValue, redactedLogValue
+		}
+	}
+	return loggedArgs, loggedOutput
 }
 
 // CopyToOCILayout copies srcImageRef into layoutDir as an OCI layout tagged with

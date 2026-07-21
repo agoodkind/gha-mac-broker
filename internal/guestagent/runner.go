@@ -36,7 +36,8 @@ const (
 	// slotDirPerm is the private mode for per-slot runner, tmp, and cache dirs.
 	slotDirPerm = 0o700
 	// markerFilePerm is the mode for the brew boot-refresh marker file.
-	markerFilePerm = 0o644
+	markerFilePerm   = 0o644
+	redactedLogValue = "[redacted]"
 )
 
 // warmCachePaths are the by-presence caches seeded into each slot's isolated
@@ -327,8 +328,10 @@ func (e *runnerExecutor) userKeychains(ctx context.Context, slotKeychain string,
 // runTool runs a system tool for a labeled slot-setup step, logging and wrapping
 // any failure so a co-tenant setup problem surfaces loudly.
 func (e *runnerExecutor) runTool(ctx context.Context, step string, name string, args []string, env map[string]string) error {
-	if _, err := e.runCommand(ctx, name, args, env); err != nil {
-		slog.WarnContext(ctx, "guest slot setup step failed", "step", step, "err", err)
+	output, err := e.runCommand(ctx, name, args, env)
+	if err != nil {
+		_, loggedOutput := guestCommandLogValues(name, args, output)
+		slog.WarnContext(ctx, "guest slot setup step failed", "step", step, "err", err, "output", loggedOutput)
 		return fmt.Errorf("guestagent: %s: %w", step, err)
 	}
 	return nil
@@ -458,13 +461,74 @@ func sleepWithContext(ctx context.Context) {
 // runSystemCommand runs name with args, layering env overrides over the process
 // environment, and returns the combined output so the caller can inspect it.
 func runSystemCommand(ctx context.Context, name string, args []string, envOverrides map[string]string) (string, error) {
-	slog.DebugContext(ctx, "guest system command built", "command", name, "args", strings.Join(args, " "))
+	loggedArgs, _ := guestCommandLogValues(name, args, "")
+	slog.DebugContext(ctx, "guest system command built", "command", name, "args", loggedArgs)
 	command := exec.CommandContext(ctx, name, args...)
 	if len(envOverrides) > 0 {
 		command.Env = envWithOverrides(os.Environ(), envOverrides)
 	}
 	output, err := command.CombinedOutput()
+	loggedArgs, loggedOutput := guestCommandLogValues(name, args, string(output))
+	if err != nil {
+		slog.WarnContext(ctx, "guest command output", "command", name, "args", loggedArgs, "output", loggedOutput, "err", err)
+	} else {
+		slog.DebugContext(ctx, "guest command output", "command", name, "args", loggedArgs, "output", loggedOutput)
+	}
 	return string(output), err
+}
+
+func guestCommandLogValues(name string, args []string, output string) (string, string) {
+	loggedArgs := strings.Join(args, " ")
+	loggedOutput := strings.TrimSpace(output)
+	redactArgs, redactOutput := guestCommandRedaction(name, args)
+	if redactArgs {
+		loggedArgs = redactedLogValue
+	}
+	if redactOutput {
+		loggedOutput = redactedLogValue
+	}
+	return loggedArgs, loggedOutput
+}
+
+func guestCommandRedaction(name string, args []string) (bool, bool) {
+	if argsContainSensitiveValue(args) {
+		return true, true
+	}
+	if filepath.Base(name) != "security" || !securityArgsContainSecret(args) {
+		return false, false
+	}
+	return true, !securityOutputIsDiagnostic(args)
+}
+
+func argsContainSensitiveValue(args []string) bool {
+	for _, arg := range args {
+		lower := strings.ToLower(arg)
+		if strings.Contains(lower, "jitconfig") || strings.Contains(lower, "base64") ||
+			strings.Contains(lower, "p12") || strings.Contains(lower, "token") {
+			return true
+		}
+	}
+	return false
+}
+
+func securityArgsContainSecret(args []string) bool {
+	for _, arg := range args {
+		if arg == "import" || arg == "-P" || arg == "-p" {
+			return true
+		}
+	}
+	return false
+}
+
+func securityOutputIsDiagnostic(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	command := args[0]
+	return command == "create-keychain" || command == "default-keychain" ||
+		command == "list-keychains" || command == "unlock-keychain" ||
+		command == "set-keychain-settings" || command == "show-keychain-info" ||
+		command == "find-identity"
 }
 
 // envWithOverrides appends sorted key=value overrides to base so the later
