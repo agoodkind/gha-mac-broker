@@ -84,9 +84,9 @@ type SpecBuilder interface {
 type commandFunc func(ctx context.Context, name string, args []string, envOverrides map[string]string) (string, error)
 
 // runnerExecutor ports the two guest shell scripts to Go. It refreshes Homebrew
-// once per boot, prepares a slot's isolated runner directory, TMPDIR, cache
-// seeded HOME, and default login keychain, then builds the ExecSpec that
-// launches run.sh --jitconfig for that slot with an absolute command.
+// once per boot, provisions a slot's isolated runner directory, TMPDIR, cache
+// seeded HOME, and default login keychain on first use, then builds the ExecSpec
+// that launches run.sh --jitconfig for that slot with an absolute command.
 type runnerExecutor struct {
 	baseHome   string
 	markerPath string
@@ -97,7 +97,9 @@ type runnerExecutor struct {
 	// the context is cancelled.
 	sleep func(ctx context.Context)
 
-	clearMarkerOnce sync.Once
+	clearMarkerOnce    sync.Once
+	provisionedSlotsMu sync.Mutex
+	provisionedSlots   map[uint32]bool
 }
 
 var _ SpecBuilder = (*runnerExecutor)(nil)
@@ -113,19 +115,20 @@ func newRunnerExecutor() *runnerExecutor {
 		}
 	}
 	return &runnerExecutor{
-		baseHome:        baseHome,
-		markerPath:      brewBootRefreshMarker,
-		runCommand:      runSystemCommand,
-		lookBrew:        brewOnPath,
-		sleep:           sleepWithContext,
-		clearMarkerOnce: sync.Once{},
+		baseHome:         baseHome,
+		markerPath:       brewBootRefreshMarker,
+		runCommand:       runSystemCommand,
+		lookBrew:         brewOnPath,
+		sleep:            sleepWithContext,
+		clearMarkerOnce:  sync.Once{},
+		provisionedSlots: make(map[uint32]bool),
 	}
 }
 
-// Build refreshes Homebrew, prepares the slot, and returns the ExecSpec that
-// launches the slot's runner. The command is the absolute run.sh path so the
-// registry accepts it, and the environment carries the per-slot HOME, TMPDIR,
-// and git isolation the runner needs.
+// Build refreshes Homebrew, provisions the slot on first use, and returns the
+// ExecSpec that launches the slot's runner. The command is the absolute run.sh
+// path so the registry accepts it, and the environment carries the per-slot
+// HOME, TMPDIR, and git isolation the runner needs.
 func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestexec.ExecSpec, error) {
 	if e.baseHome == "" {
 		err := fmt.Errorf("guestagent: base home is empty")
@@ -133,7 +136,7 @@ func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestex
 		return guestexec.ExecSpec{}, err
 	}
 	e.ensureHomebrewRefreshed(ctx)
-	if err := e.prepareSlot(ctx, request.Slot); err != nil {
+	if err := e.ensureSlotProvisioned(ctx, request.Slot); err != nil {
 		return guestexec.ExecSpec{}, err
 	}
 	runnerHome := e.runnerHome(request.Slot)
@@ -181,10 +184,30 @@ func (e *runnerExecutor) runnerEnv(slot uint32, callerEnv map[string]string) map
 	return env
 }
 
-// prepareSlot rebuilds the slot's runner directory, tmp directory, cache seeded
-// HOME, and default keychain. It removes the prior slot state first so a reused
-// slot gets a pristine runner and an ephemeral JIT registration.
-func (e *runnerExecutor) prepareSlot(ctx context.Context, slot uint32) error {
+// ensureSlotProvisioned provisions a slot once and records it only after a
+// successful setup, so a failed first attempt retries on the next build.
+func (e *runnerExecutor) ensureSlotProvisioned(ctx context.Context, slot uint32) error {
+	e.provisionedSlotsMu.Lock()
+	provisioned := e.provisionedSlots[slot]
+	e.provisionedSlotsMu.Unlock()
+	if provisioned {
+		return nil
+	}
+	if err := e.provisionSlot(ctx, slot); err != nil {
+		return err
+	}
+	e.provisionedSlotsMu.Lock()
+	if e.provisionedSlots == nil {
+		e.provisionedSlots = make(map[uint32]bool)
+	}
+	e.provisionedSlots[slot] = true
+	e.provisionedSlotsMu.Unlock()
+	return nil
+}
+
+// provisionSlot rebuilds the broker-owned runner and tmp directories, then
+// creates the cache-seeded HOME only when it does not already exist.
+func (e *runnerExecutor) provisionSlot(ctx context.Context, slot uint32) error {
 	runnerHome := e.runnerHome(slot)
 	tmpDir := e.tmpDir(slot)
 	slotHome := e.slotHome(slot)
@@ -202,8 +225,14 @@ func (e *runnerExecutor) prepareSlot(ctx context.Context, slot uint32) error {
 	if err := e.makeDir(ctx, "tmp dir", tmpDir); err != nil {
 		return err
 	}
-	if err := e.seedSlotHome(ctx, slotHome); err != nil {
-		return err
+	if _, err := os.Stat(slotHome); err != nil {
+		if !os.IsNotExist(err) {
+			slog.ErrorContext(ctx, "guest slot home stat failed", "path", slotHome, "err", err)
+			return fmt.Errorf("guestagent: stat slot home %q: %w", slotHome, err)
+		}
+		if err := e.seedSlotHome(ctx, slotHome); err != nil {
+			return err
+		}
 	}
 	// Keychain setup is best effort: a failure warns and the job then fails on
 	// signing as it does today, rather than aborting the whole job here.
@@ -213,13 +242,10 @@ func (e *runnerExecutor) prepareSlot(ctx context.Context, slot uint32) error {
 	return nil
 }
 
-// seedSlotHome rebuilds the slot's isolated HOME and seeds each present warm
+// seedSlotHome creates the slot's isolated HOME and seeds each present warm
 // cache via an APFS clone, falling back to a real copy when clonefile is
 // unavailable. Seeding by presence keeps co-tenant slots isolated yet warm.
 func (e *runnerExecutor) seedSlotHome(ctx context.Context, slotHome string) error {
-	if err := e.removeDir(ctx, "slot home", slotHome); err != nil {
-		return err
-	}
 	if err := e.makeDir(ctx, "slot home", slotHome); err != nil {
 		return err
 	}
