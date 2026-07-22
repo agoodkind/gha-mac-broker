@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -101,16 +103,41 @@ func TestBuildProducesAbsoluteRunnerSpecForSlot(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	wantCommand := filepath.Join(baseHome, "actions-runner-1", "run.sh")
+	wantCommand := "/usr/bin/sudo"
 	if spec.Command != wantCommand {
 		t.Fatalf("spec.Command = %q, want %q", spec.Command, wantCommand)
 	}
 	if !filepath.IsAbs(spec.Command) {
 		t.Fatalf("spec.Command = %q, want absolute path", spec.Command)
 	}
-	wantArgs := []string{"--jitconfig", "encoded-jit"}
-	if len(spec.Args) != len(wantArgs) || spec.Args[0] != wantArgs[0] || spec.Args[1] != wantArgs[1] {
-		t.Fatalf("spec.Args = %v, want %v", spec.Args, wantArgs)
+	currentUser, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current: %v", err)
+	}
+	wantArgsPrefix := []string{
+		"-n",
+		"/bin/launchctl",
+		"asuser",
+		strconv.Itoa(os.Getuid()),
+		"/usr/bin/sudo",
+		"-n",
+		"-u",
+		currentUser.Username,
+		"/usr/bin/env",
+	}
+	wantArgsSuffix := []string{
+		filepath.Join(baseHome, "actions-runner-1", "run.sh"),
+		"--jitconfig",
+		"encoded-jit",
+	}
+	if len(spec.Args) < len(wantArgsPrefix)+len(wantArgsSuffix) {
+		t.Fatalf("spec.Args = %v, want wrapped runner arguments", spec.Args)
+	}
+	if !slices.Equal(spec.Args[:len(wantArgsPrefix)], wantArgsPrefix) {
+		t.Fatalf("spec.Args prefix = %v, want %v", spec.Args[:len(wantArgsPrefix)], wantArgsPrefix)
+	}
+	if !slices.Equal(spec.Args[len(spec.Args)-len(wantArgsSuffix):], wantArgsSuffix) {
+		t.Fatalf("spec.Args suffix = %v, want %v", spec.Args[len(spec.Args)-len(wantArgsSuffix):], wantArgsSuffix)
 	}
 	wantWorkingDir := filepath.Join(baseHome, "actions-runner-1")
 	if spec.WorkingDir != wantWorkingDir {
@@ -155,6 +182,23 @@ func TestBuildEnvIsolatesSlotHomeTmpAndGit(t *testing.T) {
 		if got != want {
 			t.Fatalf("spec.Env[%q] = %q, want %q", key, got, want)
 		}
+	}
+	wantEnvArgs := []string{
+		"FOO=bar",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=credential.helper",
+		"GIT_CONFIG_VALUE_0=",
+		"GIT_TERMINAL_PROMPT=0",
+		"HOME=" + filepath.Join(baseHome, "slot-home-2"),
+		"TMPDIR=" + filepath.Join(baseHome, "tmp-2"),
+	}
+	runnerArgIndex := len(spec.Args) - 3
+	if runnerArgIndex < len(wantEnvArgs) {
+		t.Fatalf("spec.Args = %v, want explicit runner environment", spec.Args)
+	}
+	gotEnvArgs := spec.Args[runnerArgIndex-len(wantEnvArgs) : runnerArgIndex]
+	if !slices.Equal(gotEnvArgs, wantEnvArgs) {
+		t.Fatalf("runner env args = %v, want %v", gotEnvArgs, wantEnvArgs)
 	}
 }
 
