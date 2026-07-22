@@ -73,7 +73,7 @@ func serveDaemon(ctx context.Context, configPath string) error {
 	}
 	hostedTracker := hostedload.NewTracker()
 	sampler := newHostStatsSampler(cfg, p)
-	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, hostedTracker, sampler)
+	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, hostedTracker, sampler, server.WithRunCanceller(gh))
 
 	listener, err := listenTCP(ctx, cfg.ListenAddr)
 	if err != nil {

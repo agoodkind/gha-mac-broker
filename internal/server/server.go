@@ -37,18 +37,40 @@ type statsProvider interface {
 	Latest() hoststats.Sample
 }
 
+// runCanceller cancels the GitHub workflow runs a closed pull request leaves in
+// flight. *ghapp.Client satisfies it. It is nil when no GitHub client is wired,
+// in which case a pull_request close is acknowledged and no cancellation runs.
+type runCanceller interface {
+	CancelActiveRunsForHeadSHA(ctx context.Context, repo, headSHA string) (int, error)
+}
+
 type webhookAction string
 
 const (
 	webhookActionQueued     webhookAction = "queued"
 	webhookActionInProgress webhookAction = "in_progress"
 	webhookActionCompleted  webhookAction = "completed"
+	// webhookActionClosed is the pull_request action for both a merge and a plain
+	// close. GitHub never cancels a pull request's in-flight runs on either, so the
+	// broker cancels them itself (see handlePullRequestClose).
+	webhookActionClosed webhookAction = "closed"
 )
+
+// githubEventHeader names the webhook event, so the handler can tell a
+// pull_request delivery from a workflow_job delivery even though both carry an
+// action field. A workflow_job delivery leaves this unmatched and keeps the
+// existing action switch.
+// The canonical MIME form is "X-Github-Event"; net/http canonicalizes header keys
+// on parse and lookup, so this matches GitHub's "X-GitHub-Event" delivery header.
+const githubEventHeader = "X-Github-Event"
+
+const eventPullRequest = "pull_request"
 
 type webhookPayload struct {
 	Action      webhookAction   `json:"action"`
 	Repository  webhookRepo     `json:"repository"`
 	WorkflowJob webhookJobField `json:"workflow_job"`
+	PullRequest webhookPRField  `json:"pull_request"`
 }
 
 type webhookRepo struct {
@@ -63,6 +85,15 @@ type webhookJobField struct {
 	Conclusion string   `json:"conclusion"`
 	RunnerName string   `json:"runner_name"`
 	RunnerID   int64    `json:"runner_id"`
+}
+
+// webhookPRField is the subset of a pull_request payload the broker reads to find
+// the run a closed pull request left in flight.
+type webhookPRField struct {
+	Number int `json:"number"`
+	Head   struct {
+		SHA string `json:"sha"`
+	} `json:"head"`
 }
 
 type capacityResponse struct {
@@ -87,6 +118,17 @@ type Server struct {
 	pool          pooler
 	hostedTracker *hostedload.Tracker
 	stats         statsProvider
+	runs          runCanceller
+}
+
+// Option configures a Server built by New.
+type Option func(*Server)
+
+// WithRunCanceller wires the GitHub run canceller used to cancel a pull request's
+// in-flight runs when it merges or closes. Without it, a pull_request close is
+// acknowledged and no run is cancelled.
+func WithRunCanceller(rc runCanceller) Option {
+	return func(s *Server) { s.runs = rc }
 }
 
 type serverConfig struct {
@@ -97,7 +139,7 @@ type serverConfig struct {
 }
 
 // New builds a Server and registers its routes on an internal mux.
-func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler, hostedTracker *hostedload.Tracker, stats statsProvider) *Server {
+func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler, hostedTracker *hostedload.Tracker, stats statsProvider, opts ...Option) *Server {
 	s := &Server{
 		mux:           http.NewServeMux(),
 		mu:            sync.RWMutex{},
@@ -108,6 +150,10 @@ func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCID
 		pool:          p,
 		hostedTracker: hostedTracker,
 		stats:         stats,
+		runs:          nil,
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	s.mux.HandleFunc("/webhook", s.handleWebhook)
 	s.mux.HandleFunc("/capacity", s.handleCapacity)
@@ -149,7 +195,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// handleWebhook processes GitHub workflow_job webhook deliveries.
+// handleWebhook processes GitHub workflow_job and pull_request webhook
+// deliveries.
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -170,6 +217,10 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	if r.Header.Get(githubEventHeader) == eventPullRequest {
+		s.handlePullRequestClose(w, r, payload)
+		return
+	}
 	switch payload.Action {
 	case webhookActionQueued:
 		s.dispatchJob(w, r, payload, liveConfig)
@@ -186,9 +237,50 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			s.pool.CancelRun(payload.WorkflowJob.ID)
 		}
 		w.WriteHeader(http.StatusNoContent)
+	case webhookActionClosed:
+		// A pull_request close is handled above via the event header and returns
+		// before this switch. A workflow_job delivery never carries this action, so
+		// reaching here is a no-op.
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// handlePullRequestClose cancels the CI runs a pull request leaves in flight when
+// it merges or closes. GitHub cancels an in-progress run only when a newer run
+// enters the same concurrency group, which a merge or close never does, so an
+// admin-merged pull request otherwise keeps its gates running and its pool slot
+// held. Selecting runs by the pull request head sha never touches the merge
+// commit's run on the default branch, which carries a different sha. The work is
+// best-effort: any failure is logged and the webhook still returns 204 so GitHub
+// does not retry a partial cancel.
+func (s *Server) handlePullRequestClose(w http.ResponseWriter, r *http.Request, payload webhookPayload) {
+	ctx := r.Context()
+	if payload.Action != webhookActionClosed {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	repo := payload.Repository.FullName
+	headSHA := payload.PullRequest.Head.SHA
+	if repo == "" || headSHA == "" {
+		slog.WarnContext(ctx, "pull_request closed webhook missing repo or head sha", "repo", repo, "pr", payload.PullRequest.Number)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if s.runs == nil {
+		slog.WarnContext(ctx, "pull_request closed but no run canceller wired; skipping", "repo", repo, "pr", payload.PullRequest.Number)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	cancelled, err := s.runs.CancelActiveRunsForHeadSHA(ctx, repo, headSHA)
+	if err != nil {
+		slog.WarnContext(ctx, "cancel in-flight runs for closed pull request failed", "err", err, "repo", repo, "pr", payload.PullRequest.Number, "head_sha", headSHA)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	slog.InfoContext(ctx, "cancelled in-flight runs for closed pull request", "repo", repo, "pr", payload.PullRequest.Number, "head_sha", headSHA, "cancelled", cancelled)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request, liveConfig serverConfig) ([]byte, bool) {

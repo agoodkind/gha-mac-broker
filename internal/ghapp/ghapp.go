@@ -360,6 +360,16 @@ type inProgressRunsResponse struct {
 	} `json:"workflow_runs"`
 }
 
+// runsByHeadResponse is the relevant subset of
+// GET /repos/{owner}/{repo}/actions/runs?head_sha={sha}.
+type runsByHeadResponse struct {
+	TotalCount   int `json:"total_count"`
+	WorkflowRuns []struct {
+		ID     int64  `json:"id"`
+		Status string `json:"status"`
+	} `json:"workflow_runs"`
+}
+
 // runJobsResponse is the relevant subset of
 // GET /repos/{owner}/{repo}/actions/runs/{runID}/jobs.
 type runJobsResponse struct {
@@ -422,6 +432,65 @@ func (c *Client) CancelRun(ctx context.Context, repo string, runID int64) error 
 		return fmt.Errorf("ghapp: cancel run %s#%d: %w", repo, runID, err)
 	}
 	return nil
+}
+
+// CancelActiveRunsForHeadSHA cancels every workflow run in repo whose head commit
+// is headSHA and that is still queued or in progress, and returns how many it
+// cancelled. GitHub does not cancel a pull request's in-flight runs when it merges
+// or closes, so the broker calls this on a pull_request close to free any pool
+// slot and stop orphaned gates. Selecting by head sha never touches the merge
+// commit's run on the default branch, which carries a different sha. A failure to
+// cancel one run is logged and skipped so the remaining runs are still cancelled.
+func (c *Client) CancelActiveRunsForHeadSHA(ctx context.Context, repo, headSHA string) (int, error) {
+	owner, repoName, token, err := c.repoToken(ctx, repo)
+	if err != nil {
+		slog.ErrorContext(ctx, "ghapp prepare cancel runs for head sha failed", "err", err, "repo", repo, "head_sha", headSHA)
+		return 0, fmt.Errorf("ghapp: prepare cancel runs for %s@%s: %w", repo, headSHA, err)
+	}
+	runIDs, err := c.listActiveRunIDsForHeadSHA(ctx, owner, repoName, token, headSHA)
+	if err != nil {
+		return 0, err
+	}
+	cancelled := 0
+	for _, runID := range runIDs {
+		path := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/cancel", owner, repoName, runID)
+		if _, err := c.do(ctx, http.MethodPost, path, "token "+token, nil); err != nil {
+			slog.WarnContext(ctx, "ghapp cancel run for head sha failed", "err", err, "repo", repo, "run_id", runID, "head_sha", headSHA)
+			continue
+		}
+		cancelled++
+	}
+	return cancelled, nil
+}
+
+// listActiveRunIDsForHeadSHA returns the ids of workflow runs on headSHA that are
+// still queued or in progress, following pagination until the reported total is
+// reached. The head sha is a hex commit id, so it needs no query escaping.
+func (c *Client) listActiveRunIDsForHeadSHA(ctx context.Context, owner, repoName, token, headSHA string) ([]int64, error) {
+	var runIDs []int64
+	fetched := 0
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/repos/%s/%s/actions/runs?head_sha=%s&per_page=%d&page=%d", owner, repoName, headSHA, actionsListPageSize, page)
+		body, err := c.do(ctx, http.MethodGet, path, "token "+token, nil)
+		if err != nil {
+			slog.ErrorContext(ctx, "ghapp runs-by-head list failed", "err", err, "repo", owner+"/"+repoName, "head_sha", headSHA, "page", page)
+			return nil, fmt.Errorf("ghapp: list runs for %s/%s head %s page %d: %w", owner, repoName, headSHA, page, err)
+		}
+		var out runsByHeadResponse
+		if err := json.Unmarshal(body, &out); err != nil {
+			slog.ErrorContext(ctx, "ghapp decode runs-by-head failed", "err", err, "repo", owner+"/"+repoName, "head_sha", headSHA, "page", page)
+			return nil, fmt.Errorf("ghapp: decode runs for %s/%s head %s page %d: %w", owner, repoName, headSHA, page, err)
+		}
+		for _, run := range out.WorkflowRuns {
+			if run.Status == "queued" || run.Status == "in_progress" {
+				runIDs = append(runIDs, run.ID)
+			}
+		}
+		fetched += len(out.WorkflowRuns)
+		if len(out.WorkflowRuns) == 0 || fetched >= out.TotalCount {
+			return runIDs, nil
+		}
+	}
 }
 
 // ListRunners lists the repository runners registered for repo.

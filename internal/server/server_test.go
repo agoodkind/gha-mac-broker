@@ -748,3 +748,127 @@ func TestHealthz(t *testing.T) {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
 }
+
+type cancelCall struct {
+	repo    string
+	headSHA string
+}
+
+type fakeRunCanceller struct {
+	mu        sync.Mutex
+	calls     []cancelCall
+	cancelled int
+	err       error
+}
+
+func (f *fakeRunCanceller) CancelActiveRunsForHeadSHA(_ context.Context, repo, headSHA string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, cancelCall{repo: repo, headSHA: headSHA})
+	if f.err != nil {
+		return 0, f.err
+	}
+	return f.cancelled, nil
+}
+
+func (f *fakeRunCanceller) Calls() []cancelCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]cancelCall(nil), f.calls...)
+}
+
+func pullRequestBody(action string, repo string, headSHA string, number int) []byte {
+	payload := webhookPayload{
+		Action:     webhookAction(action),
+		Repository: webhookRepo{FullName: repo},
+	}
+	payload.PullRequest.Number = number
+	payload.PullRequest.Head.SHA = headSHA
+	body, _ := json.Marshal(payload)
+	return body
+}
+
+func postPullRequestWebhook(t *testing.T, srv *Server, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", signBody(body))
+	req.Header.Set("X-Github-Event", "pull_request")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	return w
+}
+
+func TestPullRequestClosedCancelsRunsForHeadSHA(t *testing.T) {
+	rc := &fakeRunCanceller{cancelled: 2}
+	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil, WithRunCanceller(rc))
+	w := postPullRequestWebhook(t, srv, pullRequestBody("closed", "agoodkind/lmd", "abc123", 42))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+	calls := rc.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("cancel calls = %d, want 1", len(calls))
+	}
+	if calls[0].repo != "agoodkind/lmd" || calls[0].headSHA != "abc123" {
+		t.Fatalf("cancel call = %+v, want repo agoodkind/lmd head abc123", calls[0])
+	}
+}
+
+func TestPullRequestNonClosedActionDoesNotCancel(t *testing.T) {
+	rc := &fakeRunCanceller{}
+	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil, WithRunCanceller(rc))
+	w := postPullRequestWebhook(t, srv, pullRequestBody("opened", "agoodkind/lmd", "abc123", 42))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+	if got := len(rc.Calls()); got != 0 {
+		t.Fatalf("cancel calls = %d, want 0 for a non-closed action", got)
+	}
+}
+
+func TestPullRequestClosedWithoutHeadSHADoesNotCancel(t *testing.T) {
+	rc := &fakeRunCanceller{}
+	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil, WithRunCanceller(rc))
+	w := postPullRequestWebhook(t, srv, pullRequestBody("closed", "agoodkind/lmd", "", 42))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+	if got := len(rc.Calls()); got != 0 {
+		t.Fatalf("cancel calls = %d, want 0 when head sha is missing", got)
+	}
+}
+
+func TestPullRequestClosedWithoutCancellerReturns204(t *testing.T) {
+	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil)
+	w := postPullRequestWebhook(t, srv, pullRequestBody("closed", "agoodkind/lmd", "abc123", 42))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+}
+
+func TestPullRequestClosedCancellerErrorStillReturns204(t *testing.T) {
+	rc := &fakeRunCanceller{err: errors.New("github unavailable")}
+	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil, WithRunCanceller(rc))
+	w := postPullRequestWebhook(t, srv, pullRequestBody("closed", "agoodkind/lmd", "abc123", 42))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d (cancellation is best-effort)", w.Code, http.StatusNoContent)
+	}
+	if got := len(rc.Calls()); got != 1 {
+		t.Fatalf("cancel calls = %d, want 1", got)
+	}
+}
+
+func TestWorkflowJobWebhookIgnoresPullRequestPath(t *testing.T) {
+	rc := &fakeRunCanceller{}
+	pool := &testPool{}
+	srv := New(testSecret, newTestConfig(), nil, nil, pool, hostedload.NewTracker(), nil, WithRunCanceller(rc))
+	// A workflow_job delivery carries no X-Github-Event: pull_request header, so it
+	// keeps the existing action switch and never calls the run canceller.
+	w := postWebhook(t, srv, webhookBody("queued", "owner/repo", []string{"self-hosted", "macOS"}, 42))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusAccepted)
+	}
+	if got := len(rc.Calls()); got != 0 {
+		t.Fatalf("cancel calls = %d, want 0 for a workflow_job delivery", got)
+	}
+}
