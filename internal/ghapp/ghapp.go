@@ -452,20 +452,27 @@ func (c *Client) CancelActiveRunsForHeadSHA(ctx context.Context, repo, headSHA s
 		return 0, err
 	}
 	cancelled := 0
+	failed := 0
 	for _, runID := range runIDs {
 		path := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/cancel", owner, repoName, runID)
 		if _, err := c.do(ctx, http.MethodPost, path, "token "+token, nil); err != nil {
 			slog.WarnContext(ctx, "ghapp cancel run for head sha failed", "err", err, "repo", repo, "run_id", runID, "head_sha", headSHA)
+			failed++
 			continue
 		}
 		cancelled++
 	}
+	if failed > 0 {
+		return cancelled, fmt.Errorf("ghapp: cancel runs for %s@%s: %d of %d cancels failed", repo, headSHA, failed, len(runIDs))
+	}
 	return cancelled, nil
 }
 
-// listActiveRunIDsForHeadSHA returns the ids of workflow runs on headSHA that are
-// still queued or in progress, following pagination until the reported total is
-// reached. The head sha is a hex commit id, so it needs no query escaping.
+// listActiveRunIDsForHeadSHA returns the ids of workflow runs on headSHA that have
+// not completed, which covers queued, in_progress, requested, waiting, and
+// pending, so an approval-gated or not-yet-started run on a closed pull request is
+// still cancelled. It follows pagination until the reported total is reached. The
+// head sha is a hex commit id, so it needs no query escaping.
 func (c *Client) listActiveRunIDsForHeadSHA(ctx context.Context, owner, repoName, token, headSHA string) ([]int64, error) {
 	var runIDs []int64
 	fetched := 0
@@ -482,7 +489,7 @@ func (c *Client) listActiveRunIDsForHeadSHA(ctx context.Context, owner, repoName
 			return nil, fmt.Errorf("ghapp: decode runs for %s/%s head %s page %d: %w", owner, repoName, headSHA, page, err)
 		}
 		for _, run := range out.WorkflowRuns {
-			if run.Status == "queued" || run.Status == "in_progress" {
+			if run.Status != "completed" {
 				runIDs = append(runIDs, run.ID)
 			}
 		}

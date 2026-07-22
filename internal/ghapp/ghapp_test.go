@@ -495,13 +495,15 @@ func TestCancelActiveRunsForHeadSHACancelsOnlyActiveRuns(t *testing.T) {
 				t.Errorf("runs list must use installation token, got %q", got)
 			}
 			_ = json.NewEncoder(w).Encode(runsByHeadResponse{
-				TotalCount: 3,
+				TotalCount: 5,
 				WorkflowRuns: []struct {
 					ID     int64  `json:"id"`
 					Status string `json:"status"`
 				}{
 					{ID: 321, Status: "in_progress"},
 					{ID: 322, Status: "queued"},
+					{ID: 323, Status: "requested"},
+					{ID: 324, Status: "waiting"},
 					{ID: 999, Status: "completed"},
 				},
 			})
@@ -535,10 +537,65 @@ func TestCancelActiveRunsForHeadSHACancelsOnlyActiveRuns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CancelActiveRunsForHeadSHA: %v", err)
 	}
-	if count != 2 {
-		t.Fatalf("cancelled count = %d, want 2", count)
+	if count != 4 {
+		t.Fatalf("cancelled count = %d, want 4", count)
 	}
-	if strings.Join(cancelled, ",") != "321,322" {
-		t.Fatalf("cancelled runs = %v, want [321 322]; the completed run 999 must be skipped", cancelled)
+	// queued, in_progress, requested, and waiting are all non-completed and must be
+	// cancelled; the completed run 999 must be skipped.
+	if strings.Join(cancelled, ",") != "321,322,323,324" {
+		t.Fatalf("cancelled runs = %v, want [321 322 323 324]; the completed run 999 must be skipped", cancelled)
+	}
+}
+
+func TestCancelActiveRunsForHeadSHAReturnsErrorWhenACancelFails(t *testing.T) {
+	pemKey, _ := testKeyPEM(t)
+	const headSHA = "abc123def456"
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/installation":
+			_ = json.NewEncoder(w).Encode(installationResponse{ID: 999})
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/999/access_tokens":
+			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "ghs_installationtoken"})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/actions/runs":
+			_ = json.NewEncoder(w).Encode(runsByHeadResponse{
+				TotalCount: 2,
+				WorkflowRuns: []struct {
+					ID     int64  `json:"id"`
+					Status string `json:"status"`
+				}{
+					{ID: 321, Status: "in_progress"},
+					{ID: 322, Status: "queued"},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/agoodkind/lmd/actions/runs/321/cancel":
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/agoodkind/lmd/actions/runs/322/cancel":
+			http.Error(w, "conflict", http.StatusConflict)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	})
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, r)
+			return recorder.Result(), nil
+		}),
+	}
+
+	client, err := New("12345", pemKey, WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client.apiBase = "https://api.github.test"
+
+	count, err := client.CancelActiveRunsForHeadSHA(context.Background(), "agoodkind/lmd", headSHA)
+	if err == nil {
+		t.Fatal("CancelActiveRunsForHeadSHA returned nil error, want error when a cancel fails")
+	}
+	if count != 1 {
+		t.Fatalf("cancelled count = %d, want 1 (run 321 cancelled, run 322 failed)", count)
 	}
 }

@@ -9,12 +9,14 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/hostedload"
@@ -23,6 +25,12 @@ import (
 )
 
 const maxBodyBytes = 1 << 20
+
+// pullRequestCancelTimeout bounds the background cancellation of a closed pull
+// request's runs. The webhook handler acks immediately and does this work on a
+// detached context, so GitHub closing the delivery connection at its ~10s
+// deadline cannot abort the token lookup, listing, and per-run cancels midway.
+const pullRequestCancelTimeout = 60 * time.Second
 
 // pooler is the subset of runnerpool.Pool used by the server.
 type pooler interface {
@@ -273,14 +281,36 @@ func (s *Server) handlePullRequestClose(w http.ResponseWriter, r *http.Request, 
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	// Ack immediately and cancel on a detached context, so a slow GitHub API
+	// sequence is not aborted when GitHub closes the webhook delivery at its
+	// deadline. Cancellation is idempotent, so a redelivered close is harmless.
+	// WithoutCancel keeps the request's log values while dropping its cancellation.
+	bg := context.WithoutCancel(ctx)
+	pr := payload.PullRequest.Number
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.ErrorContext(bg, "panic cancelling closed pull request runs", "err", fmt.Errorf("panic: %v", rec), "repo", repo, "pr", pr, "head_sha", headSHA)
+			}
+		}()
+		s.cancelClosedPullRequestRuns(bg, repo, headSHA, pr)
+	}()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// cancelClosedPullRequestRuns cancels a closed pull request's in-flight runs on a
+// context bounded by pullRequestCancelTimeout. It logs the outcome; a failure to
+// cancel one or more runs is logged at warn, since the webhook has already been
+// acked and there is no delivery to fail.
+func (s *Server) cancelClosedPullRequestRuns(ctx context.Context, repo, headSHA string, pr int) {
+	ctx, cancel := context.WithTimeout(ctx, pullRequestCancelTimeout)
+	defer cancel()
 	cancelled, err := s.runs.CancelActiveRunsForHeadSHA(ctx, repo, headSHA)
 	if err != nil {
-		slog.WarnContext(ctx, "cancel in-flight runs for closed pull request failed", "err", err, "repo", repo, "pr", payload.PullRequest.Number, "head_sha", headSHA)
-		w.WriteHeader(http.StatusNoContent)
+		slog.WarnContext(ctx, "cancel in-flight runs for closed pull request failed", "err", err, "repo", repo, "pr", pr, "head_sha", headSHA, "cancelled", cancelled)
 		return
 	}
-	slog.InfoContext(ctx, "cancelled in-flight runs for closed pull request", "repo", repo, "pr", payload.PullRequest.Number, "head_sha", headSHA, "cancelled", cancelled)
-	w.WriteHeader(http.StatusNoContent)
+	slog.InfoContext(ctx, "cancelled in-flight runs for closed pull request", "repo", repo, "pr", pr, "head_sha", headSHA, "cancelled", cancelled)
 }
 
 func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request, liveConfig serverConfig) ([]byte, bool) {
