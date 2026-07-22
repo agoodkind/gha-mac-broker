@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -127,9 +129,9 @@ func newRunnerExecutor() *runnerExecutor {
 }
 
 // Build refreshes Homebrew, provisions the slot on first use, and returns the
-// ExecSpec that launches the slot's runner. The command is the absolute run.sh
-// path so the registry accepts it, and the environment carries the per-slot
-// HOME, TMPDIR, and git isolation the runner needs.
+// ExecSpec that launches the slot's runner in the Aqua login session. The
+// environment carries the per-slot HOME, TMPDIR, and git isolation the runner
+// needs.
 func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestexec.ExecSpec, error) {
 	if e.baseHome == "" {
 		err := fmt.Errorf("guestagent: base home is empty")
@@ -152,16 +154,60 @@ func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestex
 		slog.WarnContext(ctx, "guest slot keychain setup incomplete; signing steps may fail", "slot", request.Slot, "err", err)
 	}
 	runnerHome := e.runnerHome(request.Slot)
+	runnerEnv := e.runnerEnv(request.Slot, request.Env)
+	command, args, err := wrapRunnerForAquaSession(
+		filepath.Join(runnerHome, runnerLaunchScript),
+		[]string{"--jitconfig", request.JitConfig},
+		runnerEnv,
+	)
+	if err != nil {
+		return guestexec.ExecSpec{}, err
+	}
 	spec := guestexec.ExecSpec{
 		ExecutionID: request.ExecutionID,
 		Slot:        request.Slot,
 		Meta:        request.Meta,
-		Command:     filepath.Join(runnerHome, runnerLaunchScript),
-		Args:        []string{"--jitconfig", request.JitConfig},
-		Env:         e.runnerEnv(request.Slot, request.Env),
+		Command:     command,
+		Args:        args,
+		Env:         runnerEnv,
 		WorkingDir:  runnerHome,
 	}
 	return spec, nil
+}
+
+// wrapRunnerForAquaSession moves the runner out of the System session, where
+// codesign cannot sign, and into the daemon user's Aqua session. The outer sudo
+// lets launchctl use asuser, the inner sudo drops back to the daemon user, and
+// env reapplies the runner environment because sudo strips inherited values.
+func wrapRunnerForAquaSession(command string, args []string, env map[string]string) (string, []string, error) {
+	currentUser, err := user.Current()
+	if err != nil {
+		return "", nil, err
+	}
+
+	wrappedArgs := []string{
+		"-n",
+		"/bin/launchctl",
+		"asuser",
+		strconv.Itoa(os.Getuid()),
+		"/usr/bin/sudo",
+		"-n",
+		"-u",
+		currentUser.Username,
+		"/usr/bin/env",
+	}
+	wrappedArgs = append(wrappedArgs, os.Environ()...)
+	envKeys := make([]string, 0, len(env))
+	for key := range env {
+		envKeys = append(envKeys, key)
+	}
+	sort.Strings(envKeys)
+	for _, key := range envKeys {
+		wrappedArgs = append(wrappedArgs, key+"="+env[key])
+	}
+	wrappedArgs = append(wrappedArgs, command)
+	wrappedArgs = append(wrappedArgs, args...)
+	return "/usr/bin/sudo", wrappedArgs, nil
 }
 
 func (e *runnerExecutor) runnerHome(slot uint32) string {
