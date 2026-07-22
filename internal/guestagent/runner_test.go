@@ -251,11 +251,16 @@ func TestBuildProvisionsSlotOnceAcrossJobs(t *testing.T) {
 	if _, err := executor.Build(context.Background(), request); err != nil {
 		t.Fatalf("second Build: %v", err)
 	}
+	// Directory provisioning (cp: runner-home clone and cache seeds) runs once per
+	// slot, so the cp count does not grow on the second job.
 	if got := stub.count("cp"); got != firstCPCount {
-		t.Fatalf("cp invocations after second Build = %d, want %d", got, firstCPCount)
+		t.Fatalf("cp invocations after second Build = %d, want %d (provisioned once)", got, firstCPCount)
 	}
-	if got := stub.count("security"); got != firstSecurityCount {
-		t.Fatalf("security invocations after second Build = %d, want %d", got, firstSecurityCount)
+	// Keychain setup (security) runs on every job so the slot's default keychain,
+	// search list, and unlock are re-established each build and cannot drift over a
+	// long-lived slot's life.
+	if got := stub.count("security"); got <= firstSecurityCount {
+		t.Fatalf("security invocations after second Build = %d, want > %d (keychain reset per job)", got, firstSecurityCount)
 	}
 }
 
