@@ -140,6 +140,17 @@ func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestex
 	if err := e.ensureSlotProvisioned(ctx, request.Slot); err != nil {
 		return guestexec.ExecSpec{}, err
 	}
+	// Reset the slot keychain on every job, not only on first provision. Before
+	// provision-once the whole slot was rebuilt per job and this ran each time;
+	// making it once-per-slot let the slot's default keychain, user search list,
+	// and unlocked state drift over a VM's life, which broke signing on
+	// long-lived pool VMs. Re-establishing them per job is cheap and idempotent,
+	// and the CI signing action still overwrites the search list with its own
+	// keychain afterward. Best effort: a failure warns and the job then fails on
+	// signing as it does today, rather than aborting the whole job here.
+	if err := e.setupSlotKeychain(ctx, e.slotHome(request.Slot)); err != nil {
+		slog.WarnContext(ctx, "guest slot keychain setup incomplete; signing steps may fail", "slot", request.Slot, "err", err)
+	}
 	runnerHome := e.runnerHome(request.Slot)
 	spec := guestexec.ExecSpec{
 		ExecutionID: request.ExecutionID,
@@ -235,11 +246,9 @@ func (e *runnerExecutor) provisionSlot(ctx context.Context, slot uint32) error {
 			return err
 		}
 	}
-	// Keychain setup is best effort: a failure warns and the job then fails on
-	// signing as it does today, rather than aborting the whole job here.
-	if err := e.setupSlotKeychain(ctx, slotHome); err != nil {
-		slog.WarnContext(ctx, "guest slot keychain setup incomplete; signing steps may fail", "slot", slot, "err", err)
-	}
+	// The slot keychain is set up per job in Build, not here, so a long-lived
+	// slot re-establishes its default keychain, search list, and unlock on every
+	// job rather than once at provision time.
 	return nil
 }
 
