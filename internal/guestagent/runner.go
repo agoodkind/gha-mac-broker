@@ -288,7 +288,13 @@ func (e *runnerExecutor) setupSlotKeychain(ctx context.Context, slotHome string)
 			return createErr
 		}
 	}
-	if err := e.runTool(ctx, "set default keychain", "security", []string{"default-keychain", "-s", keychain}, slotEnv); err != nil {
+	// -d user scopes the default-keychain write to the user preferences domain
+	// under the slot HOME. Without it, security targets the system domain at
+	// /Library/Preferences, which the runner user does not own, so the write
+	// fails with "SecKeychainSetDefault: Write permissions error" and the setup
+	// returns before the search-list and unlock steps that signing needs. The
+	// list-keychains call below already scopes to the user domain the same way.
+	if err := e.runTool(ctx, "set default keychain", "security", []string{"default-keychain", "-d", "user", "-s", keychain}, slotEnv); err != nil {
 		return err
 	}
 	existing, err := e.userKeychains(ctx, keychain, slotEnv)

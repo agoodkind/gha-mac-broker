@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -207,11 +208,19 @@ func TestBuildProvisionsSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
 	securityCommands := stub.named("security")
 	sawDefaultKeychain := false
 	for _, command := range securityCommands {
-		if len(command.args) >= 3 && command.args[0] == "default-keychain" && command.args[2] == keychain {
-			sawDefaultKeychain = true
-			if command.env["HOME"] != filepath.Join(baseHome, "slot-home-3") {
-				t.Fatalf("default-keychain HOME env = %q, want slot home", command.env["HOME"])
-			}
+		if len(command.args) == 0 || command.args[0] != "default-keychain" {
+			continue
+		}
+		sawDefaultKeychain = true
+		// The default-keychain write must be scoped to the user domain and target
+		// the slot keychain, so security writes the user preferences the runner
+		// user owns instead of the system domain it cannot write.
+		wantArgs := []string{"default-keychain", "-d", "user", "-s", keychain}
+		if !slices.Equal(command.args, wantArgs) {
+			t.Fatalf("default-keychain args = %v, want %v", command.args, wantArgs)
+		}
+		if command.env["HOME"] != filepath.Join(baseHome, "slot-home-3") {
+			t.Fatalf("default-keychain HOME env = %q, want slot home", command.env["HOME"])
 		}
 	}
 	if !sawDefaultKeychain {
