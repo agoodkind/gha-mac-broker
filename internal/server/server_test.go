@@ -759,22 +759,45 @@ type fakeRunCanceller struct {
 	calls     []cancelCall
 	cancelled int
 	err       error
+	// called is signalled once per call so a test can wait for the handler's
+	// background cancellation goroutine, since the webhook acks before it runs.
+	called chan struct{}
 }
 
 func (f *fakeRunCanceller) CancelActiveRunsForHeadSHA(_ context.Context, repo, headSHA string) (int, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, cancelCall{repo: repo, headSHA: headSHA})
-	if f.err != nil {
-		return 0, f.err
+	cancelled := f.cancelled
+	err := f.err
+	signal := f.called
+	f.mu.Unlock()
+	if signal != nil {
+		select {
+		case signal <- struct{}{}:
+		default:
+		}
 	}
-	return f.cancelled, nil
+	if err != nil {
+		return 0, err
+	}
+	return cancelled, nil
 }
 
 func (f *fakeRunCanceller) Calls() []cancelCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]cancelCall(nil), f.calls...)
+}
+
+// waitCalled blocks until the background cancellation goroutine has invoked the
+// canceller, or fails the test after a short timeout.
+func (f *fakeRunCanceller) waitCalled(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run canceller was not called within 2s")
+	}
 }
 
 func pullRequestBody(action string, repo string, headSHA string, number int) []byte {
@@ -799,12 +822,13 @@ func postPullRequestWebhook(t *testing.T, srv *Server, body []byte) *httptest.Re
 }
 
 func TestPullRequestClosedCancelsRunsForHeadSHA(t *testing.T) {
-	rc := &fakeRunCanceller{cancelled: 2}
+	rc := &fakeRunCanceller{cancelled: 2, called: make(chan struct{}, 1)}
 	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil, WithRunCanceller(rc))
 	w := postPullRequestWebhook(t, srv, pullRequestBody("closed", "agoodkind/lmd", "abc123", 42))
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
 	}
+	rc.waitCalled(t)
 	calls := rc.Calls()
 	if len(calls) != 1 {
 		t.Fatalf("cancel calls = %d, want 1", len(calls))
@@ -847,12 +871,13 @@ func TestPullRequestClosedWithoutCancellerReturns204(t *testing.T) {
 }
 
 func TestPullRequestClosedCancellerErrorStillReturns204(t *testing.T) {
-	rc := &fakeRunCanceller{err: errors.New("github unavailable")}
+	rc := &fakeRunCanceller{err: errors.New("github unavailable"), called: make(chan struct{}, 1)}
 	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil, WithRunCanceller(rc))
 	w := postPullRequestWebhook(t, srv, pullRequestBody("closed", "agoodkind/lmd", "abc123", 42))
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d (cancellation is best-effort)", w.Code, http.StatusNoContent)
 	}
+	rc.waitCalled(t)
 	if got := len(rc.Calls()); got != 1 {
 		t.Fatalf("cancel calls = %d, want 1", got)
 	}
