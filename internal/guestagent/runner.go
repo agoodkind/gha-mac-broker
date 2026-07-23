@@ -87,11 +87,12 @@ type SpecBuilder interface {
 type commandFunc func(ctx context.Context, name string, args []string, envOverrides map[string]string) (string, error)
 
 // runnerExecutor ports the two guest shell scripts to Go. It refreshes Homebrew
-// once per boot, provisions a slot's isolated runner directory, TMPDIR, cache
-// seeded HOME, and default login keychain on first use, then builds the ExecSpec
-// that launches run.sh --jitconfig for that slot with an absolute command.
+// once per boot, provisions each runner directory and TMPDIR, and provisions an
+// isolated HOME and login keychain for multi-slot agents. It then builds the
+// ExecSpec that launches run.sh --jitconfig with an absolute command.
 type runnerExecutor struct {
 	baseHome   string
+	slotCount  uint32
 	markerPath string
 	runCommand commandFunc
 	// lookBrew reports whether brew is on PATH.
@@ -110,7 +111,7 @@ var _ SpecBuilder = (*runnerExecutor)(nil)
 // newRunnerExecutor returns the production spec builder. It resolves the guest
 // user's real HOME as the base for per-slot directories and wires the system
 // tool seam to real cp, security, and brew invocations.
-func newRunnerExecutor() *runnerExecutor {
+func newRunnerExecutor(slotCount uint32) *runnerExecutor {
 	baseHome := os.Getenv("HOME")
 	if baseHome == "" {
 		if resolved, err := os.UserHomeDir(); err == nil {
@@ -119,6 +120,7 @@ func newRunnerExecutor() *runnerExecutor {
 	}
 	return &runnerExecutor{
 		baseHome:         baseHome,
+		slotCount:        slotCount,
 		markerPath:       brewBootRefreshMarker,
 		runCommand:       runSystemCommand,
 		lookBrew:         brewOnPath,
@@ -128,10 +130,13 @@ func newRunnerExecutor() *runnerExecutor {
 	}
 }
 
+func (e *runnerExecutor) singleSlot() bool {
+	return e.slotCount <= 1
+}
+
 // Build refreshes Homebrew, provisions the slot on first use, and returns the
 // ExecSpec that launches the slot's runner in the Aqua login session. The
-// environment carries the per-slot HOME, TMPDIR, and git isolation the runner
-// needs.
+// environment carries the selected HOME, per-slot TMPDIR, and git isolation.
 func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestexec.ExecSpec, error) {
 	if e.baseHome == "" {
 		err := fmt.Errorf("guestagent: base home is empty")
@@ -142,16 +147,18 @@ func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestex
 	if err := e.ensureSlotProvisioned(ctx, request.Slot); err != nil {
 		return guestexec.ExecSpec{}, err
 	}
-	// Reset the slot keychain on every job, not only on first provision. Before
-	// provision-once the whole slot was rebuilt per job and this ran each time;
-	// making it once-per-slot let the slot's default keychain, user search list,
-	// and unlocked state drift over a VM's life, which broke signing on
-	// long-lived pool VMs. Re-establishing them per job is cheap and idempotent,
-	// and the CI signing action still overwrites the search list with its own
-	// keychain afterward. Best effort: a failure warns and the job then fails on
-	// signing as it does today, rather than aborting the whole job here.
-	if err := e.setupSlotKeychain(ctx, e.slotHome(request.Slot)); err != nil {
-		slog.WarnContext(ctx, "guest slot keychain setup incomplete; signing steps may fail", "slot", request.Slot, "err", err)
+	if !e.singleSlot() {
+		// Reset the slot keychain on every job, not only on first provision. Before
+		// provision-once the whole slot was rebuilt per job and this ran each time;
+		// making it once-per-slot let the slot's default keychain, user search list,
+		// and unlocked state drift over a VM's life, which broke signing on
+		// long-lived pool VMs. Re-establishing them per job is cheap and idempotent,
+		// and the CI signing action still overwrites the search list with its own
+		// keychain afterward. Best effort: a failure warns and the job then fails on
+		// signing as it does today, rather than aborting the whole job here.
+		if err := e.setupSlotKeychain(ctx, e.slotHome(request.Slot)); err != nil {
+			slog.WarnContext(ctx, "guest slot keychain setup incomplete; signing steps may fail", "slot", request.Slot, "err", err)
+		}
 	}
 	runnerHome := e.runnerHome(request.Slot)
 	runnerEnv := e.runnerEnv(request.Slot, request.Env)
@@ -222,12 +229,16 @@ func (e *runnerExecutor) slotHome(slot uint32) string {
 	return filepath.Join(e.baseHome, fmt.Sprintf("slot-home-%d", slot))
 }
 
-// runnerEnv builds the runner environment. It applies the caller's env first,
-// then overrides the isolation keys so a caller can never redirect HOME, TMPDIR,
-// or the git credential suppression that keeps co-tenant slots isolated. SwiftPM
-// clone URLs already carry the token, so credential.helper is cleared to keep
-// git-credential-manager (whose store path can deadlock in the headless VM) out
-// of the process tree, and GIT_TERMINAL_PROMPT=0 makes a 401 fail fast.
+// runnerEnv builds the runner environment. codesign resolves the per-user
+// keychain search list through the login user's real HOME in the Aqua session.
+// A per-slot HOME keeps a job's signing keychain out of that list and causes
+// "no identity found" failures. A single slot has no co-tenant, so it safely
+// uses the real HOME. Multi-slot runners retain a per-slot HOME and defer full
+// signing isolation to slot-per-user. The caller's environment is applied first,
+// then the runner overrides HOME, TMPDIR, and git credential isolation keys.
+// SwiftPM clone URLs already carry the token, so credential.helper is cleared
+// to keep git-credential-manager out of the process tree, and
+// GIT_TERMINAL_PROMPT=0 makes a 401 fail fast.
 func (e *runnerExecutor) runnerEnv(slot uint32, callerEnv map[string]string) map[string]string {
 	env := make(map[string]string, len(callerEnv)+6)
 	for key, value := range callerEnv {
@@ -238,7 +249,11 @@ func (e *runnerExecutor) runnerEnv(slot uint32, callerEnv map[string]string) map
 	env["GIT_CONFIG_VALUE_0"] = ""
 	env["GIT_TERMINAL_PROMPT"] = "0"
 	env["TMPDIR"] = e.tmpDir(slot)
-	env["HOME"] = e.slotHome(slot)
+	if e.singleSlot() {
+		env["HOME"] = e.baseHome
+	} else {
+		env["HOME"] = e.slotHome(slot)
+	}
 	return env
 }
 
@@ -268,7 +283,6 @@ func (e *runnerExecutor) ensureSlotProvisioned(ctx context.Context, slot uint32)
 func (e *runnerExecutor) provisionSlot(ctx context.Context, slot uint32) error {
 	runnerHome := e.runnerHome(slot)
 	tmpDir := e.tmpDir(slot)
-	slotHome := e.slotHome(slot)
 
 	if err := e.removeDir(ctx, "runner home", runnerHome); err != nil {
 		return err
@@ -283,6 +297,12 @@ func (e *runnerExecutor) provisionSlot(ctx context.Context, slot uint32) error {
 	if err := e.makeDir(ctx, "tmp dir", tmpDir); err != nil {
 		return err
 	}
+	// A single slot uses the warm real HOME and its login keychain, so creating
+	// an unused slot HOME would waste work and could perturb keychain state.
+	if e.singleSlot() {
+		return nil
+	}
+	slotHome := e.slotHome(slot)
 	if _, err := os.Stat(slotHome); err != nil {
 		if !os.IsNotExist(err) {
 			slog.ErrorContext(ctx, "guest slot home stat failed", "path", slotHome, "err", err)

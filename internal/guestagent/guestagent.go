@@ -43,7 +43,7 @@ type Options struct {
 	ChildLauncher     ChildLauncher
 	// SpecBuilder assembles the runner ExecSpec and runs per-slot setup for each
 	// RunJob. When nil the handler uses the production runner executor, which
-	// clones the runner, seeds the slot HOME, and sets the slot keychain.
+	// clones the runner and applies the configured slot-count isolation.
 	SpecBuilder SpecBuilder
 }
 
@@ -90,7 +90,7 @@ func New(registry *guestexec.Registry, options Options) *Handler {
 	}
 	specBuilder := options.SpecBuilder
 	if specBuilder == nil {
-		specBuilder = newRunnerExecutor()
+		specBuilder = newRunnerExecutor(slotCount)
 	}
 	return &Handler{
 		registry:          registry,
