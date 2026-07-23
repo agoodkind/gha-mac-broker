@@ -337,6 +337,7 @@ func ResolveRunnerVersion(ctx context.Context) (string, error) {
 func (b *Builder) Build(ctx context.Context, opts Options) error {
 	slog.InfoContext(ctx, "building golden", "base", opts.BaseImage, "golden", opts.GoldenName, "runner", opts.RunnerVersion)
 
+	slog.InfoContext(ctx, "golden phase: staging provision inputs (fingerprint, guest binary, runner digest)", "golden", opts.GoldenName)
 	scratchDir, mountBinary, fingerprint, runnerVersion, runnerDigest, err := b.stageProvisionInputs(ctx, opts)
 	if err != nil {
 		return err
@@ -354,17 +355,20 @@ func (b *Builder) Build(ctx context.Context, opts Options) error {
 		}
 	}
 	dirs := []tart.DirMount{{Name: provisionMountName, Path: scratchDir}}
+	slog.InfoContext(ctx, "golden phase: cloning and booting build VM", "golden", opts.GoldenName, "vm", opts.BuildVM)
 	boot, err := b.cloneAndBoot(ctx, cloneSource, opts.BuildVM, insecure, dirs)
 	if err != nil {
 		return err
 	}
 
+	slog.InfoContext(ctx, "golden phase: provisioning build VM (install runner, bake guest binary and agent)", "golden", opts.GoldenName, "vm", opts.BuildVM)
 	if err := b.provision(ctx, opts.BuildVM, runnerVersion, runnerDigest, mountBinary, fingerprint); err != nil {
 		_ = boot.Process.Kill()
 		b.teardown(ctx, opts.BuildVM)
 		return err
 	}
 
+	slog.InfoContext(ctx, "golden phase: stopping build VM", "golden", opts.GoldenName, "vm", opts.BuildVM)
 	if err := b.stopBuildVM(ctx, opts.BuildVM); err != nil {
 		_ = boot.Process.Kill()
 		b.teardown(ctx, opts.BuildVM)
@@ -376,13 +380,16 @@ func (b *Builder) Build(ctx context.Context, opts Options) error {
 	// golden, so a clone, boot, or verify failure leaves the existing golden
 	// intact instead of destroying it.
 	staging := opts.GoldenName + goldenStagingSuffix
+	slog.InfoContext(ctx, "golden phase: snapshotting staging image", "golden", opts.GoldenName, "staging", staging)
 	if err := b.snapshot(ctx, opts.BuildVM, staging); err != nil {
 		return err
 	}
+	slog.InfoContext(ctx, "golden phase: verifying staging image", "golden", opts.GoldenName, "staging", staging)
 	if err := b.verify(ctx, staging, opts.BuildVM+"-verify", fingerprint); err != nil {
 		b.teardown(ctx, staging)
 		return err
 	}
+	slog.InfoContext(ctx, "golden phase: promoting staging to live golden", "golden", opts.GoldenName, "staging", staging)
 	return b.promote(ctx, staging, opts.GoldenName)
 }
 
@@ -628,6 +635,7 @@ func (b *Builder) teardown(ctx context.Context, name string) {
 // returns its sha256, so the fingerprint changes if the runner bytes change.
 func downloadRunnerTarballDigest(ctx context.Context, version string) (string, error) {
 	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/actions-runner-osx-arm64-%s.tar.gz", version, version)
+	slog.InfoContext(ctx, "golden phase: fetching runner tarball for digest", "version", version, "url", url)
 	fetchCtx, cancel := context.WithTimeout(ctx, runnerTarballTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, url, nil)
