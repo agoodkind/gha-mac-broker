@@ -635,7 +635,10 @@ func (b *Builder) teardown(ctx context.Context, name string) {
 // returns its sha256, so the fingerprint changes if the runner bytes change.
 func downloadRunnerTarballDigest(ctx context.Context, version string) (string, error) {
 	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/actions-runner-osx-arm64-%s.tar.gz", version, version)
-	slog.InfoContext(ctx, "golden phase: fetching runner tarball for digest", "version", version, "url", url)
+	// Not prefixed "golden phase:" because the digest also feeds the existing-golden
+	// fingerprint check, so this fetch runs on a skipped build too and is not proof a
+	// build started.
+	slog.InfoContext(ctx, "golden: fetching runner tarball for digest", "version", version, "url", url)
 	fetchCtx, cancel := context.WithTimeout(ctx, runnerTarballTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, url, nil)

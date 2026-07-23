@@ -190,7 +190,7 @@ func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestex
 		"home", runnerEnv["HOME"],
 		"tmpdir", runnerEnv["TMPDIR"],
 		"runner_home", runnerHome,
-		"session", "aqua-login",
+		"requested_session", "aqua-login",
 	)
 	return spec, nil
 }
