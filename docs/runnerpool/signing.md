@@ -20,6 +20,6 @@ The keychain search list is per-user and shared across every process of that use
 
 Two concurrent jobs that sign with the same identity both succeed, because whichever keychain wins the shared list still holds that identity. Two sequential jobs on a reused machine sign with different identities, because each job rewrites the search list and the earlier job has already finished. Two concurrent jobs that sign with different identities cannot both succeed on one user account, because each job's `security list-keychains` evicts the other's keychain. True multi-slot signing isolation needs a separate user account per slot, which is not yet implemented; today the pool runs one job per machine.
 
-## What the CI side provides
+## The broker holds no signing identity
 
-The signing workflow needs no pool-specific step. A job's signing action creates its keychain, imports the identity, and adds the keychain to the search list inside the runner's session, which is now the login session with the real home. The broker imports nothing and holds no identity; it only places the runner in the session where the job's own signing succeeds.
+The broker imports no certificate and holds no identity. It only places the runner in a session and home folder where a job's own signing keychain resolves, so the signing workflow needs no pool-specific step. The job's signing action provides the keychain and identity.
