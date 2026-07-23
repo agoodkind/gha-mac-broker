@@ -179,6 +179,19 @@ func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestex
 		Env:         runnerEnv,
 		WorkingDir:  runnerHome,
 	}
+	// Log the signing-relevant launch context per job so a signing failure is
+	// diagnosable from the daemon log. HOME decides whether codesign resolves the
+	// per-user keychain search list: the real base home signs, a per-slot home
+	// does not. The runner always launches in the Aqua login session, the one
+	// session where the search list takes effect.
+	slog.InfoContext(ctx, "guest runner launch context",
+		"slot", request.Slot,
+		"single_slot", e.singleSlot(),
+		"home", runnerEnv["HOME"],
+		"tmpdir", runnerEnv["TMPDIR"],
+		"runner_home", runnerHome,
+		"session", "aqua-login",
+	)
 	return spec, nil
 }
 
