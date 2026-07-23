@@ -62,11 +62,12 @@ func (s *commandStub) count(name string) int {
 	return len(s.named(name))
 }
 
-func newTestExecutor(t *testing.T, baseHome string) (*runnerExecutor, *commandStub) {
+func newTestExecutor(t *testing.T, baseHome string, slotCount uint32) (*runnerExecutor, *commandStub) {
 	t.Helper()
 	stub := &commandStub{}
 	executor := &runnerExecutor{
 		baseHome:        baseHome,
+		slotCount:       slotCount,
 		markerPath:      filepath.Join(t.TempDir(), "brew-marker"),
 		runCommand:      stub.run,
 		lookBrew:        func() bool { return false },
@@ -90,7 +91,7 @@ func writeGoldenRunner(t *testing.T, baseHome string) {
 func TestBuildProducesAbsoluteRunnerSpecForSlot(t *testing.T) {
 	baseHome := t.TempDir()
 	writeGoldenRunner(t, baseHome)
-	executor, _ := newTestExecutor(t, baseHome)
+	executor, _ := newTestExecutor(t, baseHome, 2)
 
 	spec, err := executor.Build(context.Background(), JobRequest{
 		ExecutionID: "exec-7",
@@ -148,17 +149,17 @@ func TestBuildProducesAbsoluteRunnerSpecForSlot(t *testing.T) {
 	}
 }
 
-func TestBuildEnvIsolatesSlotHomeTmpAndGit(t *testing.T) {
+func TestBuildSingleSlotUsesBaseHomeInAquaWrapper(t *testing.T) {
 	baseHome := t.TempDir()
 	writeGoldenRunner(t, baseHome)
-	executor, _ := newTestExecutor(t, baseHome)
+	executor, _ := newTestExecutor(t, baseHome, 1)
 
 	spec, err := executor.Build(context.Background(), JobRequest{
 		ExecutionID: "exec-8",
-		Slot:        2,
+		Slot:        0,
 		JitConfig:   "encoded-jit",
 		// A caller-supplied HOME, TMPDIR, and GIT_TERMINAL_PROMPT must not win over
-		// the per-slot isolation values.
+		// the executor's runner values.
 		Env: map[string]string{"HOME": "/attacker", "TMPDIR": "/attacker-tmp", "GIT_TERMINAL_PROMPT": "1", "FOO": "bar"},
 	})
 	if err != nil {
@@ -166,8 +167,8 @@ func TestBuildEnvIsolatesSlotHomeTmpAndGit(t *testing.T) {
 	}
 
 	wantEnv := map[string]string{
-		"HOME":                filepath.Join(baseHome, "slot-home-2"),
-		"TMPDIR":              filepath.Join(baseHome, "tmp-2"),
+		"HOME":                baseHome,
+		"TMPDIR":              filepath.Join(baseHome, "tmp-0"),
 		"GIT_CONFIG_COUNT":    "1",
 		"GIT_CONFIG_KEY_0":    "credential.helper",
 		"GIT_CONFIG_VALUE_0":  "",
@@ -189,8 +190,8 @@ func TestBuildEnvIsolatesSlotHomeTmpAndGit(t *testing.T) {
 		"GIT_CONFIG_KEY_0=credential.helper",
 		"GIT_CONFIG_VALUE_0=",
 		"GIT_TERMINAL_PROMPT=0",
-		"HOME=" + filepath.Join(baseHome, "slot-home-2"),
-		"TMPDIR=" + filepath.Join(baseHome, "tmp-2"),
+		"HOME=" + baseHome,
+		"TMPDIR=" + filepath.Join(baseHome, "tmp-0"),
 	}
 	runnerArgIndex := len(spec.Args) - 3
 	if runnerArgIndex < len(wantEnvArgs) {
@@ -200,9 +201,81 @@ func TestBuildEnvIsolatesSlotHomeTmpAndGit(t *testing.T) {
 	if !slices.Equal(gotEnvArgs, wantEnvArgs) {
 		t.Fatalf("runner env args = %v, want %v", gotEnvArgs, wantEnvArgs)
 	}
+	wantArgsSuffix := []string{
+		filepath.Join(baseHome, "actions-runner-0", "run.sh"),
+		"--jitconfig",
+		"encoded-jit",
+	}
+	if !slices.Equal(spec.Args[len(spec.Args)-len(wantArgsSuffix):], wantArgsSuffix) {
+		t.Fatalf("spec.Args suffix = %v, want %v", spec.Args[len(spec.Args)-len(wantArgsSuffix):], wantArgsSuffix)
+	}
 }
 
-func TestBuildProvisionsSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
+func TestBuildMultiSlotUsesIsolatedSlotHome(t *testing.T) {
+	baseHome := t.TempDir()
+	writeGoldenRunner(t, baseHome)
+	executor, _ := newTestExecutor(t, baseHome, 2)
+
+	spec, err := executor.Build(context.Background(), JobRequest{
+		ExecutionID: "exec-multi",
+		Slot:        1,
+		JitConfig:   "encoded-jit",
+		Env:         map[string]string{"HOME": "/attacker", "TMPDIR": "/attacker-tmp"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	wantHome := filepath.Join(baseHome, "slot-home-1")
+	if got := spec.Env["HOME"]; got != wantHome {
+		t.Fatalf("spec.Env[HOME] = %q, want %q", got, wantHome)
+	}
+	wantTmpDir := filepath.Join(baseHome, "tmp-1")
+	if got := spec.Env["TMPDIR"]; got != wantTmpDir {
+		t.Fatalf("spec.Env[TMPDIR] = %q, want %q", got, wantTmpDir)
+	}
+}
+
+func TestBuildSingleSlotClonesRunnerWithoutSlotHomeOrKeychain(t *testing.T) {
+	baseHome := t.TempDir()
+	writeGoldenRunner(t, baseHome)
+	if err := os.WriteFile(filepath.Join(baseHome, ".gitconfig"), []byte("[user]\n"), 0o600); err != nil {
+		t.Fatalf("write .gitconfig: %v", err)
+	}
+	executor, stub := newTestExecutor(t, baseHome, 1)
+
+	if _, err := executor.Build(context.Background(), JobRequest{ExecutionID: "exec-single", Slot: 0, JitConfig: "jit"}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	runnerHome := filepath.Join(baseHome, "actions-runner-0")
+	slotHome := filepath.Join(baseHome, "slot-home-0")
+	wantRunnerClone := false
+	for _, command := range stub.named("cp") {
+		if slices.Equal(command.args, []string{"-R", filepath.Join(baseHome, goldenRunnerDir), runnerHome}) {
+			wantRunnerClone = true
+		}
+		for _, argument := range command.args {
+			if argument == slotHome || strings.HasPrefix(argument, slotHome+string(os.PathSeparator)) {
+				t.Fatalf("cp command = %v, want no slot-home seed in single-slot mode", command.args)
+			}
+		}
+	}
+	if !wantRunnerClone {
+		t.Fatalf("cp commands = %+v, want runner-home clone", stub.named("cp"))
+	}
+	if got := stub.count("security"); got != 0 {
+		t.Fatalf("security invocations = %d, want 0 in single-slot mode", got)
+	}
+	if _, err := os.Stat(slotHome); !os.IsNotExist(err) {
+		t.Fatalf("slot-home-0 stat err = %v, want unused slot home absent", err)
+	}
+	if info, err := os.Stat(filepath.Join(baseHome, "tmp-0")); err != nil || !info.IsDir() {
+		t.Fatalf("tmp-0 stat err = %v, isDir = %v, want created dir", err, info != nil && info.IsDir())
+	}
+}
+
+func TestBuildMultiSlotProvisionsSlotHomeAndKeychain(t *testing.T) {
 	baseHome := t.TempDir()
 	writeGoldenRunner(t, baseHome)
 	// Two present warm caches and one absent, so seeding is by presence.
@@ -212,17 +285,17 @@ func TestBuildProvisionsSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(baseHome, ".swiftpm"), 0o700); err != nil {
 		t.Fatalf("create .swiftpm: %v", err)
 	}
-	executor, stub := newTestExecutor(t, baseHome)
+	executor, stub := newTestExecutor(t, baseHome, 2)
 
-	if _, err := executor.Build(context.Background(), JobRequest{ExecutionID: "exec-9", Slot: 3, JitConfig: "jit"}); err != nil {
+	if _, err := executor.Build(context.Background(), JobRequest{ExecutionID: "exec-9", Slot: 1, JitConfig: "jit"}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	if info, err := os.Stat(filepath.Join(baseHome, "tmp-3")); err != nil || !info.IsDir() {
-		t.Fatalf("tmp-3 stat err = %v, isDir = %v, want created dir", err, info != nil && info.IsDir())
+	if info, err := os.Stat(filepath.Join(baseHome, "tmp-1")); err != nil || !info.IsDir() {
+		t.Fatalf("tmp-1 stat err = %v, isDir = %v, want created dir", err, info != nil && info.IsDir())
 	}
-	if info, err := os.Stat(filepath.Join(baseHome, "slot-home-3")); err != nil || !info.IsDir() {
-		t.Fatalf("slot-home-3 stat err = %v, want created dir", err)
+	if info, err := os.Stat(filepath.Join(baseHome, "slot-home-1")); err != nil || !info.IsDir() {
+		t.Fatalf("slot-home-1 stat err = %v, want created dir", err)
 	}
 
 	cpCommands := stub.named("cp")
@@ -231,7 +304,7 @@ func TestBuildProvisionsSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
 	for _, command := range cpCommands {
 		if len(command.args) == 3 && command.args[0] == "-R" &&
 			command.args[1] == filepath.Join(baseHome, goldenRunnerDir) &&
-			command.args[2] == filepath.Join(baseHome, "actions-runner-3") {
+			command.args[2] == filepath.Join(baseHome, "actions-runner-1") {
 			wantRunnerClone = true
 		}
 		if len(command.args) == 3 && command.args[0] == "-cR" {
@@ -239,7 +312,7 @@ func TestBuildProvisionsSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
 		}
 	}
 	if !wantRunnerClone {
-		t.Fatalf("cp commands = %+v, want a -R clone of the golden runner into actions-runner-3", cpCommands)
+		t.Fatalf("cp commands = %+v, want a -R clone of the golden runner into actions-runner-1", cpCommands)
 	}
 	if !seededCaches[filepath.Join(baseHome, ".gitconfig")] || !seededCaches[filepath.Join(baseHome, ".swiftpm")] {
 		t.Fatalf("seeded caches = %v, want .gitconfig and .swiftpm cloned", seededCaches)
@@ -248,7 +321,7 @@ func TestBuildProvisionsSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
 		t.Fatalf("seeded caches = %v, want absent .netrc skipped", seededCaches)
 	}
 
-	keychain := filepath.Join(baseHome, "slot-home-3", loginKeychainRelPath)
+	keychain := filepath.Join(baseHome, "slot-home-1", loginKeychainRelPath)
 	securityCommands := stub.named("security")
 	sawDefaultKeychain := false
 	for _, command := range securityCommands {
@@ -263,7 +336,7 @@ func TestBuildProvisionsSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
 		if !slices.Equal(command.args, wantArgs) {
 			t.Fatalf("default-keychain args = %v, want %v", command.args, wantArgs)
 		}
-		if command.env["HOME"] != filepath.Join(baseHome, "slot-home-3") {
+		if command.env["HOME"] != filepath.Join(baseHome, "slot-home-1") {
 			t.Fatalf("default-keychain HOME env = %q, want slot home", command.env["HOME"])
 		}
 	}
@@ -275,7 +348,7 @@ func TestBuildProvisionsSlotDirectoriesAndCloneAndKeychain(t *testing.T) {
 func TestBuildProvisionsSlotOnceAcrossJobs(t *testing.T) {
 	baseHome := t.TempDir()
 	writeGoldenRunner(t, baseHome)
-	executor, stub := newTestExecutor(t, baseHome)
+	executor, stub := newTestExecutor(t, baseHome, 2)
 	request := JobRequest{ExecutionID: "exec-10", Slot: 4, JitConfig: "jit"}
 
 	if _, err := executor.Build(context.Background(), request); err != nil {
@@ -311,7 +384,7 @@ func TestBuildProvisionsSlotOnceAcrossJobs(t *testing.T) {
 func TestBuildPreservesPopulatedSlotHomeAcrossJobs(t *testing.T) {
 	baseHome := t.TempDir()
 	writeGoldenRunner(t, baseHome)
-	executor, _ := newTestExecutor(t, baseHome)
+	executor, _ := newTestExecutor(t, baseHome, 2)
 	request := JobRequest{ExecutionID: "exec-12", Slot: 5, JitConfig: "jit"}
 
 	if _, err := executor.Build(context.Background(), request); err != nil {
@@ -343,7 +416,7 @@ func TestKeychainSearchListDropsPriorSlotKeychainCopy(t *testing.T) {
 	baseHome := t.TempDir()
 	slotHome := filepath.Join(baseHome, "slot-home-1")
 	keychain := filepath.Join(slotHome, loginKeychainRelPath)
-	executor, stub := newTestExecutor(t, baseHome)
+	executor, stub := newTestExecutor(t, baseHome, 2)
 	stub.responder = func(name string, args []string) (string, error) {
 		if name == "security" && len(args) >= 3 && args[0] == "list-keychains" && args[1] == "-d" && args[2] == "user" && len(args) == 3 {
 			// The existing user list already carries the slot keychain plus System.
@@ -382,7 +455,7 @@ func TestKeychainSearchListDropsPriorSlotKeychainCopy(t *testing.T) {
 
 func TestBrewRefreshRunsOnceThenNoOpsWhenMarkerPresent(t *testing.T) {
 	baseHome := t.TempDir()
-	executor, stub := newTestExecutor(t, baseHome)
+	executor, stub := newTestExecutor(t, baseHome, 1)
 	executor.lookBrew = func() bool { return true }
 
 	executor.ensureHomebrewRefreshed(context.Background())
@@ -398,7 +471,7 @@ func TestBrewRefreshRunsOnceThenNoOpsWhenMarkerPresent(t *testing.T) {
 
 func TestBrewRefreshRetriesOnLockContention(t *testing.T) {
 	baseHome := t.TempDir()
-	executor, stub := newTestExecutor(t, baseHome)
+	executor, stub := newTestExecutor(t, baseHome, 1)
 	executor.lookBrew = func() bool { return true }
 	sleeps := 0
 	executor.sleep = func(_ context.Context) { sleeps++ }
@@ -429,7 +502,7 @@ func TestBrewRefreshRetriesOnLockContention(t *testing.T) {
 
 func TestBrewRefreshGivesUpAndWritesNoMarkerOnNonLockFailure(t *testing.T) {
 	baseHome := t.TempDir()
-	executor, stub := newTestExecutor(t, baseHome)
+	executor, stub := newTestExecutor(t, baseHome, 1)
 	executor.lookBrew = func() bool { return true }
 	stub.responder = func(name string, args []string) (string, error) {
 		if name == "brew" {
@@ -450,7 +523,7 @@ func TestBrewRefreshGivesUpAndWritesNoMarkerOnNonLockFailure(t *testing.T) {
 
 func TestBrewRefreshWriteRefusesSymlinkMarker(t *testing.T) {
 	baseHome := t.TempDir()
-	executor, stub := newTestExecutor(t, baseHome)
+	executor, stub := newTestExecutor(t, baseHome, 1)
 	executor.lookBrew = func() bool { return true }
 	// A pre-planted symlink at the marker path must not receive the write.
 	target := filepath.Join(t.TempDir(), "victim")
@@ -484,7 +557,7 @@ func TestBrewMarkerRefusesSymlinkViaONoFollow(t *testing.T) {
 	if err := os.Symlink(victim, markerPath); err != nil {
 		t.Fatalf("plant symlink: %v", err)
 	}
-	executor := &runnerExecutor{markerPath: markerPath}
+	executor := &runnerExecutor{slotCount: 1, markerPath: markerPath}
 
 	// The presence check must not follow the symlink; a symlink is not a valid
 	// regular marker, so it reports not-present and the write is left to refuse it.
@@ -513,7 +586,7 @@ func TestBrewMarkerRefusesFifoWithoutBlocking(t *testing.T) {
 	if err := unix.Mkfifo(markerPath, 0o600); err != nil {
 		t.Fatalf("mkfifo: %v", err)
 	}
-	executor := &runnerExecutor{markerPath: markerPath}
+	executor := &runnerExecutor{slotCount: 1, markerPath: markerPath}
 
 	// markerPresent must not block on the FIFO (O_NONBLOCK) and must reject it: a
 	// FIFO is not a regular marker, so it reports not-present without blocking.
@@ -556,7 +629,7 @@ func TestBrewMarkerWriteDoesNotTruncateExistingFile(t *testing.T) {
 	if err := os.WriteFile(markerPath, []byte(original), 0o600); err != nil {
 		t.Fatalf("write pre-existing file: %v", err)
 	}
-	executor := &runnerExecutor{markerPath: markerPath}
+	executor := &runnerExecutor{slotCount: 1, markerPath: markerPath}
 
 	// A pre-existing regular file counts as a present marker, so the write is a
 	// no-op that must never truncate the raced-in file (O_EXCL, no O_TRUNC).
@@ -575,7 +648,7 @@ func TestBrewMarkerWriteDoesNotTruncateExistingFile(t *testing.T) {
 
 func TestBrewRefreshSkippedWhenBrewMissing(t *testing.T) {
 	baseHome := t.TempDir()
-	executor, stub := newTestExecutor(t, baseHome)
+	executor, stub := newTestExecutor(t, baseHome, 1)
 	executor.lookBrew = func() bool { return false }
 
 	executor.ensureHomebrewRefreshed(context.Background())
