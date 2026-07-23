@@ -28,7 +28,7 @@ When one machine serves more than one job at once, the jobs share the same compu
 
 A slot's home starts warm rather than empty. The broker provisions a slot on its first job, cloning the caches that make a build fast, its downloaded dependencies, installed tools, and build intermediates, from a shared warm snapshot, then reuses that home for later jobs in the slot. The build toolchain is the one thing left out of that copy, because CI restores it into each job on its own; sharing it through the snapshot as well would let two slots collide on the same directory.
 
-A machine configured to serve a single job uses one slot home, reused across its jobs, with no co-tenant slot to isolate from.
+A machine configured to serve a single job runs in the machine's real home folder instead of a per-slot home, because that is where code signing resolves its identity. See [Signing on the pool](signing.md).
 
 ## Recycling Stuck or Finished Work
 
