@@ -2,6 +2,7 @@ package golden
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os/exec"
 	"strings"
@@ -21,6 +22,8 @@ type stubTart struct {
 	deleted                []string
 	names                  []string
 	provisionedFingerprint string
+	provisionedRunner      RunnerReceipt
+	bakedRunner            RunnerReceipt
 	// bakedFingerprint is the value the stub returns for a `cat` of the baked
 	// fingerprint file before any provision has run, standing in for the
 	// fingerprint an existing golden already carries.
@@ -77,7 +80,21 @@ func (s *stubTart) Exec(_ context.Context, _ string, argv ...string) ([]byte, er
 	}
 	if fingerprint, ok := fingerprintFromProvision(argv); ok {
 		s.provisionedFingerprint = fingerprint
+		for index := 0; index+1 < len(argv); index++ {
+			switch argv[index] {
+			case "-runner-version":
+				s.provisionedRunner.Version = argv[index+1]
+			case "-runner-digest":
+				s.provisionedRunner.TarballDigest = argv[index+1]
+			}
+		}
 		return nil, nil
+	}
+	if len(argv) == 2 && argv[0] == "cat" && argv[1] == RunnerReceiptPath {
+		if s.provisionedRunner.Version != "" {
+			return json.Marshal(s.provisionedRunner)
+		}
+		return json.Marshal(s.bakedRunner)
 	}
 	if len(argv) == 2 && argv[0] == "cat" && argv[1] == FingerprintPath {
 		// After a provision has run, echo the freshly baked fingerprint so verify
@@ -173,7 +190,7 @@ func runnerVersionFromProvision(s *stubTart) (string, bool) {
 
 // fakeDigester injects a fixed runner-tarball digest so Build needs no network.
 func fakeDigester(_ context.Context, _ string) (string, error) {
-	return "fakerunnerdigest", nil
+	return sha256Bytes([]byte("fake runner tarball")), nil
 }
 
 func TestNameForImageSanitizesCirrusTag(t *testing.T) {
@@ -184,12 +201,40 @@ func TestNameForImageSanitizesCirrusTag(t *testing.T) {
 	}
 }
 
+func TestEnsureGoldenReusesBuiltImageOffline(t *testing.T) {
+	image := "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
+	name := NameForImage(image)
+	vm := newDiskTart(t)
+	builder := New(vm)
+	builder.runnerDigest = fakeDigester
+	if err := builder.Build(t.Context(), Options{
+		BaseImage: image, GoldenName: name, BuildVM: name + "-build", RunnerVersion: "2.99.0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	vm.provisionCount = 0
+	offline := New(vm)
+	offline.resolveRunner = func(context.Context) (string, error) {
+		return "", errors.New("GitHub is unavailable")
+	}
+	offline.runnerDigest = func(context.Context, string) (string, error) {
+		return "", errors.New("runner download is unavailable")
+	}
+	got, err := offline.EnsureGolden(t.Context(), EnsureOptions{Image: image})
+	if err != nil || got != name {
+		t.Fatalf("offline EnsureGolden = %q, %v; want %q", got, err, name)
+	}
+	if vm.provisionCount != 0 {
+		t.Fatal("offline reuse rebuilt the image")
+	}
+}
+
 // ensureFingerprint computes the fingerprint EnsureGolden expects for image, so a
 // test can seed the stub's baked fingerprint to match (skip) or differ (rebuild).
 func ensureFingerprint(t *testing.T, b *Builder, image string) string {
 	t.Helper()
 	goldenName := NameForImage(image)
-	fingerprint, _, err := b.expectedFingerprint(context.Background(), Options{
+	_, fingerprint, _, _, err := b.fingerprintFor(context.Background(), Options{
 		BaseImage:     image,
 		GoldenName:    goldenName,
 		BuildVM:       goldenName + "-build",
@@ -218,6 +263,7 @@ func TestEnsureGoldenSkipsWhenFingerprintCurrent(t *testing.T) {
 	b := New(s)
 	b.runnerDigest = fakeDigester
 	s.bakedFingerprint = ensureFingerprint(t, b, image)
+	s.bakedRunner = RunnerReceipt{Version: "2.99.0", TarballDigest: sha256Bytes([]byte("fake runner tarball"))}
 
 	got, err := b.EnsureGolden(context.Background(), EnsureOptions{
 		Image:         image,
@@ -319,8 +365,10 @@ func TestEnsureGoldenBuildsMissingGoldenFromImage(t *testing.T) {
 	}
 	// The absent path must not read a baked fingerprint, so no -fpcheck clone
 	// runs and the runner-tarball fetch is not paid before Build.
-	if containsString(s.cloneTo, goldenName+"-fpcheck") {
-		t.Fatalf("absent golden should not run a fingerprint-check clone, cloneTo = %v", s.cloneTo)
+	for _, clone := range s.cloneTo {
+		if strings.HasPrefix(clone, goldenName+"-fpcheck") {
+			t.Fatalf("absent golden should not run a fingerprint-check clone, cloneTo = %v", s.cloneTo)
+		}
 	}
 }
 
@@ -518,9 +566,10 @@ func TestProvisionLandsProvisionerViaDiscreteArgv(t *testing.T) {
 }
 
 func TestVerifyChecksFingerprintRunnerAndGuestAgent(t *testing.T) {
-	s := &stubTart{provisionedFingerprint: "fpABC"}
+	runner := RunnerReceipt{Version: "2.99.0", TarballDigest: sha256Bytes([]byte("fake runner tarball"))}
+	s := &stubTart{provisionedFingerprint: "fpABC", provisionedRunner: runner}
 	b := New(s)
-	if err := b.verify(context.Background(), "gha-golden", "gha-golden-verify", "fpABC"); err != nil {
+	if err := b.verify(context.Background(), "gha-golden", "gha-golden-verify", "fpABC", runner); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 	all := ""
@@ -549,7 +598,7 @@ func TestVerifyChecksFingerprintRunnerAndGuestAgent(t *testing.T) {
 func TestVerifyRejectsFingerprintMismatch(t *testing.T) {
 	s := &stubTart{provisionedFingerprint: "different"}
 	b := New(s)
-	err := b.verify(context.Background(), "gha-golden", "gha-golden-verify", "expected")
+	err := b.verify(context.Background(), "gha-golden", "gha-golden-verify", "expected", RunnerReceipt{})
 	if err == nil {
 		t.Fatal("verify accepted a fingerprint mismatch, want failure")
 	}

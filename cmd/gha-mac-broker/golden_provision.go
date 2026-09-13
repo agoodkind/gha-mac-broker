@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -51,24 +52,26 @@ type runnerDownloader func(ctx context.Context, version string) (io.ReadCloser, 
 // provisionPaths are the destination paths the provisioner writes. Tests point
 // them at a temp dir; production uses the fixed baked locations.
 type provisionPaths struct {
-	binaryDest      string
-	plistDest       string
-	fingerprintDest string
-	watchdogScript  string
-	watchdogPlist   string
-	runnerDir       string
+	binaryDest        string
+	plistDest         string
+	fingerprintDest   string
+	runnerReceiptDest string
+	watchdogScript    string
+	watchdogPlist     string
+	runnerDir         string
 }
 
 // defaultProvisionPaths returns the fixed baked destinations, with the runner
 // installed into runnerDir (the admin user's home, resolved by the host).
 func defaultProvisionPaths(runnerDir string) provisionPaths {
 	return provisionPaths{
-		binaryDest:      golden.BakedBinaryPath,
-		plistDest:       golden.GuestAgentPlistPath,
-		fingerprintDest: golden.FingerprintPath,
-		watchdogScript:  golden.LegacyWatchdogScriptPath,
-		watchdogPlist:   golden.LegacyWatchdogPlistPath,
-		runnerDir:       runnerDir,
+		binaryDest:        golden.BakedBinaryPath,
+		plistDest:         golden.GuestAgentPlistPath,
+		fingerprintDest:   golden.FingerprintPath,
+		runnerReceiptDest: golden.RunnerReceiptPath,
+		watchdogScript:    golden.LegacyWatchdogScriptPath,
+		watchdogPlist:     golden.LegacyWatchdogPlistPath,
+		runnerDir:         runnerDir,
 	}
 }
 
@@ -137,6 +140,17 @@ func provisionGolden(ctx context.Context, req provisionRequest) error {
 	if err := writeBakedFile(req.paths.plistDest, golden.GuestAgentPlist(), bakedFileMode); err != nil {
 		slog.ErrorContext(ctx, "write guest agent plist failed", "err", err, "dest", req.paths.plistDest)
 		return fmt.Errorf("golden-provision: write guest agent plist: %w", err)
+	}
+	runner := golden.RunnerReceipt{Version: req.runnerVersion, TarballDigest: req.runnerDigest}
+	if err := runner.Validate(); err != nil {
+		return fmt.Errorf("golden-provision: runner receipt: %w", err)
+	}
+	receipt, err := json.Marshal(runner)
+	if err != nil {
+		return fmt.Errorf("golden-provision: encode runner receipt: %w", err)
+	}
+	if err := writeBakedFile(req.paths.runnerReceiptDest, receipt, bakedFileMode); err != nil {
+		return fmt.Errorf("golden-provision: write runner receipt: %w", err)
 	}
 	if err := writeBakedFile(req.paths.fingerprintDest, []byte(req.fingerprint+"\n"), bakedFileMode); err != nil {
 		slog.ErrorContext(ctx, "write fingerprint failed", "err", err, "dest", req.paths.fingerprintDest)

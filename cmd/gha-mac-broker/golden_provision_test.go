@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -138,12 +139,13 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 	}
 
 	paths := provisionPaths{
-		binaryDest:      filepath.Join(root, "usr", "local", "bin", "gha-mac-broker"),
-		plistDest:       filepath.Join(root, "Library", "LaunchDaemons", "io.goodkind.gha-mac-broker-guest.plist"),
-		fingerprintDest: filepath.Join(root, "usr", "local", "share", "gha-guest", "golden.fingerprint"),
-		watchdogScript:  watchdogScript,
-		watchdogPlist:   watchdogPlist,
-		runnerDir:       runnerDir,
+		binaryDest:        filepath.Join(root, "usr", "local", "bin", "gha-mac-broker"),
+		plistDest:         filepath.Join(root, "Library", "LaunchDaemons", "io.goodkind.gha-mac-broker-guest.plist"),
+		fingerprintDest:   filepath.Join(root, "usr", "local", "share", "gha-guest", "golden.fingerprint"),
+		runnerReceiptDest: filepath.Join(root, "usr", "local", "share", "gha-guest", "runner.json"),
+		watchdogScript:    watchdogScript,
+		watchdogPlist:     watchdogPlist,
+		runnerDir:         runnerDir,
 	}
 
 	tarballBytes := fixtureRunnerTarballBytes(t)
@@ -206,6 +208,17 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 	if string(fingerprint) != "deadbeef\n" {
 		t.Fatalf("fingerprint file = %q, want %q", string(fingerprint), "deadbeef\n")
 	}
+	receiptBytes, err := os.ReadFile(paths.runnerReceiptDest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt golden.RunnerReceipt
+	if err := json.Unmarshal(receiptBytes, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Version != req.runnerVersion || receipt.TarballDigest != sha256Hex(tarballBytes) {
+		t.Fatalf("runner receipt = %+v; want version %s and verified archive digest", receipt, req.runnerVersion)
+	}
 
 	if _, err := os.Stat(watchdogScript); !os.IsNotExist(err) {
 		t.Fatalf("watchdog script still present, stat err = %v", err)
@@ -267,6 +280,25 @@ func TestInstallRunnerRejectsDigestMismatch(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(runnerDir, "run.sh")); !os.IsNotExist(statErr) {
 		t.Fatalf("runner was extracted despite digest mismatch, stat err = %v", statErr)
+	}
+}
+
+func TestProvisionGoldenDoesNotWriteReceiptForUnverifiedRunner(t *testing.T) {
+	root := t.TempDir()
+	receiptPath := filepath.Join(root, "runner.json")
+	err := provisionGolden(t.Context(), provisionRequest{
+		runnerVersion: "2.335.1",
+		runnerDigest:  strings.Repeat("0", 64),
+		paths:         provisionPaths{runnerDir: filepath.Join(root, "actions-runner"), runnerReceiptDest: receiptPath},
+		download: func(context.Context, string) (io.ReadCloser, error) {
+			return fixtureRunnerTarball(t), nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("unverified tarball result = %v; want digest mismatch", err)
+	}
+	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
+		t.Fatalf("unverified runner wrote receipt: %v", err)
 	}
 }
 
