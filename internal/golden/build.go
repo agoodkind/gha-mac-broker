@@ -9,6 +9,7 @@ package golden
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -47,6 +48,7 @@ const (
 	// before it replaces the live golden, so a failed rebuild never destroys the
 	// existing golden.
 	goldenStagingSuffix = "-staging"
+	probeCleanupTimeout = 30 * time.Second
 )
 
 // tarter is the VM substrate the builder drives; *tart.Tart satisfies it. It is
@@ -174,33 +176,13 @@ func (b *Builder) EnsureGolden(ctx context.Context, opts EnsureOptions) (string,
 		return "", fmt.Errorf("golden: list VMs: %w", err)
 	}
 
-	// Compute the expected fingerprint only when a golden already exists, so the
-	// idempotency check pays the runner-tarball fetch. The absent-golden path
-	// goes straight to Build, which computes the same fingerprint from the same
-	// inputs, so a fresh build never fetches the runner tarball twice.
-	runnerVersion := opts.RunnerVersion
 	if slices.Contains(names, goldenName) {
-		expected, resolvedVersion, fpErr := b.expectedFingerprint(ctx, Options{
-			BaseImage:     opts.Image,
-			GoldenName:    goldenName,
-			BuildVM:       buildVM,
-			RunnerVersion: opts.RunnerVersion,
-			BinaryPath:    "",
-		})
-		if fpErr != nil {
-			return "", fpErr
-		}
-		runnerVersion = resolvedVersion
-		baked, bakedErr := b.bakedFingerprint(ctx, goldenName)
-		if bakedErr == nil && baked == expected {
-			slog.InfoContext(ctx, "golden fingerprint current; skipping build", "golden", goldenName, "fingerprint", expected)
+		cachedErr := b.checkCachedGolden(ctx, goldenName, opts)
+		if cachedErr == nil {
+			slog.InfoContext(ctx, "golden fingerprint current; skipping build", "golden", goldenName)
 			return goldenName, nil
 		}
-		if bakedErr != nil {
-			slog.InfoContext(ctx, "golden stale; rebuilding", "golden", goldenName, "read_err", bakedErr, "expected", expected)
-		} else {
-			slog.InfoContext(ctx, "golden stale; rebuilding", "golden", goldenName, "baked", baked, "expected", expected)
-		}
+		slog.InfoContext(ctx, "golden stale; rebuilding", "golden", goldenName, "err", cachedErr)
 		// The stale golden stays in place until Build snapshots, verifies, and
 		// promotes its replacement, so a failed rebuild leaves the pool a working
 		// golden to clone.
@@ -210,7 +192,7 @@ func (b *Builder) EnsureGolden(ctx context.Context, opts EnsureOptions) (string,
 		BaseImage:     opts.Image,
 		GoldenName:    goldenName,
 		BuildVM:       buildVM,
-		RunnerVersion: runnerVersion,
+		RunnerVersion: opts.RunnerVersion,
 		BinaryPath:    "",
 	}); err != nil {
 		slog.ErrorContext(ctx, "ensure golden build failed", "err", err, "golden", goldenName, "image", opts.Image)
@@ -219,22 +201,9 @@ func (b *Builder) EnsureGolden(ctx context.Context, opts EnsureOptions) (string,
 	return goldenName, nil
 }
 
-// expectedFingerprint computes the golden fingerprint the current binary and
-// config would bake for opts, resolving the runner version when it is empty and
-// returning the resolved version so the caller can pass it to Build unchanged. It
-// shares the fingerprint assembly with stageProvisionInputs, so the idempotency
-// check and the build path can never compute different fingerprints for the same
-// inputs.
-func (b *Builder) expectedFingerprint(ctx context.Context, opts Options) (fingerprint, runnerVersion string, err error) {
-	_, fingerprint, runnerVersion, _, err = b.fingerprintFor(ctx, opts)
-	return fingerprint, runnerVersion, err
-}
-
 // fingerprintFor resolves the baked-binary path, the runner version, the runner
 // tarball digest, and the baked-binary digest for opts, then folds them plus the
-// guest-agent plist payload into the golden fingerprint. It returns each
-// resolved input so both the build path and the check path can reuse the exact
-// same computation.
+// guest-agent plist payload into the golden fingerprint for a new build.
 func (b *Builder) fingerprintFor(ctx context.Context, opts Options) (binaryPath, fingerprint, runnerVersion, runnerDigest string, err error) {
 	binaryPath = opts.BinaryPath
 	if binaryPath == "" {
@@ -261,42 +230,70 @@ func (b *Builder) fingerprintFor(ctx context.Context, opts Options) (binaryPath,
 	if err != nil {
 		return "", "", "", "", err
 	}
-	fingerprint = Fingerprint(FingerprintInputs{
-		BaseImageRef:        opts.BaseImage,
-		RunnerVersion:       runnerVersion,
-		RunnerTarballDigest: runnerDigest,
+	fingerprint = fingerprintWithRunner(opts.BaseImage, binaryDigest, RunnerReceipt{Version: runnerVersion, TarballDigest: runnerDigest})
+	return binaryPath, fingerprint, runnerVersion, runnerDigest, nil
+}
+
+func fingerprintWithRunner(image, binaryDigest string, runner RunnerReceipt) string {
+	return Fingerprint(FingerprintInputs{
+		BaseImageRef:        image,
+		RunnerVersion:       runner.Version,
+		RunnerTarballDigest: runner.TarballDigest,
 		BinaryDigest:        binaryDigest,
 		Payloads: []PayloadDigest{
 			{Name: GuestAgentPlistLabel, Digest: sha256Bytes(GuestAgentPlist())},
 		},
 	})
-	return binaryPath, fingerprint, runnerVersion, runnerDigest, nil
 }
 
-// bakedFingerprint reads the fingerprint baked into an existing golden by cloning
-// and booting a throwaway clone and catting the baked fingerprint file, then
-// tearing the clone down. A clone, boot, read, or empty-file failure returns an
-// error, which the caller treats as stale so the golden is rebuilt.
-func (b *Builder) bakedFingerprint(ctx context.Context, goldenName string) (string, error) {
-	cloneName := goldenName + "-fpcheck"
+// checkCachedGolden uses the runner receipt and fingerprint from the same clone
+// to validate the current binary and config without any release lookup or fetch.
+func (b *Builder) checkCachedGolden(ctx context.Context, goldenName string, opts EnsureOptions) error {
+	cloneName := goldenName + "-fpcheck-" + rand.Text()
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), probeCleanupTimeout)
+		defer cancel()
+		b.teardown(cleanupCtx, cloneName)
+	}()
 	boot, err := b.cloneAndBoot(ctx, goldenName, cloneName, false, nil)
 	if err != nil {
-		return "", fmt.Errorf("golden: read baked fingerprint of %s: %w", goldenName, err)
+		slog.WarnContext(ctx, "cached golden probe failed", "err", err, "golden", goldenName)
+		return fmt.Errorf("golden: read baked fingerprint of %s: %w", goldenName, err)
 	}
-	defer func() {
-		_ = boot.Process.Kill()
-		b.teardown(ctx, cloneName)
-	}()
-	out, err := b.vm.Exec(ctx, cloneName, "cat", FingerprintPath)
+	defer func() { _ = boot.Process.Kill() }()
+	runner, err := b.readRunnerReceipt(ctx, cloneName)
 	if err != nil {
-		slog.WarnContext(ctx, "read baked fingerprint failed", "err", err, "golden", goldenName)
-		return "", fmt.Errorf("golden: read baked fingerprint from %s: %w", goldenName, err)
+		return err
 	}
-	baked := strings.TrimSpace(string(out))
-	if baked == "" {
-		return "", fmt.Errorf("golden: baked fingerprint on %s is empty", goldenName)
+	if opts.RunnerVersion != "" && opts.RunnerVersion != runner.Version {
+		return fmt.Errorf("golden: baked runner %q differs from requested %q", runner.Version, opts.RunnerVersion)
 	}
-	return baked, nil
+	binaryPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("golden: resolve executable: %w", err)
+	}
+	binaryDigest, err := sha256File(ctx, binaryPath)
+	if err != nil {
+		return err
+	}
+	expected := fingerprintWithRunner(opts.Image, binaryDigest, runner)
+	return b.verifyBooted(ctx, goldenName, cloneName, expected, runner)
+}
+
+func (b *Builder) readRunnerReceipt(ctx context.Context, name string) (RunnerReceipt, error) {
+	var runner RunnerReceipt
+	content, err := b.vm.Exec(ctx, name, "cat", RunnerReceiptPath)
+	if err != nil {
+		slog.WarnContext(ctx, "read runner receipt failed", "err", err, "vm", name)
+		return runner, fmt.Errorf("golden: read runner receipt from %s: %w", name, err)
+	}
+	if err := json.Unmarshal(content, &runner); err != nil {
+		return runner, fmt.Errorf("golden: decode runner receipt from %s: %w", name, err)
+	}
+	if err := runner.Validate(); err != nil {
+		return runner, err
+	}
+	return runner, nil
 }
 
 // runnerRelease is the subset of the actions/runner latest-release API response
@@ -385,7 +382,7 @@ func (b *Builder) Build(ctx context.Context, opts Options) error {
 		return err
 	}
 	slog.InfoContext(ctx, "golden phase: verifying staging image", "golden", opts.GoldenName, "staging", staging)
-	if err := b.verify(ctx, staging, opts.BuildVM+"-verify", fingerprint); err != nil {
+	if err := b.verify(ctx, staging, opts.BuildVM+"-verify", fingerprint, RunnerReceipt{Version: runnerVersion, TarballDigest: runnerDigest}); err != nil {
 		b.teardown(ctx, staging)
 		return err
 	}
@@ -412,10 +409,8 @@ func (b *Builder) promote(ctx context.Context, staging, golden string) error {
 }
 
 // stageProvisionInputs prepares a host scratch dir holding the guest binary to
-// mount into the build VM, and computes the golden fingerprint host-side via
-// fingerprintFor, the same helper the idempotency check uses, so the built
-// image's fingerprint equals the one EnsureGolden expects. The fingerprint is a
-// pure function of its inputs, so it is unit-testable without a VM.
+// mount into the build VM, and computes the golden fingerprint host-side from
+// the resolved runner release, current binary, base ref, and guest payload.
 func (b *Builder) stageProvisionInputs(ctx context.Context, opts Options) (scratchDir, mountBinary, fingerprint, runnerVersion, runnerDigest string, err error) {
 	binaryPath, fingerprint, runnerVersion, runnerDigest, err := b.fingerprintFor(ctx, opts)
 	if err != nil {
@@ -560,17 +555,22 @@ func (b *Builder) stopBuildVM(ctx context.Context, name string) error {
 // fingerprint matches the computed value, failing loudly otherwise. It also
 // asserts the retired watchdog script was not baked. The verify VM is always torn
 // down.
-func (b *Builder) verify(ctx context.Context, golden, verifyVM, fingerprint string) error {
+func (b *Builder) verify(ctx context.Context, golden, verifyVM, fingerprint string, runner RunnerReceipt) error {
 	slog.InfoContext(ctx, "verifying golden", "golden", golden)
 	boot, err := b.cloneAndBoot(ctx, golden, verifyVM, false, nil)
 	if err != nil {
+		slog.ErrorContext(ctx, "golden verification probe failed", "err", err, "golden", golden)
 		return fmt.Errorf("golden: verify boot: %w", err)
 	}
 	defer func() {
 		_ = boot.Process.Kill()
 		b.teardown(ctx, verifyVM)
 	}()
+	return b.verifyBooted(ctx, golden, verifyVM, fingerprint, runner)
+}
 
+// verifyBooted applies the same identity and usability checks to new and cached images.
+func (b *Builder) verifyBooted(ctx context.Context, golden, verifyVM, fingerprint string, runner RunnerReceipt) error {
 	if _, err := b.vm.IP(ctx, verifyVM); err != nil {
 		slog.ErrorContext(ctx, "verify failed: tart ip did not resolve", "err", err, "golden", golden)
 		return fmt.Errorf("golden: verify %s: tart ip did not resolve: %w", golden, err)
@@ -597,6 +597,13 @@ func (b *Builder) verify(ctx context.Context, golden, verifyVM, fingerprint stri
 	}
 	if bakedFingerprint != fingerprint {
 		return fmt.Errorf("golden: verify %s: baked fingerprint %q does not match computed %q", golden, bakedFingerprint, fingerprint)
+	}
+	bakedRunner, err := b.readRunnerReceipt(ctx, verifyVM)
+	if err != nil {
+		return fmt.Errorf("golden: verify %s: %w", golden, err)
+	}
+	if bakedRunner != runner {
+		return fmt.Errorf("golden: verify %s: runner receipt does not match provisioned inputs", golden)
 	}
 
 	if _, err := b.vm.Exec(ctx, verifyVM, "test", "-f", GuestAgentPlistPath); err != nil {
@@ -635,9 +642,6 @@ func (b *Builder) teardown(ctx context.Context, name string) {
 // returns its sha256, so the fingerprint changes if the runner bytes change.
 func downloadRunnerTarballDigest(ctx context.Context, version string) (string, error) {
 	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/actions-runner-osx-arm64-%s.tar.gz", version, version)
-	// Not prefixed "golden phase:" because the digest also feeds the existing-golden
-	// fingerprint check, so this fetch runs on a skipped build too and is not proof a
-	// build started.
 	slog.InfoContext(ctx, "golden: fetching runner tarball for digest", "version", version, "url", url)
 	fetchCtx, cancel := context.WithTimeout(ctx, runnerTarballTimeout)
 	defer cancel()
