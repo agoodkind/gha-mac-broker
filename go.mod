@@ -9,7 +9,7 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.9
 	golang.org/x/sys v0.49.0
 	goodkind.io/gklog v0.4.5
-	goodkind.io/go-makefile/selfupdate v0.0.0-20260703030139-1d33d4f11d19
+	goodkind.io/go-makefile v0.1.0
 	google.golang.org/protobuf v1.36.12
 )
 
@@ -17,9 +17,9 @@ require (
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467 // indirect
-	github.com/digitorus/pkcs7 v0.0.0-20260821105541-05f79448fa77 // indirect
-	github.com/digitorus/timestamp v0.0.0-20231217203849-220c5c2851b7 // indirect
+	github.com/cyberphone/json-canonicalization v0.0.0-20261011152517-32a48195b9b2 // indirect
+	github.com/digitorus/pkcs7 v0.0.0-20260914070511-d678ea5ea03f // indirect
+	github.com/digitorus/timestamp v0.0.0-20260914073129-b4b58b92aa51 // indirect
 	github.com/ebitengine/purego v0.11.2 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
