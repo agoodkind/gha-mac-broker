@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -24,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/golden"
@@ -66,12 +67,9 @@ var drainIdleTimeout = 45 * time.Second
 // mismatch means the VM runs an incompatible agent and is skipped.
 const hostProtocolMajor = uint32(1)
 
-// jobStatusStream is the subset of a guest JobStatus server stream drainJob
-// consumes. *connect.ServerStreamForClient satisfies it.
+// jobStatusStream receives guest execution events for the broker.
 type jobStatusStream interface {
-	Receive() bool
-	Msg() *guestproto.JobStatusEvent
-	Err() error
+	Receive() (*guestproto.JobStatusEvent, error)
 	Close() error
 }
 
@@ -487,9 +485,15 @@ func contextDone(ctx context.Context) bool {
 func drainStream(ctx context.Context, cancelIdle context.CancelCauseFunc, stream jobStatusStream, runLog *os.File, cursor *uint64) (*guestproto.TerminalResult, error) {
 	idle := time.AfterFunc(drainIdleTimeout, func() { cancelIdle(errDrainIdle) })
 	defer idle.Stop()
-	for stream.Receive() {
+	for {
+		event, err := stream.Receive()
+		if errors.Is(err, io.EOF) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("broker: guest status stream: %w", err)
+		}
 		idle.Reset(drainIdleTimeout)
-		event := stream.Msg()
 		*cursor = event.GetSequence()
 		if chunk := event.GetLog(); chunk != nil && runLog != nil {
 			// An evicted (nil-data) chunk is tolerated, not an error.
@@ -503,10 +507,6 @@ func drainStream(ctx context.Context, cancelIdle context.CancelCauseFunc, stream
 			return result, nil
 		}
 	}
-	if err := stream.Err(); err != nil {
-		return nil, fmt.Errorf("broker: guest status stream: %w", err)
-	}
-	return nil, nil
 }
 
 // sleepWithContext sleeps for delay unless ctx is done first.

@@ -3,12 +3,12 @@ module goodkind.io/gha-mac-broker
 go 1.27
 
 require (
-	connectrpc.com/connect v1.21.1
+	connectrpc.com/connect/v2 v2.0.2
 	github.com/google/go-containerregistry v0.22.1
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/shirou/gopsutil/v4 v4.26.9
 	golang.org/x/sys v0.49.0
-	goodkind.io/gklog v0.4.4
+	goodkind.io/gklog v0.4.5
 	goodkind.io/go-makefile/selfupdate v0.0.0-20260703030139-1d33d4f11d19
 	google.golang.org/protobuf v1.36.12
 )
@@ -82,8 +82,8 @@ require (
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20261012220534-4341edf3f941 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20261005182115-fad411399dd8 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20261019180522-ce908d29299b // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b // indirect
 	google.golang.org/grpc v1.84.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect

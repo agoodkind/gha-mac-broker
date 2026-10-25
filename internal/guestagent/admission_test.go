@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"connectrpc.com/connect"
 	"goodkind.io/gha-mac-broker/internal/guestexec"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
 )
@@ -81,15 +80,15 @@ func TestRunJobSerializesConcurrentSameSlot(t *testing.T) {
 	handler := New(registry, Options{SlotCount: 1, SpecBuilder: builder, ChildLauncher: launcher})
 
 	runJob := func(executionID string) (guestproto.RunJobResponse_Outcome, error) {
-		response, err := handler.RunJob(context.Background(), connect.NewRequest(&guestproto.RunJobRequest{
+		response, err := handler.RunJob(context.Background(), &guestproto.RunJobRequest{
 			ExecutionId: executionID,
 			Slot:        0,
 			JitConfig:   "jit",
-		}))
+		})
 		if err != nil {
 			return guestproto.RunJobResponse_OUTCOME_UNSPECIFIED, err
 		}
-		return response.Msg.GetOutcome(), nil
+		return response.GetOutcome(), nil
 	}
 
 	firstResult := make(chan guestproto.RunJobResponse_Outcome, 1)
@@ -234,27 +233,27 @@ func TestRunJobSkipsDestructivePrepWhenSlotBusy(t *testing.T) {
 	}
 	handler := New(registry, Options{SlotCount: 1, SpecBuilder: executor})
 
-	sameResponse, err := handler.RunJob(ctx, connect.NewRequest(&guestproto.RunJobRequest{
+	sameResponse, err := handler.RunJob(ctx, &guestproto.RunJobRequest{
 		ExecutionId: "job-live",
 		Slot:        0,
 		JitConfig:   "jit",
-	}))
+	})
 	if err != nil {
 		t.Fatalf("RunJob same id: %v", err)
 	}
-	if got := sameResponse.Msg.GetOutcome(); got != guestproto.RunJobResponse_ALREADY_RUNNING {
+	if got := sameResponse.GetOutcome(); got != guestproto.RunJobResponse_ALREADY_RUNNING {
 		t.Fatalf("same-id outcome = %v, want ALREADY_RUNNING", got)
 	}
 
-	conflictResponse, err := handler.RunJob(ctx, connect.NewRequest(&guestproto.RunJobRequest{
+	conflictResponse, err := handler.RunJob(ctx, &guestproto.RunJobRequest{
 		ExecutionId: "job-new",
 		Slot:        0,
 		JitConfig:   "jit",
-	}))
+	})
 	if err != nil {
 		t.Fatalf("RunJob conflicting slot: %v", err)
 	}
-	if got := conflictResponse.Msg.GetOutcome(); got != guestproto.RunJobResponse_CONFLICT {
+	if got := conflictResponse.GetOutcome(); got != guestproto.RunJobResponse_CONFLICT {
 		t.Fatalf("conflict outcome = %v, want CONFLICT", got)
 	}
 

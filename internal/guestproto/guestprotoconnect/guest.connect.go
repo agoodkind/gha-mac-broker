@@ -5,248 +5,308 @@
 package guestprotoconnect
 
 import (
-	connect "connectrpc.com/connect"
+	connect "connectrpc.com/connect/v2"
 	context "context"
-	errors "errors"
 	guestproto "goodkind.io/gha-mac-broker/internal/guestproto"
-	http "net/http"
-	strings "strings"
+	sync "sync"
 )
-
-// This is a compile-time assertion to ensure that this generated file and the connect package are
-// compatible. If you get a compiler error that this constant is not defined, this code was
-// generated with a version of connect newer than the one compiled into your binary. You can fix the
-// problem by either regenerating this code with an older version of connect or updating the connect
-// version compiled into your binary.
-const _ = connect.IsAtLeastVersion1_13_0
 
 const (
 	// GuestAgentServiceName is the fully-qualified name of the GuestAgentService service.
 	GuestAgentServiceName = "gha.guest.v1.GuestAgentService"
 )
 
-// These constants are the fully-qualified names of the RPCs defined in this package. They're
-// exposed at runtime as Spec.Procedure and as the final two segments of the HTTP route.
+// These constants are the procedure names of the RPCs defined in this package. They're exposed at
+// runtime as Spec.Procedure and as the final two segments of the HTTP route.
 //
 // Note that these are different from the fully-qualified method names used by
 // google.golang.org/protobuf/reflect/protoreflect. To convert from these constants to
 // reflection-formatted method names, remove the leading slash and convert the remaining slash to a
 // period.
 const (
-	// GuestAgentServiceHelloProcedure is the fully-qualified name of the GuestAgentService's Hello RPC.
+	// GuestAgentServiceHelloProcedure is the procedure name of the GuestAgentService's Hello RPC.
 	GuestAgentServiceHelloProcedure = "/gha.guest.v1.GuestAgentService/Hello"
-	// GuestAgentServiceRunJobProcedure is the fully-qualified name of the GuestAgentService's RunJob
-	// RPC.
+	// GuestAgentServiceRunJobProcedure is the procedure name of the GuestAgentService's RunJob RPC.
 	GuestAgentServiceRunJobProcedure = "/gha.guest.v1.GuestAgentService/RunJob"
-	// GuestAgentServiceJobStatusProcedure is the fully-qualified name of the GuestAgentService's
-	// JobStatus RPC.
+	// GuestAgentServiceJobStatusProcedure is the procedure name of the GuestAgentService's JobStatus
+	// RPC.
 	GuestAgentServiceJobStatusProcedure = "/gha.guest.v1.GuestAgentService/JobStatus"
-	// GuestAgentServiceReattachProcedure is the fully-qualified name of the GuestAgentService's
-	// Reattach RPC.
+	// GuestAgentServiceReattachProcedure is the procedure name of the GuestAgentService's Reattach RPC.
 	GuestAgentServiceReattachProcedure = "/gha.guest.v1.GuestAgentService/Reattach"
-	// GuestAgentServiceDrainProcedure is the fully-qualified name of the GuestAgentService's Drain RPC.
+	// GuestAgentServiceDrainProcedure is the procedure name of the GuestAgentService's Drain RPC.
 	GuestAgentServiceDrainProcedure = "/gha.guest.v1.GuestAgentService/Drain"
-	// GuestAgentServiceCancelJobProcedure is the fully-qualified name of the GuestAgentService's
-	// CancelJob RPC.
+	// GuestAgentServiceCancelJobProcedure is the procedure name of the GuestAgentService's CancelJob
+	// RPC.
 	GuestAgentServiceCancelJobProcedure = "/gha.guest.v1.GuestAgentService/CancelJob"
+)
+
+var (
+	guestAgentServiceHelloSpec = sync.OnceValue(func() connect.Spec {
+		return connect.Spec{
+			StreamType: connect.StreamTypeUnary,
+			Schema:     guestproto.File_guest_v1_guest_proto.Services().ByName("GuestAgentService").Methods().ByName("Hello"),
+			Procedure:  GuestAgentServiceHelloProcedure,
+		}
+	})
+	guestAgentServiceRunJobSpec = sync.OnceValue(func() connect.Spec {
+		return connect.Spec{
+			StreamType: connect.StreamTypeUnary,
+			Schema:     guestproto.File_guest_v1_guest_proto.Services().ByName("GuestAgentService").Methods().ByName("RunJob"),
+			Procedure:  GuestAgentServiceRunJobProcedure,
+		}
+	})
+	guestAgentServiceJobStatusSpec = sync.OnceValue(func() connect.Spec {
+		return connect.Spec{
+			StreamType: connect.StreamTypeServer,
+			Schema:     guestproto.File_guest_v1_guest_proto.Services().ByName("GuestAgentService").Methods().ByName("JobStatus"),
+			Procedure:  GuestAgentServiceJobStatusProcedure,
+		}
+	})
+	guestAgentServiceReattachSpec = sync.OnceValue(func() connect.Spec {
+		return connect.Spec{
+			StreamType: connect.StreamTypeUnary,
+			Schema:     guestproto.File_guest_v1_guest_proto.Services().ByName("GuestAgentService").Methods().ByName("Reattach"),
+			Procedure:  GuestAgentServiceReattachProcedure,
+		}
+	})
+	guestAgentServiceDrainSpec = sync.OnceValue(func() connect.Spec {
+		return connect.Spec{
+			StreamType: connect.StreamTypeUnary,
+			Schema:     guestproto.File_guest_v1_guest_proto.Services().ByName("GuestAgentService").Methods().ByName("Drain"),
+			Procedure:  GuestAgentServiceDrainProcedure,
+		}
+	})
+	guestAgentServiceCancelJobSpec = sync.OnceValue(func() connect.Spec {
+		return connect.Spec{
+			StreamType: connect.StreamTypeUnary,
+			Schema:     guestproto.File_guest_v1_guest_proto.Services().ByName("GuestAgentService").Methods().ByName("CancelJob"),
+			Procedure:  GuestAgentServiceCancelJobProcedure,
+		}
+	})
 )
 
 // GuestAgentServiceClient is a client for the gha.guest.v1.GuestAgentService service.
 type GuestAgentServiceClient interface {
-	Hello(context.Context, *connect.Request[guestproto.HelloRequest]) (*connect.Response[guestproto.HelloResponse], error)
-	RunJob(context.Context, *connect.Request[guestproto.RunJobRequest]) (*connect.Response[guestproto.RunJobResponse], error)
-	JobStatus(context.Context, *connect.Request[guestproto.JobStatusRequest]) (*connect.ServerStreamForClient[guestproto.JobStatusEvent], error)
-	Reattach(context.Context, *connect.Request[guestproto.ReattachRequest]) (*connect.Response[guestproto.ReattachResponse], error)
-	Drain(context.Context, *connect.Request[guestproto.DrainRequest]) (*connect.Response[guestproto.DrainResponse], error)
-	CancelJob(context.Context, *connect.Request[guestproto.CancelJobRequest]) (*connect.Response[guestproto.CancelJobResponse], error)
+	Hello(context.Context, *guestproto.HelloRequest) (*guestproto.HelloResponse, error)
+	RunJob(context.Context, *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error)
+	JobStatus(context.Context, *guestproto.JobStatusRequest) (GuestAgentServiceJobStatusClientStream, error)
+	Reattach(context.Context, *guestproto.ReattachRequest) (*guestproto.ReattachResponse, error)
+	Drain(context.Context, *guestproto.DrainRequest) (*guestproto.DrainResponse, error)
+	CancelJob(context.Context, *guestproto.CancelJobRequest) (*guestproto.CancelJobResponse, error)
 }
 
-// NewGuestAgentServiceClient constructs a client for the gha.guest.v1.GuestAgentService service. By
-// default, it uses the Connect protocol with the binary Protobuf Codec, asks for gzipped responses,
-// and sends uncompressed requests. To use the gRPC or gRPC-Web protocols, supply the
-// connect.WithGRPC() or connect.WithGRPCWeb() options.
-//
-// The URL supplied here should be the base URL for the Connect or gRPC server (for example,
-// http://api.acme.com or https://acme.com/grpc).
-func NewGuestAgentServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...connect.ClientOption) GuestAgentServiceClient {
-	baseURL = strings.TrimRight(baseURL, "/")
-	guestAgentServiceMethods := guestproto.File_guest_v1_guest_proto.Services().ByName("GuestAgentService").Methods()
-	return &guestAgentServiceClient{
-		hello: connect.NewClient[guestproto.HelloRequest, guestproto.HelloResponse](
-			httpClient,
-			baseURL+GuestAgentServiceHelloProcedure,
-			connect.WithSchema(guestAgentServiceMethods.ByName("Hello")),
-			connect.WithClientOptions(opts...),
-		),
-		runJob: connect.NewClient[guestproto.RunJobRequest, guestproto.RunJobResponse](
-			httpClient,
-			baseURL+GuestAgentServiceRunJobProcedure,
-			connect.WithSchema(guestAgentServiceMethods.ByName("RunJob")),
-			connect.WithClientOptions(opts...),
-		),
-		jobStatus: connect.NewClient[guestproto.JobStatusRequest, guestproto.JobStatusEvent](
-			httpClient,
-			baseURL+GuestAgentServiceJobStatusProcedure,
-			connect.WithSchema(guestAgentServiceMethods.ByName("JobStatus")),
-			connect.WithClientOptions(opts...),
-		),
-		reattach: connect.NewClient[guestproto.ReattachRequest, guestproto.ReattachResponse](
-			httpClient,
-			baseURL+GuestAgentServiceReattachProcedure,
-			connect.WithSchema(guestAgentServiceMethods.ByName("Reattach")),
-			connect.WithClientOptions(opts...),
-		),
-		drain: connect.NewClient[guestproto.DrainRequest, guestproto.DrainResponse](
-			httpClient,
-			baseURL+GuestAgentServiceDrainProcedure,
-			connect.WithSchema(guestAgentServiceMethods.ByName("Drain")),
-			connect.WithClientOptions(opts...),
-		),
-		cancelJob: connect.NewClient[guestproto.CancelJobRequest, guestproto.CancelJobResponse](
-			httpClient,
-			baseURL+GuestAgentServiceCancelJobProcedure,
-			connect.WithSchema(guestAgentServiceMethods.ByName("CancelJob")),
-			connect.WithClientOptions(opts...),
-		),
+// NewGuestAgentServiceClient constructs a client for the gha.guest.v1.GuestAgentService service.
+// Multiple service clients may share a single connect.Client.
+func NewGuestAgentServiceClient(client *connect.Client) GuestAgentServiceClient {
+	return &guestAgentServiceClient{client: client}
+}
+
+// GuestAgentServiceJobStatusClientStream is the client stream for the GuestAgentService's JobStatus
+// RPC.
+type GuestAgentServiceJobStatusClientStream struct {
+	stream connect.ClientStream
+}
+
+// Receive returns the next response message from the server.
+func (s GuestAgentServiceJobStatusClientStream) Receive() (*guestproto.JobStatusEvent, error) {
+	var res guestproto.JobStatusEvent
+	if err := s.stream.Receive(&res); err != nil {
+		return nil, err
 	}
+	return &res, nil
 }
 
-// guestAgentServiceClient implements GuestAgentServiceClient.
-type guestAgentServiceClient struct {
-	hello     *connect.Client[guestproto.HelloRequest, guestproto.HelloResponse]
-	runJob    *connect.Client[guestproto.RunJobRequest, guestproto.RunJobResponse]
-	jobStatus *connect.Client[guestproto.JobStatusRequest, guestproto.JobStatusEvent]
-	reattach  *connect.Client[guestproto.ReattachRequest, guestproto.ReattachResponse]
-	drain     *connect.Client[guestproto.DrainRequest, guestproto.DrainResponse]
-	cancelJob *connect.Client[guestproto.CancelJobRequest, guestproto.CancelJobResponse]
-}
-
-// Hello calls gha.guest.v1.GuestAgentService.Hello.
-func (c *guestAgentServiceClient) Hello(ctx context.Context, req *connect.Request[guestproto.HelloRequest]) (*connect.Response[guestproto.HelloResponse], error) {
-	return c.hello.CallUnary(ctx, req)
-}
-
-// RunJob calls gha.guest.v1.GuestAgentService.RunJob.
-func (c *guestAgentServiceClient) RunJob(ctx context.Context, req *connect.Request[guestproto.RunJobRequest]) (*connect.Response[guestproto.RunJobResponse], error) {
-	return c.runJob.CallUnary(ctx, req)
-}
-
-// JobStatus calls gha.guest.v1.GuestAgentService.JobStatus.
-func (c *guestAgentServiceClient) JobStatus(ctx context.Context, req *connect.Request[guestproto.JobStatusRequest]) (*connect.ServerStreamForClient[guestproto.JobStatusEvent], error) {
-	return c.jobStatus.CallServerStream(ctx, req)
-}
-
-// Reattach calls gha.guest.v1.GuestAgentService.Reattach.
-func (c *guestAgentServiceClient) Reattach(ctx context.Context, req *connect.Request[guestproto.ReattachRequest]) (*connect.Response[guestproto.ReattachResponse], error) {
-	return c.reattach.CallUnary(ctx, req)
-}
-
-// Drain calls gha.guest.v1.GuestAgentService.Drain.
-func (c *guestAgentServiceClient) Drain(ctx context.Context, req *connect.Request[guestproto.DrainRequest]) (*connect.Response[guestproto.DrainResponse], error) {
-	return c.drain.CallUnary(ctx, req)
-}
-
-// CancelJob calls gha.guest.v1.GuestAgentService.CancelJob.
-func (c *guestAgentServiceClient) CancelJob(ctx context.Context, req *connect.Request[guestproto.CancelJobRequest]) (*connect.Response[guestproto.CancelJobResponse], error) {
-	return c.cancelJob.CallUnary(ctx, req)
+// Close releases the stream's resources. It is idempotent and is typically deferred to clean up a
+// stream abandoned before io.EOF.
+func (s GuestAgentServiceJobStatusClientStream) Close() error {
+	return s.stream.Close()
 }
 
 // GuestAgentServiceHandler is an implementation of the gha.guest.v1.GuestAgentService service.
 type GuestAgentServiceHandler interface {
-	Hello(context.Context, *connect.Request[guestproto.HelloRequest]) (*connect.Response[guestproto.HelloResponse], error)
-	RunJob(context.Context, *connect.Request[guestproto.RunJobRequest]) (*connect.Response[guestproto.RunJobResponse], error)
-	JobStatus(context.Context, *connect.Request[guestproto.JobStatusRequest], *connect.ServerStream[guestproto.JobStatusEvent]) error
-	Reattach(context.Context, *connect.Request[guestproto.ReattachRequest]) (*connect.Response[guestproto.ReattachResponse], error)
-	Drain(context.Context, *connect.Request[guestproto.DrainRequest]) (*connect.Response[guestproto.DrainResponse], error)
-	CancelJob(context.Context, *connect.Request[guestproto.CancelJobRequest]) (*connect.Response[guestproto.CancelJobResponse], error)
+	Hello(context.Context, *guestproto.HelloRequest) (*guestproto.HelloResponse, error)
+	RunJob(context.Context, *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error)
+	JobStatus(context.Context, *guestproto.JobStatusRequest, GuestAgentServiceJobStatusServerStream) error
+	Reattach(context.Context, *guestproto.ReattachRequest) (*guestproto.ReattachResponse, error)
+	Drain(context.Context, *guestproto.DrainRequest) (*guestproto.DrainResponse, error)
+	CancelJob(context.Context, *guestproto.CancelJobRequest) (*guestproto.CancelJobResponse, error)
 }
 
-// NewGuestAgentServiceHandler builds an HTTP handler from the service implementation. It returns
-// the path on which to mount the handler and the handler itself.
-//
-// By default, handlers support the Connect, gRPC, and gRPC-Web protocols with the binary Protobuf
-// and JSON codecs. They also support gzip compression.
-func NewGuestAgentServiceHandler(svc GuestAgentServiceHandler, opts ...connect.HandlerOption) (string, http.Handler) {
-	guestAgentServiceMethods := guestproto.File_guest_v1_guest_proto.Services().ByName("GuestAgentService").Methods()
-	guestAgentServiceHelloHandler := connect.NewUnaryHandler(
-		GuestAgentServiceHelloProcedure,
-		svc.Hello,
-		connect.WithSchema(guestAgentServiceMethods.ByName("Hello")),
-		connect.WithHandlerOptions(opts...),
+// RegisterGuestAgentServiceHandler registers svc as the gha.guest.v1.GuestAgentService
+// implementation on server.
+func RegisterGuestAgentServiceHandler(server *connect.Server, svc GuestAgentServiceHandler) {
+	adapter := guestAgentServiceHandler{svc: svc}
+	server.Register(
+		connect.Method{Spec: guestAgentServiceHelloSpec(), Handler: adapter.hello},
+		connect.Method{Spec: guestAgentServiceRunJobSpec(), Handler: adapter.runJob},
+		connect.Method{Spec: guestAgentServiceJobStatusSpec(), Handler: adapter.jobStatus},
+		connect.Method{Spec: guestAgentServiceReattachSpec(), Handler: adapter.reattach},
+		connect.Method{Spec: guestAgentServiceDrainSpec(), Handler: adapter.drain},
+		connect.Method{Spec: guestAgentServiceCancelJobSpec(), Handler: adapter.cancelJob},
 	)
-	guestAgentServiceRunJobHandler := connect.NewUnaryHandler(
-		GuestAgentServiceRunJobProcedure,
-		svc.RunJob,
-		connect.WithSchema(guestAgentServiceMethods.ByName("RunJob")),
-		connect.WithHandlerOptions(opts...),
-	)
-	guestAgentServiceJobStatusHandler := connect.NewServerStreamHandler(
-		GuestAgentServiceJobStatusProcedure,
-		svc.JobStatus,
-		connect.WithSchema(guestAgentServiceMethods.ByName("JobStatus")),
-		connect.WithHandlerOptions(opts...),
-	)
-	guestAgentServiceReattachHandler := connect.NewUnaryHandler(
-		GuestAgentServiceReattachProcedure,
-		svc.Reattach,
-		connect.WithSchema(guestAgentServiceMethods.ByName("Reattach")),
-		connect.WithHandlerOptions(opts...),
-	)
-	guestAgentServiceDrainHandler := connect.NewUnaryHandler(
-		GuestAgentServiceDrainProcedure,
-		svc.Drain,
-		connect.WithSchema(guestAgentServiceMethods.ByName("Drain")),
-		connect.WithHandlerOptions(opts...),
-	)
-	guestAgentServiceCancelJobHandler := connect.NewUnaryHandler(
-		GuestAgentServiceCancelJobProcedure,
-		svc.CancelJob,
-		connect.WithSchema(guestAgentServiceMethods.ByName("CancelJob")),
-		connect.WithHandlerOptions(opts...),
-	)
-	return "/gha.guest.v1.GuestAgentService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case GuestAgentServiceHelloProcedure:
-			guestAgentServiceHelloHandler.ServeHTTP(w, r)
-		case GuestAgentServiceRunJobProcedure:
-			guestAgentServiceRunJobHandler.ServeHTTP(w, r)
-		case GuestAgentServiceJobStatusProcedure:
-			guestAgentServiceJobStatusHandler.ServeHTTP(w, r)
-		case GuestAgentServiceReattachProcedure:
-			guestAgentServiceReattachHandler.ServeHTTP(w, r)
-		case GuestAgentServiceDrainProcedure:
-			guestAgentServiceDrainHandler.ServeHTTP(w, r)
-		case GuestAgentServiceCancelJobProcedure:
-			guestAgentServiceCancelJobHandler.ServeHTTP(w, r)
-		default:
-			http.NotFound(w, r)
-		}
-	})
+}
+
+// GuestAgentServiceJobStatusServerStream is the server stream for the GuestAgentService's JobStatus
+// RPC.
+type GuestAgentServiceJobStatusServerStream struct {
+	stream connect.ServerStream
+}
+
+// SendHeaders flushes the response headers without a message. The first Send does this implicitly.
+func (s GuestAgentServiceJobStatusServerStream) SendHeaders() error {
+	return s.stream.SendHeaders()
+}
+
+// Send sends a response message to the client.
+func (s GuestAgentServiceJobStatusServerStream) Send(res *guestproto.JobStatusEvent) error {
+	return s.stream.Send(res)
 }
 
 // UnimplementedGuestAgentServiceHandler returns CodeUnimplemented from all methods.
 type UnimplementedGuestAgentServiceHandler struct{}
 
-func (UnimplementedGuestAgentServiceHandler) Hello(context.Context, *connect.Request[guestproto.HelloRequest]) (*connect.Response[guestproto.HelloResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("gha.guest.v1.GuestAgentService.Hello is not implemented"))
+func (UnimplementedGuestAgentServiceHandler) Hello(context.Context, *guestproto.HelloRequest) (*guestproto.HelloResponse, error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, "gha.guest.v1.GuestAgentService.Hello is not implemented")
 }
 
-func (UnimplementedGuestAgentServiceHandler) RunJob(context.Context, *connect.Request[guestproto.RunJobRequest]) (*connect.Response[guestproto.RunJobResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("gha.guest.v1.GuestAgentService.RunJob is not implemented"))
+func (UnimplementedGuestAgentServiceHandler) RunJob(context.Context, *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, "gha.guest.v1.GuestAgentService.RunJob is not implemented")
 }
 
-func (UnimplementedGuestAgentServiceHandler) JobStatus(context.Context, *connect.Request[guestproto.JobStatusRequest], *connect.ServerStream[guestproto.JobStatusEvent]) error {
-	return connect.NewError(connect.CodeUnimplemented, errors.New("gha.guest.v1.GuestAgentService.JobStatus is not implemented"))
+func (UnimplementedGuestAgentServiceHandler) JobStatus(context.Context, *guestproto.JobStatusRequest, GuestAgentServiceJobStatusServerStream) error {
+	return connect.NewError(connect.CodeUnimplemented, "gha.guest.v1.GuestAgentService.JobStatus is not implemented")
 }
 
-func (UnimplementedGuestAgentServiceHandler) Reattach(context.Context, *connect.Request[guestproto.ReattachRequest]) (*connect.Response[guestproto.ReattachResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("gha.guest.v1.GuestAgentService.Reattach is not implemented"))
+func (UnimplementedGuestAgentServiceHandler) Reattach(context.Context, *guestproto.ReattachRequest) (*guestproto.ReattachResponse, error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, "gha.guest.v1.GuestAgentService.Reattach is not implemented")
 }
 
-func (UnimplementedGuestAgentServiceHandler) Drain(context.Context, *connect.Request[guestproto.DrainRequest]) (*connect.Response[guestproto.DrainResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("gha.guest.v1.GuestAgentService.Drain is not implemented"))
+func (UnimplementedGuestAgentServiceHandler) Drain(context.Context, *guestproto.DrainRequest) (*guestproto.DrainResponse, error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, "gha.guest.v1.GuestAgentService.Drain is not implemented")
 }
 
-func (UnimplementedGuestAgentServiceHandler) CancelJob(context.Context, *connect.Request[guestproto.CancelJobRequest]) (*connect.Response[guestproto.CancelJobResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("gha.guest.v1.GuestAgentService.CancelJob is not implemented"))
+func (UnimplementedGuestAgentServiceHandler) CancelJob(context.Context, *guestproto.CancelJobRequest) (*guestproto.CancelJobResponse, error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, "gha.guest.v1.GuestAgentService.CancelJob is not implemented")
+}
+
+type guestAgentServiceClient struct {
+	client *connect.Client
+}
+
+func (c *guestAgentServiceClient) Hello(ctx context.Context, req *guestproto.HelloRequest) (*guestproto.HelloResponse, error) {
+	var res guestproto.HelloResponse
+	if err := c.client.CallUnary(ctx, guestAgentServiceHelloSpec(), req, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+func (c *guestAgentServiceClient) RunJob(ctx context.Context, req *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error) {
+	var res guestproto.RunJobResponse
+	if err := c.client.CallUnary(ctx, guestAgentServiceRunJobSpec(), req, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+func (c *guestAgentServiceClient) JobStatus(ctx context.Context, req *guestproto.JobStatusRequest) (GuestAgentServiceJobStatusClientStream, error) {
+	stream, err := c.client.CallServerStream(ctx, guestAgentServiceJobStatusSpec(), req)
+	if err != nil {
+		return GuestAgentServiceJobStatusClientStream{}, err
+	}
+	return GuestAgentServiceJobStatusClientStream{stream: stream}, nil
+}
+
+func (c *guestAgentServiceClient) Reattach(ctx context.Context, req *guestproto.ReattachRequest) (*guestproto.ReattachResponse, error) {
+	var res guestproto.ReattachResponse
+	if err := c.client.CallUnary(ctx, guestAgentServiceReattachSpec(), req, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+func (c *guestAgentServiceClient) Drain(ctx context.Context, req *guestproto.DrainRequest) (*guestproto.DrainResponse, error) {
+	var res guestproto.DrainResponse
+	if err := c.client.CallUnary(ctx, guestAgentServiceDrainSpec(), req, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+func (c *guestAgentServiceClient) CancelJob(ctx context.Context, req *guestproto.CancelJobRequest) (*guestproto.CancelJobResponse, error) {
+	var res guestproto.CancelJobResponse
+	if err := c.client.CallUnary(ctx, guestAgentServiceCancelJobSpec(), req, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+type guestAgentServiceHandler struct{ svc GuestAgentServiceHandler }
+
+func (h guestAgentServiceHandler) hello(ctx context.Context, _ connect.Spec, stream connect.ServerStream) error {
+	var req guestproto.HelloRequest
+	if err := stream.Receive(&req); err != nil {
+		return err
+	}
+	res, err := h.svc.Hello(ctx, &req)
+	if err != nil {
+		return err
+	}
+	return stream.Send(res)
+}
+
+func (h guestAgentServiceHandler) runJob(ctx context.Context, _ connect.Spec, stream connect.ServerStream) error {
+	var req guestproto.RunJobRequest
+	if err := stream.Receive(&req); err != nil {
+		return err
+	}
+	res, err := h.svc.RunJob(ctx, &req)
+	if err != nil {
+		return err
+	}
+	return stream.Send(res)
+}
+
+func (h guestAgentServiceHandler) jobStatus(ctx context.Context, _ connect.Spec, stream connect.ServerStream) error {
+	var req guestproto.JobStatusRequest
+	if err := stream.Receive(&req); err != nil {
+		return err
+	}
+	return h.svc.JobStatus(ctx, &req, GuestAgentServiceJobStatusServerStream{stream: stream})
+}
+
+func (h guestAgentServiceHandler) reattach(ctx context.Context, _ connect.Spec, stream connect.ServerStream) error {
+	var req guestproto.ReattachRequest
+	if err := stream.Receive(&req); err != nil {
+		return err
+	}
+	res, err := h.svc.Reattach(ctx, &req)
+	if err != nil {
+		return err
+	}
+	return stream.Send(res)
+}
+
+func (h guestAgentServiceHandler) drain(ctx context.Context, _ connect.Spec, stream connect.ServerStream) error {
+	var req guestproto.DrainRequest
+	if err := stream.Receive(&req); err != nil {
+		return err
+	}
+	res, err := h.svc.Drain(ctx, &req)
+	if err != nil {
+		return err
+	}
+	return stream.Send(res)
+}
+
+func (h guestAgentServiceHandler) cancelJob(ctx context.Context, _ connect.Spec, stream connect.ServerStream) error {
+	var req guestproto.CancelJobRequest
+	if err := stream.Receive(&req); err != nil {
+		return err
+	}
+	res, err := h.svc.CancelJob(ctx, &req)
+	if err != nil {
+		return err
+	}
+	return stream.Send(res)
 }
