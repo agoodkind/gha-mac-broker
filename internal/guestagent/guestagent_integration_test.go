@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"connectrpc.com/connect"
 	"goodkind.io/gha-mac-broker/internal/guestagent"
 	"goodkind.io/gha-mac-broker/internal/guestclient"
 	"goodkind.io/gha-mac-broker/internal/guestexec"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
+	"goodkind.io/gha-mac-broker/internal/guestproto/guestprotoconnect"
 	"goodkind.io/gha-mac-broker/internal/guesttransport"
 )
 
@@ -195,7 +195,7 @@ func waitForServer(t *testing.T, done <-chan error) {
 func readUntilLog(
 	t *testing.T,
 	ctx context.Context,
-	stream *connect.ServerStreamForClient[guestproto.JobStatusEvent],
+	stream guestprotoconnect.GuestAgentServiceJobStatusClientStream,
 	substring string,
 ) []*guestproto.JobStatusEvent {
 	t.Helper()
@@ -204,10 +204,10 @@ func readUntilLog(
 		if err := ctx.Err(); err != nil {
 			t.Fatalf("context done before log %q: %v", substring, err)
 		}
-		if !stream.Receive() {
-			t.Fatalf("stream closed before log %q: %v", substring, stream.Err())
+		event, err := stream.Receive()
+		if err != nil {
+			t.Fatalf("stream closed before log %q: %v", substring, err)
 		}
-		event := stream.Msg()
 		events = append(events, event)
 		logChunk := event.GetLog()
 		if logChunk != nil && strings.Contains(string(logChunk.GetData()), substring) {
@@ -219,7 +219,7 @@ func readUntilLog(
 func readThroughTerminal(
 	t *testing.T,
 	ctx context.Context,
-	stream *connect.ServerStreamForClient[guestproto.JobStatusEvent],
+	stream guestprotoconnect.GuestAgentServiceJobStatusClientStream,
 ) []*guestproto.JobStatusEvent {
 	t.Helper()
 	events := make([]*guestproto.JobStatusEvent, 0)
@@ -227,10 +227,10 @@ func readThroughTerminal(
 		if err := ctx.Err(); err != nil {
 			t.Fatalf("context done before terminal result: %v", err)
 		}
-		if !stream.Receive() {
-			t.Fatalf("stream closed before terminal result: %v", stream.Err())
+		event, err := stream.Receive()
+		if err != nil {
+			t.Fatalf("stream closed before terminal result: %v", err)
 		}
-		event := stream.Msg()
 		events = append(events, event)
 		if event.GetResult() != nil {
 			return events

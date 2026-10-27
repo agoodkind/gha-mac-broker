@@ -9,7 +9,7 @@ import (
 	"errors"
 	"strconv"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
 	"goodkind.io/gha-mac-broker/internal/guestexec"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
 )
@@ -120,15 +120,15 @@ func executionStateToProto(state guestexec.ExecutionState) *guestproto.Execution
 func mapRegistryError(err error) error {
 	switch {
 	case errors.Is(err, guestexec.ErrExecutionNotFound):
-		return connect.NewError(connect.CodeNotFound, err)
+		return connect.NewError(connect.CodeNotFound, err.Error()).WithCause(err)
 	case errors.Is(err, guestexec.ErrDraining):
-		return connect.NewError(connect.CodeUnavailable, err)
+		return connect.NewError(connect.CodeUnavailable, err.Error()).WithCause(err)
 	case errors.Is(err, context.Canceled):
-		return connect.NewError(connect.CodeCanceled, err)
+		return connect.NewError(connect.CodeCanceled, err.Error()).WithCause(err)
 	case errors.Is(err, context.DeadlineExceeded):
-		return connect.NewError(connect.CodeDeadlineExceeded, err)
+		return connect.NewError(connect.CodeDeadlineExceeded, err.Error()).WithCause(err)
 	default:
-		return connect.NewError(connect.CodeInternal, err)
+		return connect.NewError(connect.CodeInternal, err.Error()).WithCause(err)
 	}
 }
 

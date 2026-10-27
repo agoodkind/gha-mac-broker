@@ -7,7 +7,8 @@ import (
 	"net/http"
 	"sync"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connecthttp"
 	"goodkind.io/gha-mac-broker/internal/guestexec"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
 	"goodkind.io/gha-mac-broker/internal/guestproto/guestprotoconnect"
@@ -122,16 +123,17 @@ func (handler *Handler) slotLock(slot uint32) *sync.Mutex {
 // NewHTTPHandler mounts a guest-agent service on the generated ConnectRPC path.
 func NewHTTPHandler(registry *guestexec.Registry, options Options) http.Handler {
 	mux := http.NewServeMux()
-	path, handler := guestprotoconnect.NewGuestAgentServiceHandler(New(registry, options))
-	mux.Handle(path, handler)
+	server := connect.NewServer()
+	guestprotoconnect.RegisterGuestAgentServiceHandler(server, New(registry, options))
+	connecthttp.Mount(mux, server, connecthttp.WithReadMaxBytes(0))
 	return mux
 }
 
 // Hello returns agent metadata and the current configured slot snapshot.
 func (handler *Handler) Hello(
 	_ context.Context,
-	_ *connect.Request[guestproto.HelloRequest],
-) (*connect.Response[guestproto.HelloResponse], error) {
+	_ *guestproto.HelloRequest,
+) (*guestproto.HelloResponse, error) {
 	response := &guestproto.HelloResponse{
 		BootId:        handler.bootID,
 		AgentBuild:    handler.agentBuild,
@@ -145,7 +147,7 @@ func (handler *Handler) Hello(
 		Slots:             handler.slots(),
 		GoldenFingerprint: handler.goldenFingerprint,
 	}
-	return connect.NewResponse(response), nil
+	return response, nil
 }
 
 // RunJob builds the runner ExecSpec through the spec builder, which prepares the
@@ -153,14 +155,14 @@ func (handler *Handler) Hello(
 // execution using the request ID as the idempotency key.
 func (handler *Handler) RunJob(
 	ctx context.Context,
-	request *connect.Request[guestproto.RunJobRequest],
-) (*connect.Response[guestproto.RunJobResponse], error) {
+	request *guestproto.RunJobRequest,
+) (*guestproto.RunJobResponse, error) {
 	jobRequest := JobRequest{
-		ExecutionID: request.Msg.GetExecutionId(),
-		Slot:        request.Msg.GetSlot(),
-		Meta:        protoMetaToExec(request.Msg.GetMeta()),
-		JitConfig:   request.Msg.GetJitConfig(),
-		Env:         copyEnvironment(request.Msg.GetEnv()),
+		ExecutionID: request.GetExecutionId(),
+		Slot:        request.GetSlot(),
+		Meta:        protoMetaToExec(request.GetMeta()),
+		JitConfig:   request.GetJitConfig(),
+		Env:         copyEnvironment(request.GetEnv()),
 	}
 	// Serialize admission, prep, and start per slot for the whole critical section,
 	// so two concurrent RunJobs for the same slot cannot both pass admission and
@@ -183,18 +185,18 @@ func (handler *Handler) RunJob(
 	}
 	if admission != guestexec.OutcomeAccepted {
 		response := &guestproto.RunJobResponse{Outcome: outcomeToProto(admission)}
-		return connect.NewResponse(response), nil
+		return response, nil
 	}
 	spec, err := handler.specBuilder.Build(ctx, jobRequest)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, connect.NewError(connect.CodeInternal, err.Error()).WithCause(err)
 	}
 	outcome, err := handler.startExecution(spec)
 	if err != nil {
 		return nil, mapRegistryError(err)
 	}
 	response := &guestproto.RunJobResponse{Outcome: outcomeToProto(outcome)}
-	return connect.NewResponse(response), nil
+	return response, nil
 }
 
 // startExecution forks the runner in-process through the registry, which owns
@@ -211,12 +213,12 @@ func (handler *Handler) startExecution(spec guestexec.ExecSpec) (guestexec.Outco
 // stream cancellation, or registry close.
 func (handler *Handler) JobStatus(
 	ctx context.Context,
-	request *connect.Request[guestproto.JobStatusRequest],
-	stream *connect.ServerStream[guestproto.JobStatusEvent],
+	request *guestproto.JobStatusRequest,
+	stream guestprotoconnect.GuestAgentServiceJobStatusServerStream,
 ) error {
 	events, unsubscribe, err := handler.registry.Subscribe(
-		request.Msg.GetExecutionId(),
-		request.Msg.GetFromSequence(),
+		request.GetExecutionId(),
+		request.GetFromSequence(),
 	)
 	if err != nil {
 		return mapRegistryError(err)
@@ -245,38 +247,38 @@ func (handler *Handler) JobStatus(
 // Reattach returns active and retained executions with their last sequence.
 func (handler *Handler) Reattach(
 	_ context.Context,
-	_ *connect.Request[guestproto.ReattachRequest],
-) (*connect.Response[guestproto.ReattachResponse], error) {
+	_ *guestproto.ReattachRequest,
+) (*guestproto.ReattachResponse, error) {
 	states := handler.registry.List()
 	executions := make([]*guestproto.ExecutionState, 0, len(states))
 	for _, state := range states {
 		executions = append(executions, executionStateToProto(state))
 	}
-	return connect.NewResponse(&guestproto.ReattachResponse{Executions: executions}), nil
+	return &guestproto.ReattachResponse{Executions: executions}, nil
 }
 
 // Drain refuses future executions and reports whether the registry is idle.
 func (handler *Handler) Drain(
 	_ context.Context,
-	_ *connect.Request[guestproto.DrainRequest],
-) (*connect.Response[guestproto.DrainResponse], error) {
+	_ *guestproto.DrainRequest,
+) (*guestproto.DrainResponse, error) {
 	state := handler.registry.Drain()
 	response := &guestproto.DrainResponse{
 		Idle:             state.Idle,
 		ActiveExecutions: state.ActiveExecutions,
 	}
-	return connect.NewResponse(response), nil
+	return response, nil
 }
 
 // CancelJob requests process-group cancellation for one execution.
 func (handler *Handler) CancelJob(
 	_ context.Context,
-	request *connect.Request[guestproto.CancelJobRequest],
-) (*connect.Response[guestproto.CancelJobResponse], error) {
-	if err := handler.registry.Cancel(request.Msg.GetExecutionId()); err != nil {
+	request *guestproto.CancelJobRequest,
+) (*guestproto.CancelJobResponse, error) {
+	if err := handler.registry.Cancel(request.GetExecutionId()); err != nil {
 		return nil, mapRegistryError(err)
 	}
-	return connect.NewResponse(&guestproto.CancelJobResponse{}), nil
+	return &guestproto.CancelJobResponse{}, nil
 }
 
 func (handler *Handler) slots() []*guestproto.SlotInfo {

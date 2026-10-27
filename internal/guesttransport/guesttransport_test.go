@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,7 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connecthttp"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -20,6 +22,16 @@ const (
 	testUnaryProcedure  = "/test.guest.v1.TestService/Echo"
 	testStreamProcedure = "/test.guest.v1.TestService/Watch"
 )
+
+var testUnarySpec = connect.Spec{
+	Procedure:  testUnaryProcedure,
+	StreamType: connect.StreamTypeUnary,
+}
+
+var testStreamSpec = connect.Spec{
+	Procedure:  testStreamProcedure,
+	StreamType: connect.StreamTypeServer,
+}
 
 func TestUnaryAuthentication(t *testing.T) {
 	t.Parallel()
@@ -63,21 +75,23 @@ func TestUnaryAuthentication(t *testing.T) {
 				tcpDialer(listener.Addr().String()),
 				testCase.token,
 			)
-			clientOptions := make([]connect.ClientOption, 0, 1)
+			clientOptions := make([]connect.ClientInterceptor, 0, 1)
 			if testCase.auth {
 				clientOptions = append(
 					clientOptions,
-					connect.WithInterceptors(clientTransport.Interceptor()),
+					clientTransport.Interceptor(),
 				)
 			}
-			client := connect.NewClient[wrapperspb.StringValue, wrapperspb.StringValue](
-				clientTransport.HTTPClient(),
-				fmt.Sprintf("http://%s%s", listener.Addr(), testUnaryProcedure),
+			client := connect.NewClient(
+				connecthttp.NewTransport(clientTransport.HTTPClient(), "http://"+listener.Addr().String()),
 				clientOptions...,
 			)
-			response, err := client.CallUnary(
+			response := new(wrapperspb.StringValue)
+			err := client.CallUnary(
 				context.Background(),
-				connect.NewRequest(wrapperspb.String("hello")),
+				testUnarySpec,
+				wrapperspb.String("hello"),
+				response,
 			)
 			if testCase.wantCode != 0 {
 				if connect.CodeOf(err) != testCase.wantCode {
@@ -88,8 +102,8 @@ func TestUnaryAuthentication(t *testing.T) {
 			if err != nil {
 				t.Fatalf("CallUnary() error = %v", err)
 			}
-			if response.Msg.Value != testCase.wantValue {
-				t.Fatalf("CallUnary() value = %q, want %q", response.Msg.Value, testCase.wantValue)
+			if response.Value != testCase.wantValue {
+				t.Fatalf("CallUnary() value = %q, want %q", response.Value, testCase.wantValue)
 			}
 		})
 	}
@@ -100,14 +114,15 @@ func TestServerAuthInterceptorRejectsWrongToken(t *testing.T) {
 
 	server := httptest.NewServer(newTestHandler(testToken))
 	t.Cleanup(server.Close)
-	client := connect.NewClient[wrapperspb.StringValue, wrapperspb.StringValue](
-		server.Client(),
-		server.URL+testUnaryProcedure,
-		connect.WithInterceptors(NewClientAuthInterceptor("wrong-token")),
+	client := connect.NewClient(
+		connecthttp.NewTransport(server.Client(), server.URL),
+		NewClientAuthInterceptor("wrong-token"),
 	)
-	_, err := client.CallUnary(
+	err := client.CallUnary(
 		context.Background(),
-		connect.NewRequest(wrapperspb.String("hello")),
+		testUnarySpec,
+		wrapperspb.String("hello"),
+		new(wrapperspb.StringValue),
 	)
 	if connect.CodeOf(err) != connect.CodeUnauthenticated {
 		t.Fatalf(
@@ -131,26 +146,32 @@ func TestServerStreamAuthenticationAndMessages(t *testing.T) {
 	})
 
 	clientTransport := DialContext(context.Background(), tcpDialer(listener.Addr().String()), testToken)
-	client := connect.NewClient[wrapperspb.StringValue, wrapperspb.StringValue](
-		clientTransport.HTTPClient(),
-		fmt.Sprintf("http://%s%s", listener.Addr(), testStreamProcedure),
-		connect.WithInterceptors(clientTransport.Interceptor()),
+	client := connect.NewClient(
+		connecthttp.NewTransport(clientTransport.HTTPClient(), "http://"+listener.Addr().String()),
+		clientTransport.Interceptor(),
 	)
 	stream, err := client.CallServerStream(
 		context.Background(),
-		connect.NewRequest(wrapperspb.String("event")),
+		testStreamSpec,
+		wrapperspb.String("event"),
 	)
 	if err != nil {
 		t.Fatalf("CallServerStream() error = %v", err)
 	}
 
 	var messages []string
-	for stream.Receive() {
-		messages = append(messages, stream.Msg().Value)
+	for {
+		message := new(wrapperspb.StringValue)
+		err := stream.Receive(message)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("Receive() error = %v", err)
+		}
+		messages = append(messages, message.Value)
 	}
-	if err := stream.Err(); err != nil {
-		t.Fatalf("Receive() error = %v", err)
-	}
+
 	wantMessages := []string{"event:1", "event:2", "event:3"}
 	if !reflect.DeepEqual(messages, wantMessages) {
 		t.Fatalf("stream messages = %#v, want %#v", messages, wantMessages)
@@ -183,32 +204,36 @@ func TestClientReconnectsAfterServerRestart(t *testing.T) {
 
 func newTestHandler(token string) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle(
-		testUnaryProcedure,
-		connect.NewUnaryHandler(
-			testUnaryProcedure,
-			func(_ context.Context, request *connect.Request[wrapperspb.StringValue]) (*connect.Response[wrapperspb.StringValue], error) {
-				return connect.NewResponse(wrapperspb.String("echo:" + request.Msg.Value)), nil
+	server := connect.NewServer(NewServerAuthInterceptor(token))
+	server.Register(
+		connect.Method{
+			Spec: testUnarySpec,
+			Handler: func(_ context.Context, _ connect.Spec, stream connect.ServerStream) error {
+				request := new(wrapperspb.StringValue)
+				if err := stream.Receive(request); err != nil {
+					return err
+				}
+				return stream.Send(wrapperspb.String("echo:" + request.Value))
 			},
-			connect.WithInterceptors(NewServerAuthInterceptor(token)),
-		),
-	)
-	mux.Handle(
-		testStreamProcedure,
-		connect.NewServerStreamHandler(
-			testStreamProcedure,
-			func(_ context.Context, request *connect.Request[wrapperspb.StringValue], stream *connect.ServerStream[wrapperspb.StringValue]) error {
+		},
+		connect.Method{
+			Spec: testStreamSpec,
+			Handler: func(_ context.Context, _ connect.Spec, stream connect.ServerStream) error {
+				request := new(wrapperspb.StringValue)
+				if err := stream.Receive(request); err != nil {
+					return err
+				}
 				for sequence := 1; sequence <= 3; sequence++ {
-					message := wrapperspb.String(fmt.Sprintf("%s:%d", request.Msg.Value, sequence))
+					message := wrapperspb.String(fmt.Sprintf("%s:%d", request.Value, sequence))
 					if err := stream.Send(message); err != nil {
 						return err
 					}
 				}
 				return nil
 			},
-			connect.WithInterceptors(NewServerAuthInterceptor(token)),
-		),
+		},
 	)
+	connecthttp.Mount(mux, server)
 	return mux
 }
 
@@ -225,32 +250,34 @@ func newUnaryClient(
 	ctx context.Context,
 	address string,
 	token string,
-) *connect.Client[wrapperspb.StringValue, wrapperspb.StringValue] {
+) *connect.Client {
 	t.Helper()
 	clientTransport := DialContext(ctx, tcpDialer(address), token)
-	return connect.NewClient[wrapperspb.StringValue, wrapperspb.StringValue](
-		clientTransport.HTTPClient(),
-		fmt.Sprintf("http://%s%s", address, testUnaryProcedure),
-		connect.WithInterceptors(clientTransport.Interceptor()),
+	return connect.NewClient(
+		connecthttp.NewTransport(clientTransport.HTTPClient(), "http://"+address),
+		clientTransport.Interceptor(),
 	)
 }
 
 func callUnary(
 	t *testing.T,
-	client *connect.Client[wrapperspb.StringValue, wrapperspb.StringValue],
+	client *connect.Client,
 	value string,
 	want string,
 ) {
 	t.Helper()
-	response, err := client.CallUnary(
+	response := new(wrapperspb.StringValue)
+	err := client.CallUnary(
 		context.Background(),
-		connect.NewRequest(wrapperspb.String(value)),
+		testUnarySpec,
+		wrapperspb.String(value),
+		response,
 	)
 	if err != nil {
 		t.Fatalf("CallUnary(%q) error = %v", value, err)
 	}
-	if response.Msg.Value != want {
-		t.Fatalf("CallUnary(%q) value = %q, want %q", value, response.Msg.Value, want)
+	if response.Value != want {
+		t.Fatalf("CallUnary(%q) value = %q, want %q", value, response.Value, want)
 	}
 }
 

@@ -13,7 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connecthttp"
 )
 
 const (
@@ -29,7 +30,7 @@ const (
 // needed to construct a ConnectRPC client.
 type Client struct {
 	httpClient  *http.Client
-	interceptor connect.Interceptor
+	interceptor connect.ClientInterceptor
 }
 
 // GuestDialer establishes one transport connection to the guest agent. The
@@ -63,7 +64,7 @@ func (client *Client) HTTPClient() *http.Client {
 
 // Interceptor returns the bearer-token interceptor used by a generated
 // ConnectRPC client.
-func (client *Client) Interceptor() connect.Interceptor {
+func (client *Client) Interceptor() connect.ClientInterceptor {
 	return client.interceptor
 }
 
@@ -204,57 +205,38 @@ func (connection *trackedConnection) Close() error {
 
 // NewClientAuthInterceptor injects the boot-scoped bearer token into unary and
 // streaming ConnectRPC requests.
-func NewClientAuthInterceptor(token string) connect.Interceptor {
-	return &authInterceptor{token: token, client: true}
+func NewClientAuthInterceptor(token string) connect.ClientInterceptor {
+	return func(next connect.ClientFunc) connect.ClientFunc {
+		return func(ctx context.Context, spec connect.Spec) (connect.ClientStream, error) {
+			info, found := connect.CallInfoForClientContext(ctx)
+			if !found {
+				return nil, errors.New("guest transport: missing client call metadata")
+			}
+			info.RequestHeader().Set(authorizationHeader, bearerPrefix+token)
+			return next(ctx, spec)
+		}
+	}
 }
 
 // NewServerAuthInterceptor validates the boot-scoped bearer token on unary and
 // streaming ConnectRPC requests.
-func NewServerAuthInterceptor(token string) connect.Interceptor {
-	return &authInterceptor{token: token, client: false}
-}
-
-type authInterceptor struct {
-	token  string
-	client bool
-}
-
-func (interceptor *authInterceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
-	return func(ctx context.Context, request connect.AnyRequest) (connect.AnyResponse, error) {
-		if interceptor.client {
-			setAuthorization(request.Header(), interceptor.token)
-		} else if !validAuthorization(request.Header(), interceptor.token) {
-			return nil, unauthenticatedError()
+func NewServerAuthInterceptor(token string) connect.ServerInterceptor {
+	return func(next connect.ServerFunc) connect.ServerFunc {
+		return func(ctx context.Context, spec connect.Spec, stream connect.ServerStream) error {
+			info, found := connect.CallInfoForServerContext(ctx)
+			if !found {
+				return unauthenticatedError()
+			}
+			if !validAuthorizationValue(info.RequestHeader().Get(authorizationHeader), token) {
+				return unauthenticatedError()
+			}
+			return next(ctx, spec, stream)
 		}
-		return next(ctx, request)
-	}
-}
-
-func (interceptor *authInterceptor) WrapStreamingClient(
-	next connect.StreamingClientFunc,
-) connect.StreamingClientFunc {
-	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
-		connection := next(ctx, spec)
-		if interceptor.client {
-			setAuthorization(connection.RequestHeader(), interceptor.token)
-		}
-		return connection
-	}
-}
-
-func (interceptor *authInterceptor) WrapStreamingHandler(
-	next connect.StreamingHandlerFunc,
-) connect.StreamingHandlerFunc {
-	return func(ctx context.Context, connection connect.StreamingHandlerConn) error {
-		if !interceptor.client && !validAuthorization(connection.RequestHeader(), interceptor.token) {
-			return unauthenticatedError()
-		}
-		return next(ctx, connection)
 	}
 }
 
 func requireBearerToken(next http.Handler, token string) http.Handler {
-	errorWriter := connect.NewErrorWriter()
+	errorWriter := connecthttp.NewErrorWriter()
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if validAuthorization(request.Header, token) {
 			next.ServeHTTP(response, request)
@@ -266,12 +248,12 @@ func requireBearerToken(next http.Handler, token string) http.Handler {
 	})
 }
 
-func setAuthorization(header http.Header, token string) {
-	header.Set(authorizationHeader, bearerPrefix+token)
+func validAuthorization(header http.Header, expectedToken string) bool {
+	return validAuthorizationValue(header.Get(authorizationHeader), expectedToken)
 }
 
-func validAuthorization(header http.Header, expectedToken string) bool {
-	providedToken, found := strings.CutPrefix(header.Get(authorizationHeader), bearerPrefix)
+func validAuthorizationValue(value string, expectedToken string) bool {
+	providedToken, found := strings.CutPrefix(value, bearerPrefix)
 	if !found {
 		providedToken = ""
 	}
@@ -281,7 +263,7 @@ func validAuthorization(header http.Header, expectedToken string) bool {
 }
 
 func unauthenticatedError() *connect.Error {
-	return connect.NewError(connect.CodeUnauthenticated, errors.New("invalid bearer token"))
+	return connect.NewError(connect.CodeUnauthenticated, "invalid bearer token")
 }
 
 func normalizeServerError(err error) error {

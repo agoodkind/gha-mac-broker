@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
 	"goodkind.io/gha-mac-broker/internal/config"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
@@ -30,17 +31,18 @@ type stubStream struct {
 	err    error
 }
 
-func (s *stubStream) Receive() bool {
+func (s *stubStream) Receive() (*guestproto.JobStatusEvent, error) {
 	if s.pos < len(s.events) {
 		s.pos++
-		return true
+		return s.events[s.pos-1], nil
 	}
-	return false
+	if s.err != nil {
+		return nil, s.err
+	}
+	return nil, io.EOF
 }
 
-func (s *stubStream) Msg() *guestproto.JobStatusEvent { return s.events[s.pos-1] }
-func (s *stubStream) Err() error                      { return s.err }
-func (s *stubStream) Close() error                    { return nil }
+func (s *stubStream) Close() error { return nil }
 
 // blockingStream models a JobStatus stream that never delivers an event. Receive
 // blocks until done closes, matching how a real ConnectRPC server stream unblocks
@@ -49,10 +51,11 @@ type blockingStream struct {
 	done <-chan struct{}
 }
 
-func (b *blockingStream) Receive() bool                   { <-b.done; return false }
-func (b *blockingStream) Msg() *guestproto.JobStatusEvent { return nil }
-func (b *blockingStream) Err() error                      { return nil }
-func (b *blockingStream) Close() error                    { return nil }
+func (b *blockingStream) Receive() (*guestproto.JobStatusEvent, error) {
+	<-b.done
+	return nil, io.EOF
+}
+func (b *blockingStream) Close() error { return nil }
 
 // tickStream emits ticks empty (non-terminal) events spaced interval apart, then
 // ends. An empty event carries no log and no result, matching a heartbeat that
@@ -63,19 +66,15 @@ type tickStream struct {
 	sent     int
 }
 
-func (s *tickStream) Receive() bool {
+func (s *tickStream) Receive() (*guestproto.JobStatusEvent, error) {
 	if s.sent >= s.ticks {
-		return false
+		return nil, io.EOF
 	}
 	time.Sleep(s.interval)
 	s.sent++
-	return true
+	return &guestproto.JobStatusEvent{Sequence: uint64(s.sent)}, nil
 }
 
-func (s *tickStream) Msg() *guestproto.JobStatusEvent {
-	return &guestproto.JobStatusEvent{Sequence: uint64(s.sent)}
-}
-func (s *tickStream) Err() error   { return nil }
 func (s *tickStream) Close() error { return nil }
 
 // silentGuest is a guestConn whose JobStatus opens a stream that never emits an
@@ -403,7 +402,7 @@ func TestDrainJobExecutionNotFoundFreesSlot(t *testing.T) {
 	guest := &stubGuest{
 		statusFactory: []func(uint64) (jobStatusStream, error){
 			func(uint64) (jobStatusStream, error) {
-				return nil, connect.NewError(connect.CodeNotFound, errors.New("execution not found"))
+				return nil, connect.NewError(connect.CodeNotFound, "execution not found")
 			},
 		},
 	}
