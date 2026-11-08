@@ -1,4 +1,36 @@
-# staticcheck-extra: generated_at=2026-10-04T21:09:54Z
+# staticcheck-extra: generated_at=2026-11-08T23:08:10Z
+internal/broker/bind.go:826:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/clock/clock.go:12:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/config/config.go:485:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/deploy/decide.go:75:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/fastpull/stage.go:73:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/ghapp/ghapp.go:71:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/golden/assets.go:31:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/golden/build.go:94:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/golden/fingerprint.go:35:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/golden/receipt.go:19:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/guestagent/guestagent.go:69:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/guestagent/runner.go:137:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/guestclient/client.go:88:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/guestexec/launch.go:26:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/guestexec/registry.go:96:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/guestexec/types.go:22:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/guestsupervisor/slots.go:90:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/guestsupervisor/token.go:73:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/guesttransport/guesttransport.go:71:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/hostedload/hostedload.go:55:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/hoststats/reader.go:33:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/hoststats/sampler.go:45:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/install/install.go:73:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/install/restart.go:24:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/runnerpool/pool.go:617:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/runnerpool/status.go:27:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/server/server.go:200:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/skopeo/skopeo.go:86:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/tart/execconn.go:97:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/tart/tart.go:68:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/updateopts/options.go:26:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
+internal/version/version.go:16:1: doc_structure: add an introduction, explanation, and example or layout	# staticcheck-extra:first_added=2026-11-08T23:08:10Z last_seen=2026-11-08T23:08:10Z
 cmd/gha-mac-broker/golden_provision_test.go:118:6: Test TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog calls the unexported function provisionGolden of the package under test. A test must enter through the exported API or the built command. Call the exported entry point that uses provisionGolden.	# staticcheck-extra:first_added=2026-10-04T21:09:54Z last_seen=2026-10-04T21:09:54Z
 cmd/gha-mac-broker/golden_provision_test.go:159:13: TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog replaces the function field download. Production code sets that field to one value. A test must run the production function with real dependencies. Remove the replacement, or add //testseam:external <reason> above it when the function calls a service outside the host.	# staticcheck-extra:first_added=2026-10-04T21:09:54Z last_seen=2026-10-04T21:09:54Z
 cmd/gha-mac-broker/golden_provision_test.go:162:9: TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog replaces the function field sign. Production code sets that field to one value. A test must run the production function with real dependencies. Remove the replacement, or add //testseam:external <reason> above it when the function calls a service outside the host.	# staticcheck-extra:first_added=2026-10-04T21:09:54Z last_seen=2026-10-04T21:09:54Z
