@@ -46,11 +46,14 @@ func ensureConfigDir(ctx context.Context, dir string) error {
 	if info, err := os.Stat(dir); err == nil && info.IsDir() {
 		return nil
 	}
+
 	if err := os.MkdirAll(dir, configDirMode); err != nil {
 		slog.ErrorContext(ctx, "create config dir failed", "err", err, "dir", dir)
 		return fmt.Errorf("install: create config dir %s: %w", dir, err)
 	}
+
 	slog.InfoContext(ctx, "created config dir", "dir", dir)
+
 	return nil
 }
 
@@ -62,16 +65,20 @@ func scaffoldConfig(ctx context.Context, cfg Config) error {
 	if statErr == nil {
 		return nil
 	}
+
 	if !errors.Is(statErr, os.ErrNotExist) {
 		slog.ErrorContext(ctx, "stat config failed", "err", statErr, "path", cfg.ConfigPath)
 		return fmt.Errorf("install: stat config %s: %w", cfg.ConfigPath, statErr)
 	}
+
 	rendered := strings.ReplaceAll(exampleConfig, placeholderHome, cfg.Home)
 	if err := os.WriteFile(cfg.ConfigPath, []byte(rendered), configFileMode); err != nil {
 		slog.ErrorContext(ctx, "write config failed", "err", err, "path", cfg.ConfigPath)
 		return fmt.Errorf("install: write config %s: %w", cfg.ConfigPath, err)
 	}
+
 	slog.InfoContext(ctx, "scaffolded config", "path", cfg.ConfigPath)
+
 	return nil
 }
 
@@ -80,6 +87,7 @@ func ensureSecrets(ctx context.Context, dir string) error {
 	if err := ensureSecret(ctx, filepath.Join(dir, "webhook-secret")); err != nil {
 		return err
 	}
+
 	return ensureSecret(ctx, filepath.Join(dir, "capacity-token"))
 }
 
@@ -90,21 +98,26 @@ func ensureSecret(ctx context.Context, path string) error {
 	if statErr == nil {
 		return nil
 	}
+
 	if !errors.Is(statErr, os.ErrNotExist) {
 		slog.ErrorContext(ctx, "stat secret failed", "err", statErr, "path", path)
 		return fmt.Errorf("install: stat secret %s: %w", path, statErr)
 	}
+
 	buf := make([]byte, secretBytes)
 	if _, err := rand.Read(buf); err != nil {
 		slog.ErrorContext(ctx, "generate secret failed", "err", err, "path", path)
 		return fmt.Errorf("install: generate secret %s: %w", path, err)
 	}
+
 	encoded := hex.EncodeToString(buf)
 	if err := os.WriteFile(path, []byte(encoded), secretFileMode); err != nil {
 		slog.ErrorContext(ctx, "write secret failed", "err", err, "path", path)
 		return fmt.Errorf("install: write secret %s: %w", path, err)
 	}
+
 	slog.InfoContext(ctx, "generated secret", "path", path)
+
 	return nil
 }
 
@@ -122,20 +135,38 @@ func ensureWebhookCIDRs(ctx context.Context, dir string) {
 	if statErr == nil {
 		return
 	}
+
 	if !errors.Is(statErr, os.ErrNotExist) {
-		slog.WarnContext(ctx, "stat github webhook CIDRs failed; continuing", "err", statErr, "path", path)
+		slog.WarnContext(
+			ctx,
+			"stat github webhook CIDRs failed; continuing",
+			"err",
+			statErr,
+			"path",
+			path,
+		)
 		return
 	}
+
 	cidrs, err := fetchMetaHooks(ctx)
 	if err != nil {
 		slog.WarnContext(ctx, "fetch github webhook CIDRs failed; continuing", "err", err)
 		return
 	}
+
 	content := strings.Join(cidrs, "\n") + "\n"
 	if err := os.WriteFile(path, []byte(content), dataFileMode); err != nil {
-		slog.WarnContext(ctx, "write github webhook CIDRs failed; continuing", "err", err, "path", path)
+		slog.WarnContext(
+			ctx,
+			"write github webhook CIDRs failed; continuing",
+			"err",
+			err,
+			"path",
+			path,
+		)
 		return
 	}
+
 	slog.InfoContext(ctx, "wrote github webhook CIDRs", "path", path, "count", len(cidrs))
 }
 
@@ -146,21 +177,32 @@ func fetchMetaHooks(ctx context.Context) ([]string, error) {
 		slog.ErrorContext(ctx, "build meta request failed", "err", err)
 		return nil, fmt.Errorf("install: build meta request: %w", err)
 	}
+
 	client := &http.Client{Timeout: httpTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		slog.ErrorContext(ctx, "fetch meta failed", "err", err)
 		return nil, fmt.Errorf("install: fetch meta: %w", err)
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		slog.ErrorContext(ctx, "meta status not ok", "err", fmt.Errorf("status %d", resp.StatusCode), "status", resp.StatusCode)
+		slog.ErrorContext(
+			ctx,
+			"meta status not ok",
+			"err",
+			fmt.Errorf("status %d", resp.StatusCode),
+			"status",
+			resp.StatusCode,
+		)
 		return nil, fmt.Errorf("install: meta status %d", resp.StatusCode)
 	}
+
 	var meta metaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
 		slog.ErrorContext(ctx, "decode meta failed", "err", err)
 		return nil, fmt.Errorf("install: decode meta: %w", err)
 	}
+
 	return meta.Hooks, nil
 }

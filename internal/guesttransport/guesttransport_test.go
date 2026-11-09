@@ -69,43 +69,55 @@ func TestUnaryAuthentication(t *testing.T) {
 		},
 	}
 	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			clientTransport := DialContext(
-				context.Background(),
-				tcpDialer(listener.Addr().String()),
-				testCase.token,
-			)
-			clientOptions := make([]connect.ClientInterceptor, 0, 1)
-			if testCase.auth {
-				clientOptions = append(
-					clientOptions,
-					clientTransport.Interceptor(),
+		t.Run(
+			testCase.name,
+			func(t *testing.T) {
+				clientTransport := DialContext(
+					context.Background(),
+					tcpDialer(listener.Addr().String()),
+					testCase.token,
 				)
-			}
-			client := connect.NewClient(
-				connecthttp.NewTransport(clientTransport.HTTPClient(), "http://"+listener.Addr().String()),
-				clientOptions...,
-			)
-			response := new(wrapperspb.StringValue)
-			err := client.CallUnary(
-				context.Background(),
-				testUnarySpec,
-				wrapperspb.String("hello"),
-				response,
-			)
-			if testCase.wantCode != 0 {
-				if connect.CodeOf(err) != testCase.wantCode {
-					t.Fatalf("CallUnary() error code = %v, want %v: %v", connect.CodeOf(err), testCase.wantCode, err)
+				clientOptions := make([]connect.ClientInterceptor, 0, 1)
+				if testCase.auth {
+					clientOptions = append(clientOptions, clientTransport.Interceptor())
 				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("CallUnary() error = %v", err)
-			}
-			if response.Value != testCase.wantValue {
-				t.Fatalf("CallUnary() value = %q, want %q", response.Value, testCase.wantValue)
-			}
-		})
+
+				client := connect.NewClient(
+					connecthttp.NewTransport(
+						clientTransport.HTTPClient(),
+						"http://"+listener.Addr().String(),
+					),
+					clientOptions...,
+				)
+				response := new(wrapperspb.StringValue)
+				err := client.CallUnary(
+					context.Background(),
+					testUnarySpec,
+					wrapperspb.String("hello"),
+					response,
+				)
+				if testCase.wantCode != 0 {
+					if connect.CodeOf(err) != testCase.wantCode {
+						t.Fatalf(
+							"CallUnary() error code = %v, want %v: %v",
+							connect.CodeOf(err),
+							testCase.wantCode,
+							err,
+						)
+					}
+
+					return
+				}
+
+				if err != nil {
+					t.Fatalf("CallUnary() error = %v", err)
+				}
+
+				if response.Value != testCase.wantValue {
+					t.Fatalf("CallUnary() value = %q, want %q", response.Value, testCase.wantValue)
+				}
+			},
+		)
 	}
 }
 
@@ -145,7 +157,11 @@ func TestServerStreamAuthenticationAndMessages(t *testing.T) {
 		waitForServer(t, serverDone)
 	})
 
-	clientTransport := DialContext(context.Background(), tcpDialer(listener.Addr().String()), testToken)
+	clientTransport := DialContext(
+		context.Background(),
+		tcpDialer(listener.Addr().String()),
+		testToken,
+	)
 	client := connect.NewClient(
 		connecthttp.NewTransport(clientTransport.HTTPClient(), "http://"+listener.Addr().String()),
 		clientTransport.Interceptor(),
@@ -160,6 +176,7 @@ func TestServerStreamAuthenticationAndMessages(t *testing.T) {
 	}
 
 	var messages []string
+
 	for {
 		message := new(wrapperspb.StringValue)
 		err := stream.Receive(message)
@@ -167,8 +184,10 @@ func TestServerStreamAuthenticationAndMessages(t *testing.T) {
 			if errors.Is(err, io.EOF) {
 				break
 			}
+
 			t.Fatalf("Receive() error = %v", err)
 		}
+
 		messages = append(messages, message.Value)
 	}
 
@@ -213,6 +232,7 @@ func newTestHandler(token string) http.Handler {
 				if err := stream.Receive(request); err != nil {
 					return err
 				}
+
 				return stream.Send(wrapperspb.String("echo:" + request.Value))
 			},
 		},
@@ -223,17 +243,20 @@ func newTestHandler(token string) http.Handler {
 				if err := stream.Receive(request); err != nil {
 					return err
 				}
+
 				for sequence := 1; sequence <= 3; sequence++ {
 					message := wrapperspb.String(fmt.Sprintf("%s:%d", request.Value, sequence))
 					if err := stream.Send(message); err != nil {
 						return err
 					}
 				}
+
 				return nil
 			},
 		},
 	)
 	connecthttp.Mount(mux, server)
+
 	return mux
 }
 
@@ -242,6 +265,7 @@ func serveTestService(ctx context.Context, listener net.Listener, token string) 
 	go func() {
 		done <- Serve(ctx, listener, newTestHandler(token), token)
 	}()
+
 	return done
 }
 
@@ -253,6 +277,7 @@ func newUnaryClient(
 ) *connect.Client {
 	t.Helper()
 	clientTransport := DialContext(ctx, tcpDialer(address), token)
+
 	return connect.NewClient(
 		connecthttp.NewTransport(clientTransport.HTTPClient(), "http://"+address),
 		clientTransport.Interceptor(),
@@ -267,15 +292,11 @@ func callUnary(
 ) {
 	t.Helper()
 	response := new(wrapperspb.StringValue)
-	err := client.CallUnary(
-		context.Background(),
-		testUnarySpec,
-		wrapperspb.String(value),
-		response,
-	)
+	err := client.CallUnary(context.Background(), testUnarySpec, wrapperspb.String(value), response)
 	if err != nil {
 		t.Fatalf("CallUnary(%q) error = %v", value, err)
 	}
+
 	if response.Value != want {
 		t.Fatalf("CallUnary(%q) value = %q, want %q", value, response.Value, want)
 	}
@@ -287,6 +308,7 @@ func listenLocal(t *testing.T, address string) net.Listener {
 	if err != nil {
 		t.Fatalf("net.Listen(%q) error = %v", address, err)
 	}
+
 	return listener
 }
 

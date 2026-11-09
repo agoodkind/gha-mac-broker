@@ -56,7 +56,10 @@ type CommandRunner func(ctx context.Context, bin string, args ...string) ([]byte
 
 // TeeCommandRunner runs `tart <args...>` and mirrors combined output to sink.
 // It is a field so tests can stub streaming CLI paths.
-type TeeCommandRunner func(ctx context.Context, bin string, sink io.Writer, args ...string) ([]byte, error)
+type TeeCommandRunner func(ctx context.Context, bin string, sink io.Writer, args ...string) (
+	[]byte,
+	error,
+)
 
 // Tart drives the tart binary. Runner fields are swappable in white-box tests.
 type Tart struct {
@@ -70,6 +73,7 @@ func New(bin string) *Tart {
 	if bin == "" {
 		bin = "tart"
 	}
+
 	return &Tart{bin: bin, run: execRunner, runTee: execRunnerTee}
 }
 
@@ -79,6 +83,7 @@ func New(bin string) *Tart {
 func command(ctx context.Context, bin string, args ...string) *exec.Cmd {
 	loggedArgs, _ := tartCommandLogValues(args, nil)
 	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", loggedArgs)
+
 	return exec.CommandContext(ctx, bin, args...)
 }
 
@@ -91,6 +96,7 @@ func detachedCommand(ctx context.Context, bin string, args ...string) *exec.Cmd 
 	// readies is caught by the caller's bounded readiness wait.
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), bin, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
 	return cmd
 }
 
@@ -102,6 +108,7 @@ func runProcessGroup(ctx context.Context, cmd *exec.Cmd) error {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
+
 	cmd.SysProcAttr.Setpgid = true
 	// The command carries ctx (built with CommandContext), but cancellation is
 	// owned here. A no-op Cancel with the default zero WaitDelay stops os/exec
@@ -111,6 +118,7 @@ func runProcessGroup(ctx context.Context, cmd *exec.Cmd) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("tart: start: %w", err)
 	}
+
 	// With Setpgid and an unset Pgid, the child leads a new group whose id equals
 	// its pid, so negating the pid addresses the whole group.
 	pgid := cmd.Process.Pid
@@ -136,11 +144,13 @@ func runProcessGroup(ctx context.Context, cmd *exec.Cmd) error {
 			leaderExited = true
 		case <-time.After(killGrace):
 		}
+
 		// Sweep any group member that ignored SIGTERM, then reap the leader.
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		if !leaderExited {
 			<-waitErr
 		}
+
 		return fmt.Errorf("tart: bounded run: %w", ctx.Err())
 	}
 }
@@ -154,11 +164,28 @@ func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error)
 	cmd.Stderr = &out
 	if err := runProcessGroup(ctx, cmd); err != nil {
 		loggedArgs, loggedOutput := tartCommandLogValues(args, out.Bytes())
-		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", loggedArgs, "output", loggedOutput)
-		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out.String()))
+		slog.ErrorContext(
+			ctx,
+			"tart command failed",
+			"err",
+			err,
+			"args",
+			loggedArgs,
+			"output",
+			loggedOutput,
+		)
+
+		return out.Bytes(), fmt.Errorf(
+			"tart %s: %w: %s",
+			strings.Join(args, " "),
+			err,
+			strings.TrimSpace(out.String()),
+		)
 	}
+
 	loggedArgs, loggedOutput := tartCommandLogValues(args, out.Bytes())
 	slog.DebugContext(ctx, "tart command output", "args", loggedArgs, "output", loggedOutput)
+
 	return out.Bytes(), nil
 }
 
@@ -178,16 +205,20 @@ func (b *tailBuffer) Write(p []byte) (int, error) {
 	if b.limit <= 0 {
 		return len(p), nil
 	}
+
 	if len(p) >= b.limit {
 		b.buf = append(b.buf[:0], p[len(p)-b.limit:]...)
 		return len(p), nil
 	}
+
 	excess := len(b.buf) + len(p) - b.limit
 	if excess > 0 {
 		copy(b.buf, b.buf[excess:])
 		b.buf = b.buf[:len(b.buf)-excess]
 	}
+
 	b.buf = append(b.buf, p...)
+
 	return len(p), nil
 }
 
@@ -195,7 +226,12 @@ func (b *tailBuffer) Bytes() []byte {
 	return b.buf
 }
 
-func execRunnerTee(ctx context.Context, bin string, sink io.Writer, args ...string) ([]byte, error) {
+func execRunnerTee(
+	ctx context.Context,
+	bin string,
+	sink io.Writer,
+	args ...string,
+) ([]byte, error) {
 	loggedArgs, _ := tartCommandLogValues(args, nil)
 	slog.DebugContext(ctx, "tart command built", "bin", bin, "args", loggedArgs)
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -204,16 +240,34 @@ func execRunnerTee(ctx context.Context, bin string, sink io.Writer, args ...stri
 	if sink != nil {
 		writer = io.MultiWriter(out, sink)
 	}
+
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 	if err := runProcessGroup(ctx, cmd); err != nil {
 		loggedArgs, loggedOutput := tartCommandLogValues(args, out.Bytes())
-		slog.ErrorContext(ctx, "tart command failed", "err", err, "args", loggedArgs, "output", loggedOutput)
+		slog.ErrorContext(
+			ctx,
+			"tart command failed",
+			"err",
+			err,
+			"args",
+			loggedArgs,
+			"output",
+			loggedOutput,
+		)
 		tail := string(out.Bytes())
-		return out.Bytes(), fmt.Errorf("tart %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(tail))
+
+		return out.Bytes(), fmt.Errorf(
+			"tart %s: %w: %s",
+			strings.Join(args, " "),
+			err,
+			strings.TrimSpace(tail),
+		)
 	}
+
 	loggedArgs, loggedOutput := tartCommandLogValues(args, out.Bytes())
 	slog.DebugContext(ctx, "tart command output", "args", loggedArgs, "output", loggedOutput)
+
 	return out.Bytes(), nil
 }
 
@@ -224,9 +278,11 @@ func tartCommandLogValues(args []string, output []byte) (string, string) {
 	if redactArgs {
 		loggedArgs = redactedLogValue
 	}
+
 	if redactOutput {
 		loggedOutput = redactedLogValue
 	}
+
 	return loggedArgs, loggedOutput
 }
 
@@ -234,10 +290,12 @@ func tartCommandRedaction(args []string) (bool, bool) {
 	if tartArgsContainSensitiveValue(args) {
 		return true, true
 	}
+
 	securityArgs := nestedSecurityArgs(args)
 	if !securityArgsContainSecret(securityArgs) {
 		return false, false
 	}
+
 	return true, !securityOutputIsDiagnostic(securityArgs)
 }
 
@@ -249,6 +307,7 @@ func tartArgsContainSensitiveValue(args []string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -258,6 +317,7 @@ func nestedSecurityArgs(args []string) []string {
 			return args[index+1:]
 		}
 	}
+
 	return nil
 }
 
@@ -267,6 +327,7 @@ func securityArgsContainSecret(args []string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -274,7 +335,9 @@ func securityOutputIsDiagnostic(args []string) bool {
 	if len(args) == 0 {
 		return false
 	}
+
 	command := args[0]
+
 	return command == "create-keychain" || command == "default-keychain" ||
 		command == "list-keychains" || command == "unlock-keychain" ||
 		command == "set-keychain-settings" || command == "show-keychain-info" ||
@@ -300,10 +363,12 @@ func (t *Tart) List(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		names = append(names, e.Name)
 	}
+
 	return names, nil
 }
 
@@ -315,17 +380,20 @@ func (t *Tart) ListVMs(ctx context.Context) ([]VM, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	var entries []listEntry
 	if err := json.Unmarshal(out, &entries); err != nil {
 		slog.ErrorContext(ctx, "tart list parse failed", "err", err)
 		return nil, fmt.Errorf("tart: parse list output: %w", err)
 	}
+
 	vms := make([]VM, 0, len(entries))
 	for _, e := range entries {
 		// Go struct conversions ignore tags; listEntry and VM intentionally keep
 		// matching field names and types so JSON tags stay isolated to parsing.
 		vms = append(vms, VM(e))
 	}
+
 	return vms, nil
 }
 
@@ -337,8 +405,10 @@ func (t *Tart) Clone(ctx context.Context, source, name string, insecure bool) er
 	if insecure {
 		args = append(args, "--insecure")
 	}
+
 	args = append(args, source, name)
 	_, err := t.run(ctx, t.bin, args...)
+
 	return err
 }
 
@@ -352,10 +422,12 @@ func (t *Tart) IP(ctx context.Context, name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	addr := strings.TrimSpace(string(out))
 	if net.ParseIP(addr) == nil {
 		return "", fmt.Errorf("tart: ip %s returned %q, not a valid IP", name, addr)
 	}
+
 	return addr, nil
 }
 
@@ -369,7 +441,12 @@ func (t *Tart) Exec(ctx context.Context, name string, argv ...string) ([]byte, e
 
 // ExecTee runs a guest command and mirrors combined output to sink while it is
 // produced. It still returns the buffered combined output when the command exits.
-func (t *Tart) ExecTee(ctx context.Context, name string, sink io.Writer, argv ...string) ([]byte, error) {
+func (t *Tart) ExecTee(
+	ctx context.Context,
+	name string,
+	sink io.Writer,
+	argv ...string,
+) ([]byte, error) {
 	args := append([]string{"exec", name}, argv...)
 	return t.runTee(ctx, t.bin, sink, args...)
 }
@@ -379,6 +456,7 @@ func (t *Tart) Stop(ctx context.Context, name string) error {
 	ctx, cancel := context.WithTimeout(ctx, stopDeadline)
 	defer cancel()
 	_, err := t.run(ctx, t.bin, "stop", name)
+
 	return err
 }
 
@@ -387,6 +465,7 @@ func (t *Tart) Delete(ctx context.Context, name string) error {
 	ctx, cancel := context.WithTimeout(ctx, deleteDeadline)
 	defer cancel()
 	_, err := t.run(ctx, t.bin, "delete", name)
+
 	return err
 }
 
@@ -418,11 +497,14 @@ func (t *Tart) BootCommand(ctx context.Context, name string, opts BootOptions) *
 	if opts.NoGraphics {
 		args = append(args, "--no-graphics")
 	}
+
 	for _, d := range opts.Dirs {
 		args = append(args, "--dir", d.Name+":"+d.Path)
 	}
+
 	if opts.Detach {
 		return detachedCommand(ctx, t.bin, args...)
 	}
+
 	return command(ctx, t.bin, args...)
 }

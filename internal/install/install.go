@@ -43,30 +43,37 @@ func Install(ctx context.Context, cfg Config) error {
 	if err := ensureConfigDir(ctx, cfg.ConfigDir); err != nil {
 		return err
 	}
+
 	if err := scaffoldConfig(ctx, cfg); err != nil {
 		return err
 	}
+
 	if err := ensureSecrets(ctx, cfg.ConfigDir); err != nil {
 		return err
 	}
+
 	ensureWebhookCIDRs(ctx, cfg.ConfigDir)
 	runtimeConfig, err := config.Load(cfg.ConfigPath)
 	if err != nil {
 		slog.ErrorContext(ctx, "load config for install failed", "err", err, "path", cfg.ConfigPath)
 		return fmt.Errorf("install: load config: %w", err)
 	}
+
 	if err := buildGoldenIfAbsent(ctx, runtimeConfig); err != nil {
 		return err
 	}
+
 	if err := installUnit(ctx, cfg); err != nil {
 		return err
 	}
+
 	cfg.Maintenance = runtimeConfig.Maintenance
 	if err := installMaintenanceTimer(ctx, cfg); err != nil {
 		return err
 	}
 
 	printOperatorNotice(ctx, cfg)
+
 	return nil
 }
 
@@ -83,6 +90,7 @@ func Uninstall(ctx context.Context, cfg Config) error {
 		slog.ErrorContext(ctx, "uninstall completed with errors", "err", err)
 		return err
 	}
+
 	return nil
 }
 
@@ -108,13 +116,34 @@ func command(ctx context.Context, name string, args ...string) combinedOutputRun
 	loggedArgs, _ := installCommandLogValues(name, args, nil)
 	slog.DebugContext(ctx, "install command built", "name", name, "args", loggedArgs)
 	cmd := exec.CommandContext(ctx, name, args...)
+
 	return &loggedCombinedOutputRunner{
 		logResult: func(output []byte, err error) {
 			loggedArgs, loggedOutput := installCommandLogValues(name, args, output)
 			if err != nil {
-				slog.ErrorContext(ctx, "install command failed", "name", name, "args", loggedArgs, "output", loggedOutput, "err", err)
+				slog.ErrorContext(
+					ctx,
+					"install command failed",
+					"name",
+					name,
+					"args",
+					loggedArgs,
+					"output",
+					loggedOutput,
+					"err",
+					err,
+				)
 			} else {
-				slog.DebugContext(ctx, "install command output", "name", name, "args", loggedArgs, "output", loggedOutput)
+				slog.DebugContext(
+					ctx,
+					"install command output",
+					"name",
+					name,
+					"args",
+					loggedArgs,
+					"output",
+					loggedOutput,
+				)
 			}
 		},
 		run: func() combinedOutputResult {
@@ -127,6 +156,7 @@ func command(ctx context.Context, name string, args ...string) combinedOutputRun
 func (r *loggedCombinedOutputRunner) CombinedOutput() ([]byte, error) {
 	result := r.run()
 	r.logResult(result.output, result.err)
+
 	return result.output, result.err
 }
 
@@ -137,9 +167,11 @@ func installCommandLogValues(name string, args []string, output []byte) (string,
 	if redactArgs {
 		loggedArgs = "[redacted]"
 	}
+
 	if redactOutput {
 		loggedOutput = "[redacted]"
 	}
+
 	return loggedArgs, loggedOutput
 }
 
@@ -151,19 +183,24 @@ func installCommandRedaction(name string, args []string) (bool, bool) {
 			return true, true
 		}
 	}
+
 	if name != "security" {
 		return false, false
 	}
+
 	containsSecret := false
+
 	for _, arg := range args {
 		if arg == "import" || arg == "-P" || arg == "-p" {
 			containsSecret = true
 			break
 		}
 	}
+
 	if !containsSecret {
 		return false, false
 	}
+
 	if len(args) > 0 {
 		command := args[0]
 		if command == "create-keychain" || command == "default-keychain" ||
@@ -173,24 +210,44 @@ func installCommandRedaction(name string, args []string) (bool, bool) {
 			return true, false
 		}
 	}
+
 	return true, true
 }
 
 func requireHostBinary(ctx context.Context, binary string, installHint string) error {
 	if _, err := exec.LookPath(binary); err != nil {
-		slog.ErrorContext(ctx, "required host binary not found on PATH", "err", err, "binary", binary)
-		return fmt.Errorf("install: %s not found on PATH; install it with `%s`: %w", binary, installHint, err)
+		slog.ErrorContext(
+			ctx,
+			"required host binary not found on PATH",
+			"err",
+			err,
+			"binary",
+			binary,
+		)
+		return fmt.Errorf(
+			"install: %s not found on PATH; install it with `%s`: %w",
+			binary,
+			installHint,
+			err,
+		)
 	}
+
 	return nil
 }
 
 // printOperatorNotice logs the steps the installer cannot perform, so the
 // operator knows what remains before the daemon can serve.
 func printOperatorNotice(ctx context.Context, cfg Config) {
-	slog.InfoContext(ctx, "install complete; operator steps remain",
-		"config", cfg.ConfigPath,
-		"step_1", "edit config.toml and set app.app_id to the GitHub App ID",
-		"step_2", "place the GitHub App private key at app.private_key_path",
-		"step_3", "set up the Cloudflare tunnel to expose the webhook endpoint",
+	slog.InfoContext(
+		ctx,
+		"install complete; operator steps remain",
+		"config",
+		cfg.ConfigPath,
+		"step_1",
+		"edit config.toml and set app.app_id to the GitHub App ID",
+		"step_2",
+		"place the GitHub App private key at app.private_key_path",
+		"step_3",
+		"set up the Cloudflare tunnel to expose the webhook endpoint",
 	)
 }

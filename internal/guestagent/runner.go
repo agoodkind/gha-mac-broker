@@ -84,7 +84,12 @@ type SpecBuilder interface {
 // commandFunc runs a system tool with args and env overrides layered over the
 // process environment, returning its combined output. It is a seam so a host
 // side test drives the port without invoking cp, security, or brew.
-type commandFunc func(ctx context.Context, name string, args []string, envOverrides map[string]string) (string, error)
+type commandFunc func(
+	ctx context.Context,
+	name string,
+	args []string,
+	envOverrides map[string]string,
+) (string, error)
 
 // runnerExecutor ports the two guest shell scripts to Go. It refreshes Homebrew
 // once per boot, provisions each runner directory and TMPDIR, and provisions an
@@ -157,7 +162,14 @@ func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestex
 		// keychain afterward. Best effort: a failure warns and the job then fails on
 		// signing as it does today, rather than aborting the whole job here.
 		if err := e.setupSlotKeychain(ctx, e.slotHome(request.Slot)); err != nil {
-			slog.WarnContext(ctx, "guest slot keychain setup incomplete; signing steps may fail", "slot", request.Slot, "err", err)
+			slog.WarnContext(
+				ctx,
+				"guest slot keychain setup incomplete; signing steps may fail",
+				"slot",
+				request.Slot,
+				"err",
+				err,
+			)
 		}
 	}
 	runnerHome := e.runnerHome(request.Slot)
@@ -184,13 +196,21 @@ func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestex
 	// per-user keychain search list: the real base home signs, a per-slot home
 	// does not. The runner always launches in the Aqua login session, the one
 	// session where the search list takes effect.
-	slog.InfoContext(ctx, "guest runner launch context",
-		"slot", request.Slot,
-		"single_slot", e.singleSlot(),
-		"home", runnerEnv["HOME"],
-		"tmpdir", runnerEnv["TMPDIR"],
-		"runner_home", runnerHome,
-		"requested_session", "aqua-login",
+	slog.InfoContext(
+		ctx,
+		"guest runner launch context",
+		"slot",
+		request.Slot,
+		"single_slot",
+		e.singleSlot(),
+		"home",
+		runnerEnv["HOME"],
+		"tmpdir",
+		runnerEnv["TMPDIR"],
+		"runner_home",
+		runnerHome,
+		"requested_session",
+		"aqua-login",
 	)
 	return spec, nil
 }
@@ -199,7 +219,11 @@ func (e *runnerExecutor) Build(ctx context.Context, request JobRequest) (guestex
 // codesign cannot sign, and into the daemon user's Aqua session. The outer sudo
 // lets launchctl use asuser, the inner sudo drops back to the daemon user, and
 // env reapplies the runner environment because sudo strips inherited values.
-func wrapRunnerForAquaSession(command string, args []string, env map[string]string) (string, []string, error) {
+func wrapRunnerForAquaSession(command string, args []string, env map[string]string) (
+	string,
+	[]string,
+	error,
+) {
 	currentUser, err := user.Current()
 	if err != nil {
 		return "", nil, err
@@ -304,7 +328,13 @@ func (e *runnerExecutor) provisionSlot(ctx context.Context, slot uint32) error {
 		return err
 	}
 	goldenRunner := filepath.Join(e.baseHome, goldenRunnerDir)
-	if err := e.runTool(ctx, "clone runner home", "cp", []string{"-R", goldenRunner, runnerHome}, nil); err != nil {
+	if err := e.runTool(
+		ctx,
+		"clone runner home",
+		"cp",
+		[]string{"-R", goldenRunner, runnerHome},
+		nil,
+	); err != nil {
 		return err
 	}
 	if err := e.makeDir(ctx, "tmp dir", tmpDir); err != nil {
@@ -351,9 +381,22 @@ func (e *runnerExecutor) seedSlotHome(ctx context.Context, slotHome string) erro
 		// expected where the tool is unavailable, so fall back to a real copy and
 		// only surface the fallback failure.
 		if _, err := e.runCommand(ctx, "cp", []string{"-cR", source, dest}, nil); err != nil {
-			slog.WarnContext(ctx, "guest slot cache clone failed; falling back to copy", "cache", cachePath, "err", err)
+			slog.WarnContext(
+				ctx,
+				"guest slot cache clone failed; falling back to copy",
+				"cache",
+				cachePath,
+				"err",
+				err,
+			)
 			_ = os.RemoveAll(dest)
-			if fallbackErr := e.runTool(ctx, "seed cache "+cachePath, "cp", []string{"-R", source, dest}, nil); fallbackErr != nil {
+			if fallbackErr := e.runTool(
+				ctx,
+				"seed cache "+cachePath,
+				"cp",
+				[]string{"-R", source, dest},
+				nil,
+			); fallbackErr != nil {
 				return fallbackErr
 			}
 		}
@@ -371,8 +414,19 @@ func (e *runnerExecutor) setupSlotKeychain(ctx context.Context, slotHome string)
 		return err
 	}
 	slotEnv := map[string]string{"HOME": slotHome}
-	if _, err := e.runCommand(ctx, "security", []string{"show-keychain-info", keychain}, slotEnv); err != nil {
-		if createErr := e.runTool(ctx, "create keychain", "security", []string{"create-keychain", "-p", "", keychain}, slotEnv); createErr != nil {
+	if _, err := e.runCommand(
+		ctx,
+		"security",
+		[]string{"show-keychain-info", keychain},
+		slotEnv,
+	); err != nil {
+		if createErr := e.runTool(
+			ctx,
+			"create keychain",
+			"security",
+			[]string{"create-keychain", "-p", "", keychain},
+			slotEnv,
+		); createErr != nil {
 			return createErr
 		}
 	}
@@ -382,7 +436,13 @@ func (e *runnerExecutor) setupSlotKeychain(ctx context.Context, slotHome string)
 	// fails with "SecKeychainSetDefault: Write permissions error" and the setup
 	// returns before the search-list and unlock steps that signing needs. The
 	// list-keychains call below already scopes to the user domain the same way.
-	if err := e.runTool(ctx, "set default keychain", "security", []string{"default-keychain", "-d", "user", "-s", keychain}, slotEnv); err != nil {
+	if err := e.runTool(
+		ctx,
+		"set default keychain",
+		"security",
+		[]string{"default-keychain", "-d", "user", "-s", keychain},
+		slotEnv,
+	); err != nil {
 		return err
 	}
 	existing, err := e.userKeychains(ctx, keychain, slotEnv)
@@ -390,19 +450,41 @@ func (e *runnerExecutor) setupSlotKeychain(ctx context.Context, slotHome string)
 		return err
 	}
 	listArgs := append([]string{"list-keychains", "-d", "user", "-s", keychain}, existing...)
-	if err := e.runTool(ctx, "set keychain search list", "security", listArgs, slotEnv); err != nil {
+	if err := e.runTool(
+		ctx,
+		"set keychain search list",
+		"security",
+		listArgs,
+		slotEnv,
+	); err != nil {
 		return err
 	}
-	if err := e.runTool(ctx, "unlock keychain", "security", []string{"unlock-keychain", "-p", "", keychain}, slotEnv); err != nil {
+	if err := e.runTool(
+		ctx,
+		"unlock keychain",
+		"security",
+		[]string{"unlock-keychain", "-p", "", keychain},
+		slotEnv,
+	); err != nil {
 		return err
 	}
-	return e.runTool(ctx, "set keychain settings", "security", []string{"set-keychain-settings", keychain}, slotEnv)
+	return e.runTool(
+		ctx,
+		"set keychain settings",
+		"security",
+		[]string{"set-keychain-settings", keychain},
+		slotEnv,
+	)
 }
 
 // userKeychains returns the current user keychain search list with the slot
 // keychain removed, so re-adding the slot keychain at the front does not
 // duplicate it while the System keychain's trust anchors stay in the list.
-func (e *runnerExecutor) userKeychains(ctx context.Context, slotKeychain string, slotEnv map[string]string) ([]string, error) {
+func (e *runnerExecutor) userKeychains(
+	ctx context.Context,
+	slotKeychain string,
+	slotEnv map[string]string,
+) ([]string, error) {
 	output, err := e.runCommand(ctx, "security", []string{"list-keychains", "-d", "user"}, slotEnv)
 	if err != nil {
 		slog.WarnContext(ctx, "guest slot keychain list failed", "err", err)
@@ -421,11 +503,26 @@ func (e *runnerExecutor) userKeychains(ctx context.Context, slotKeychain string,
 
 // runTool runs a system tool for a labeled slot-setup step, logging and wrapping
 // any failure so a co-tenant setup problem surfaces loudly.
-func (e *runnerExecutor) runTool(ctx context.Context, step string, name string, args []string, env map[string]string) error {
+func (e *runnerExecutor) runTool(
+	ctx context.Context,
+	step string,
+	name string,
+	args []string,
+	env map[string]string,
+) error {
 	output, err := e.runCommand(ctx, name, args, env)
 	if err != nil {
 		_, loggedOutput := guestCommandLogValues(name, args, output)
-		slog.WarnContext(ctx, "guest slot setup step failed", "step", step, "err", err, "output", loggedOutput)
+		slog.WarnContext(
+			ctx,
+			"guest slot setup step failed",
+			"step",
+			step,
+			"err",
+			err,
+			"output",
+			loggedOutput,
+		)
 		return fmt.Errorf("guestagent: %s: %w", step, err)
 	}
 	return nil
@@ -434,7 +531,16 @@ func (e *runnerExecutor) runTool(ctx context.Context, step string, name string, 
 // removeDir removes a slot directory, logging and wrapping any failure.
 func (e *runnerExecutor) removeDir(ctx context.Context, label string, path string) error {
 	if err := os.RemoveAll(path); err != nil {
-		slog.ErrorContext(ctx, "guest slot dir remove failed", "dir", label, "path", path, "err", err)
+		slog.ErrorContext(
+			ctx,
+			"guest slot dir remove failed",
+			"dir",
+			label,
+			"path",
+			path,
+			"err",
+			err,
+		)
 		return fmt.Errorf("guestagent: remove %s %q: %w", label, path, err)
 	}
 	return nil
@@ -443,7 +549,16 @@ func (e *runnerExecutor) removeDir(ctx context.Context, label string, path strin
 // makeDir creates a private slot directory, logging and wrapping any failure.
 func (e *runnerExecutor) makeDir(ctx context.Context, label string, path string) error {
 	if err := os.MkdirAll(path, slotDirPerm); err != nil {
-		slog.ErrorContext(ctx, "guest slot dir create failed", "dir", label, "path", path, "err", err)
+		slog.ErrorContext(
+			ctx,
+			"guest slot dir create failed",
+			"dir",
+			label,
+			"path",
+			path,
+			"err",
+			err,
+		)
 		return fmt.Errorf("guestagent: create %s %q: %w", label, path, err)
 	}
 	return nil
@@ -470,7 +585,13 @@ func (e *runnerExecutor) ensureHomebrewRefreshed(ctx context.Context) {
 func (e *runnerExecutor) clearStaleMarker() {
 	e.clearMarkerOnce.Do(func() {
 		if err := os.Remove(e.markerPath); err != nil && !os.IsNotExist(err) {
-			slog.Warn("guest brew boot refresh marker clear failed", "path", e.markerPath, "err", err)
+			slog.Warn(
+				"guest brew boot refresh marker clear failed",
+				"path",
+				e.markerPath,
+				"err",
+				err,
+			)
 		}
 	})
 }
@@ -483,7 +604,11 @@ func (e *runnerExecutor) clearStaleMarker() {
 // write then refuses the occupant without truncating or following it, so an
 // attacker cannot suppress the refresh by squatting the world-writable path.
 func (e *runnerExecutor) markerPresent() bool {
-	fd, err := unix.Open(e.markerPath, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(
+		e.markerPath,
+		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC,
+		0,
+	)
 	if err != nil {
 		return false
 	}
@@ -529,7 +654,14 @@ func (e *runnerExecutor) writeBootRefreshMarker(ctx context.Context) {
 		markerFilePerm,
 	)
 	if err != nil {
-		slog.WarnContext(ctx, "guest brew boot refresh marker write refused or failed", "path", e.markerPath, "err", err)
+		slog.WarnContext(
+			ctx,
+			"guest brew boot refresh marker write refused or failed",
+			"path",
+			e.markerPath,
+			"err",
+			err,
+		)
 		return
 	}
 	_ = unix.Close(fd)
@@ -554,7 +686,12 @@ func sleepWithContext(ctx context.Context) {
 
 // runSystemCommand runs name with args, layering env overrides over the process
 // environment, and returns the combined output so the caller can inspect it.
-func runSystemCommand(ctx context.Context, name string, args []string, envOverrides map[string]string) (string, error) {
+func runSystemCommand(
+	ctx context.Context,
+	name string,
+	args []string,
+	envOverrides map[string]string,
+) (string, error) {
 	loggedArgs, _ := guestCommandLogValues(name, args, "")
 	slog.DebugContext(ctx, "guest system command built", "command", name, "args", loggedArgs)
 	command := exec.CommandContext(ctx, name, args...)
@@ -564,9 +701,29 @@ func runSystemCommand(ctx context.Context, name string, args []string, envOverri
 	output, err := command.CombinedOutput()
 	loggedArgs, loggedOutput := guestCommandLogValues(name, args, string(output))
 	if err != nil {
-		slog.WarnContext(ctx, "guest command output", "command", name, "args", loggedArgs, "output", loggedOutput, "err", err)
+		slog.WarnContext(
+			ctx,
+			"guest command output",
+			"command",
+			name,
+			"args",
+			loggedArgs,
+			"output",
+			loggedOutput,
+			"err",
+			err,
+		)
 	} else {
-		slog.DebugContext(ctx, "guest command output", "command", name, "args", loggedArgs, "output", loggedOutput)
+		slog.DebugContext(
+			ctx,
+			"guest command output",
+			"command",
+			name,
+			"args",
+			loggedArgs,
+			"output",
+			loggedOutput,
+		)
 	}
 	return string(output), err
 }

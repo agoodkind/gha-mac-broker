@@ -33,6 +33,7 @@ func Launch(spec ExecSpec) (*LaunchedProcess, error) {
 	if spec.Command == "" {
 		return nil, fmt.Errorf("guestexec: command is required")
 	}
+
 	if !filepath.IsAbs(spec.Command) {
 		return nil, fmt.Errorf("guestexec: command path must be absolute")
 	}
@@ -42,13 +43,16 @@ func Launch(spec ExecSpec) (*LaunchedProcess, error) {
 		slog.Error("guest execution stdout pipe creation failed", "err", err)
 		return nil, fmt.Errorf("guestexec: create stdout pipe: %w", err)
 	}
+
 	stderrReader, stderrWriter, err := os.Pipe()
 	if err != nil {
 		_ = stdoutReader.Close()
 		_ = stdoutWriter.Close()
 		slog.Error("guest execution stderr pipe creation failed", "err", err)
+
 		return nil, fmt.Errorf("guestexec: create stderr pipe: %w", err)
 	}
+
 	closePipes := func() {
 		_ = stdoutReader.Close()
 		_ = stdoutWriter.Close()
@@ -66,9 +70,17 @@ func Launch(spec ExecSpec) (*LaunchedProcess, error) {
 	configureProcessGroup(command)
 	if err := command.Start(); err != nil {
 		closePipes()
-		slog.Error("guest execution process start failed", "err", err, "execution_id", spec.ExecutionID)
+		slog.Error(
+			"guest execution process start failed",
+			"err",
+			err,
+			"execution_id",
+			spec.ExecutionID,
+		)
+
 		return nil, fmt.Errorf("guestexec: start %q: %w", spec.Command, err)
 	}
+
 	_ = stdoutWriter.Close()
 	_ = stderrWriter.Close()
 

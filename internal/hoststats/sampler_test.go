@@ -37,7 +37,12 @@ func TestSamplerSampleOnceRecordsReaderAndInventoryOutput(t *testing.T) {
 	wantInv := Inventory{RunnerCount: 3, Idle: 1, Busy: 2, Queued: 4}
 	wantTime := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	reader := &fakeReader{host: wantHost}
-	s := New(reader, fakeInventory(wantInv), fakeNow(wantTime), Options{Enabled: true, Interval: time.Second})
+	s := New(
+		reader,
+		fakeInventory(wantInv),
+		fakeNow(wantTime),
+		Options{Enabled: true, Interval: time.Second},
+	)
 
 	s.sampleOnce(context.Background())
 
@@ -45,9 +50,11 @@ func TestSamplerSampleOnceRecordsReaderAndInventoryOutput(t *testing.T) {
 	if got.Host != wantHost {
 		t.Fatalf("Latest().Host = %+v, want %+v", got.Host, wantHost)
 	}
+
 	if got.Inventory != wantInv {
 		t.Fatalf("Latest().Inventory = %+v, want %+v", got.Inventory, wantInv)
 	}
+
 	if !got.SampledAt.Equal(wantTime) {
 		t.Fatalf("Latest().SampledAt = %v, want %v", got.SampledAt, wantTime)
 	}
@@ -58,11 +65,19 @@ func TestSamplerSampleOnceDisabledDoesNotOverwriteLatest(t *testing.T) {
 	firstInv := Inventory{RunnerCount: 1}
 	firstTime := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	reader := &fakeReader{host: firstHost}
-	s := New(reader, fakeInventory(firstInv), fakeNow(firstTime), Options{Enabled: true, Interval: time.Second})
+	s := New(
+		reader,
+		fakeInventory(firstInv),
+		fakeNow(firstTime),
+		Options{Enabled: true, Interval: time.Second},
+	)
 	s.sampleOnce(context.Background())
 	want := s.Latest()
 
-	s.Reconfigure(Options{Enabled: false, Interval: time.Second})
+	s.Reconfigure(Options{
+		Enabled:  false,
+		Interval: time.Second,
+	})
 	reader.host = Host{UserPct: 99}
 	s.sampleOnce(context.Background())
 
@@ -74,9 +89,17 @@ func TestSamplerSampleOnceDisabledDoesNotOverwriteLatest(t *testing.T) {
 
 func TestSamplerReconfigureUpdatesInterval(t *testing.T) {
 	reader := &fakeReader{host: Host{}}
-	s := New(reader, fakeInventory(Inventory{}), fakeNow(time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)), Options{Enabled: true, Interval: time.Second})
+	s := New(
+		reader,
+		fakeInventory(Inventory{}),
+		fakeNow(time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)),
+		Options{Enabled: true, Interval: time.Second},
+	)
 
-	s.Reconfigure(Options{Enabled: true, Interval: 5 * time.Minute})
+	s.Reconfigure(Options{
+		Enabled:  true,
+		Interval: 5 * time.Minute,
+	})
 
 	if got := s.currentInterval(); got != 5*time.Minute {
 		t.Fatalf("currentInterval() = %v, want %v", got, 5*time.Minute)
@@ -88,7 +111,12 @@ func TestSamplerSampleOnceReadErrorPreservesLatest(t *testing.T) {
 	goodInv := Inventory{RunnerCount: 7}
 	goodTime := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	reader := &fakeReader{host: goodHost}
-	s := New(reader, fakeInventory(goodInv), fakeNow(goodTime), Options{Enabled: true, Interval: time.Second})
+	s := New(
+		reader,
+		fakeInventory(goodInv),
+		fakeNow(goodTime),
+		Options{Enabled: true, Interval: time.Second},
+	)
 	s.sampleOnce(context.Background())
 	want := s.Latest()
 
@@ -104,7 +132,12 @@ func TestSamplerSampleOnceReadErrorPreservesLatest(t *testing.T) {
 
 func TestSamplerSampleOnceReadErrorBeforeAnySampleLeavesLatestZero(t *testing.T) {
 	reader := &fakeReader{err: errors.New("boom")}
-	s := New(reader, fakeInventory(Inventory{}), fakeNow(time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)), Options{Enabled: true, Interval: time.Second})
+	s := New(
+		reader,
+		fakeInventory(Inventory{}),
+		fakeNow(time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)),
+		Options{Enabled: true, Interval: time.Second},
+	)
 
 	s.sampleOnce(context.Background())
 

@@ -98,12 +98,15 @@ func (r gopsutilReader) Read(ctx context.Context) (Host, error) {
 // the user/sys split, so this reader computes the split itself from
 // TimesStat. A zero total delta (e.g. a context that is canceled between
 // snapshots) reports zeros rather than dividing by zero.
-func (r gopsutilReader) readCPUPercents(ctx context.Context) (userPct, sysPct, idlePct float64, err error) {
+func (r gopsutilReader) readCPUPercents(
+	ctx context.Context,
+) (userPct, sysPct, idlePct float64, err error) {
 	before, err := cpu.TimesWithContext(ctx, false)
 	if err != nil {
 		slog.WarnContext(ctx, "hoststats: read cpu times failed", "err", err)
 		return 0, 0, 0, fmt.Errorf("hoststats: read cpu times: %w", err)
 	}
+
 	if len(before) == 0 {
 		slog.WarnContext(ctx, "hoststats: read cpu times failed", "err", "no cpu stats returned")
 		return 0, 0, 0, fmt.Errorf("hoststats: read cpu times: no cpu stats returned")
@@ -123,6 +126,7 @@ func (r gopsutilReader) readCPUPercents(ctx context.Context) (userPct, sysPct, i
 		slog.WarnContext(ctx, "hoststats: read cpu times failed", "err", err)
 		return 0, 0, 0, fmt.Errorf("hoststats: read cpu times: %w", err)
 	}
+
 	if len(after) == 0 {
 		slog.WarnContext(ctx, "hoststats: read cpu times failed", "err", "no cpu stats returned")
 		return 0, 0, 0, fmt.Errorf("hoststats: read cpu times: no cpu stats returned")

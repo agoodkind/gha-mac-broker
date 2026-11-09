@@ -29,15 +29,22 @@ func (f combinedOutputFunc) CombinedOutput() ([]byte, error) {
 	return f()
 }
 
-func replaceCommandRunner(runner func(context.Context, string, ...string) combinedOutputRunner) func() {
+func replaceCommandRunner(
+	runner func(context.Context, string, ...string) combinedOutputRunner,
+) func() {
 	original := commandRunner
 	commandRunner = runner
+
 	return func() {
 		commandRunner = original
 	}
 }
 
-func (r *recordingCommandRunner) build(_ context.Context, name string, args ...string) combinedOutputRunner {
+func (r *recordingCommandRunner) build(
+	_ context.Context,
+	name string,
+	args ...string,
+) combinedOutputRunner {
 	copiedArgs := append([]string(nil), args...)
 	r.calls = append(r.calls, recordedCommand{name: name, args: copiedArgs})
 	if name == "launchctl" && len(args) > 0 && args[0] == "bootout" {
@@ -45,6 +52,7 @@ func (r *recordingCommandRunner) build(_ context.Context, name string, args ...s
 			return []byte("not loaded"), errors.New("not loaded")
 		})
 	}
+
 	if name == "launchctl" && len(args) > 0 && args[0] == "print" {
 		printIndex := r.launchctlPrintCount
 		r.launchctlPrintCount++
@@ -55,14 +63,17 @@ func (r *recordingCommandRunner) build(_ context.Context, name string, args ...s
 					return []byte("not loaded"), err
 				})
 			}
+
 			return combinedOutputFunc(func() ([]byte, error) {
 				return []byte("loaded"), nil
 			})
 		}
+
 		return combinedOutputFunc(func() ([]byte, error) {
 			return []byte("not loaded"), errors.New("not loaded")
 		})
 	}
+
 	return combinedOutputFunc(func() ([]byte, error) {
 		return []byte("ok"), nil
 	})
@@ -95,7 +106,9 @@ func TestInstallLaunchdMaintenanceRendersLaunchdFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read maintenance script: %v", err)
 	}
+
 	scriptText := string(script)
+
 	for _, want := range []string{
 		"#!/usr/bin/env bash\n",
 		"set -euo pipefail",
@@ -111,13 +124,20 @@ func TestInstallLaunchdMaintenanceRendersLaunchdFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read maintenance plist: %v", err)
 	}
+
 	plistText := string(plist)
+
 	for _, want := range []string{
 		"<string>io.goodkind.gha-mac-broker-maintenance</string>",
 		"<string>/bin/bash</string>",
 		"<string>" + scriptPath + "</string>",
 		"<integer>900</integer>",
-		"<string>" + filepath.Join(home, "Library", "Logs", "gha-mac-broker-maintenance.log") + "</string>",
+		"<string>" + filepath.Join(
+			home,
+			"Library",
+			"Logs",
+			"gha-mac-broker-maintenance.log",
+		) + "</string>",
 		// The launchd job runs in a minimal env, so the plist must set PATH (with
 		// the user bin dir where swift-mk installs) and HOME.
 		"<key>EnvironmentVariables</key>",
@@ -130,12 +150,15 @@ func TestInstallLaunchdMaintenanceRendersLaunchdFiles(t *testing.T) {
 			t.Errorf("maintenance plist missing %q\n%s", want, plistText)
 		}
 	}
+
 	if len(recorder.calls) != 2 {
 		t.Fatalf("launchctl calls = %d, want 2", len(recorder.calls))
 	}
+
 	if recorder.calls[0].name != "launchctl" || recorder.calls[0].args[0] != "bootout" {
 		t.Fatalf("first command = %#v, want launchctl bootout", recorder.calls[0])
 	}
+
 	if recorder.calls[1].name != "launchctl" || recorder.calls[1].args[0] != "bootstrap" {
 		t.Fatalf("second command = %#v, want launchctl bootstrap", recorder.calls[1])
 	}
@@ -176,20 +199,25 @@ func TestUninstallLaunchdMaintenanceRemovesFiles(t *testing.T) {
 	if err := installLaunchdMaintenance(context.Background(), cfg); err != nil {
 		t.Fatalf("installLaunchdMaintenance: %v", err)
 	}
+
 	if err := uninstallLaunchdMaintenance(context.Background(), cfg); err != nil {
 		t.Fatalf("uninstallLaunchdMaintenance: %v", err)
 	}
+
 	for _, path := range []string{maintenanceScriptPath(cfg), maintenancePlistPath(cfg)} {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("stat %s err = %v, want not exist", path, err)
 		}
 	}
+
 	var bootouts int
+
 	for _, call := range recorder.calls {
 		if call.name == "launchctl" && len(call.args) > 0 && call.args[0] == "bootout" {
 			bootouts++
 		}
 	}
+
 	if bootouts < 1 {
 		t.Fatalf("expected at least one launchctl bootout, calls = %#v", recorder.calls)
 	}
@@ -199,6 +227,7 @@ func TestUninstallRemovesMaintenanceFiles(t *testing.T) {
 	if runtime.GOOS != osDarwin {
 		t.Skipf("launchd maintenance uninstall is darwin-only, got %s", runtime.GOOS)
 	}
+
 	home := t.TempDir()
 	cfg := sampleConfig()
 	cfg.Home = home
@@ -208,22 +237,31 @@ func TestUninstallRemovesMaintenanceFiles(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(maintenanceScriptPath(cfg)), 0o755); err != nil {
 		t.Fatalf("mkdir maintenance script dir: %v", err)
 	}
+
 	if err := os.MkdirAll(filepath.Dir(maintenancePlistPath(cfg)), 0o755); err != nil {
 		t.Fatalf("mkdir maintenance plist dir: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(filepath.Join(cfg.Home, "Library", "LaunchAgents", launchdLabel+".plist")), 0o755); err != nil {
+
+	if err := os.MkdirAll(
+		filepath.Dir(filepath.Join(cfg.Home, "Library", "LaunchAgents", launchdLabel+".plist")),
+		0o755,
+	); err != nil {
 		t.Fatalf("mkdir service plist dir: %v", err)
 	}
+
 	if err := os.WriteFile(maintenanceScriptPath(cfg), []byte("script"), 0o755); err != nil {
 		t.Fatalf("write maintenance script: %v", err)
 	}
+
 	if err := os.WriteFile(maintenancePlistPath(cfg), []byte("plist"), 0o644); err != nil {
 		t.Fatalf("write maintenance plist: %v", err)
 	}
+
 	servicePlist := filepath.Join(cfg.Home, "Library", "LaunchAgents", launchdLabel+".plist")
 	if err := os.WriteFile(servicePlist, []byte("plist"), 0o644); err != nil {
 		t.Fatalf("write service plist: %v", err)
 	}
+
 	recorder := &recordingCommandRunner{calls: nil}
 	restore := replaceCommandRunner(recorder.build)
 	t.Cleanup(restore)
@@ -231,11 +269,17 @@ func TestUninstallRemovesMaintenanceFiles(t *testing.T) {
 	if err := Uninstall(context.Background(), cfg); err != nil {
 		t.Fatalf("Uninstall: %v", err)
 	}
-	for _, path := range []string{maintenanceScriptPath(cfg), maintenancePlistPath(cfg), servicePlist} {
+
+	for _, path := range []string{
+		maintenanceScriptPath(cfg),
+		maintenancePlistPath(cfg),
+		servicePlist,
+	} {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("stat %s err = %v, want not exist", path, err)
 		}
 	}
+
 	if len(recorder.calls) != 2 {
 		t.Fatalf("launchctl calls = %d, want 2", len(recorder.calls))
 	}

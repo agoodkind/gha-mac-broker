@@ -291,11 +291,14 @@ func (handler *Handler) slots() []*guestproto.SlotInfo {
 	slots := make([]*guestproto.SlotInfo, 0, handler.slotCount)
 	for slot := uint32(0); slot < handler.slotCount; slot++ {
 		executionID, busy := activeBySlot[slot]
-		slots = append(slots, &guestproto.SlotInfo{
-			Index:       slot,
-			Busy:        busy,
-			ExecutionId: executionID,
-		})
+		slots = append(
+			slots,
+			&guestproto.SlotInfo{
+				Index:       slot,
+				Busy:        busy,
+				ExecutionId: executionID,
+			},
+		)
 	}
 	return slots
 }

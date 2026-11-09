@@ -41,9 +41,11 @@ func New(bin string, parallelCopies int) *Client {
 	if bin == "" {
 		bin = "skopeo"
 	}
+
 	if parallelCopies <= 0 {
 		parallelCopies = defaultParallelCopies
 	}
+
 	return &Client{bin: bin, parallelCopies: parallelCopies, run: execRunner}
 }
 
@@ -52,6 +54,7 @@ func New(bin string, parallelCopies int) *Client {
 func command(ctx context.Context, bin string, args ...string) *exec.Cmd {
 	loggedArgs, _ := skopeoCommandLogValues(args, nil)
 	slog.DebugContext(ctx, "skopeo command built", "bin", bin, "args", loggedArgs)
+
 	return exec.CommandContext(ctx, bin, args...)
 }
 
@@ -62,17 +65,35 @@ func execRunner(ctx context.Context, bin string, args ...string) ([]byte, error)
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
 		loggedArgs, loggedOutput := skopeoCommandLogValues(args, out.Bytes())
-		slog.ErrorContext(ctx, "skopeo command failed", "err", err, "args", loggedArgs, "output", loggedOutput)
-		return out.Bytes(), fmt.Errorf("skopeo %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out.String()))
+		slog.ErrorContext(
+			ctx,
+			"skopeo command failed",
+			"err",
+			err,
+			"args",
+			loggedArgs,
+			"output",
+			loggedOutput,
+		)
+
+		return out.Bytes(), fmt.Errorf(
+			"skopeo %s: %w: %s",
+			strings.Join(args, " "),
+			err,
+			strings.TrimSpace(out.String()),
+		)
 	}
+
 	loggedArgs, loggedOutput := skopeoCommandLogValues(args, out.Bytes())
 	slog.DebugContext(ctx, "skopeo command output", "args", loggedArgs, "output", loggedOutput)
+
 	return out.Bytes(), nil
 }
 
 func skopeoCommandLogValues(args []string, output []byte) (string, string) {
 	loggedArgs := strings.Join(args, " ")
 	loggedOutput := strings.TrimSpace(string(output))
+
 	for _, arg := range args {
 		lower := strings.ToLower(arg)
 		if strings.Contains(lower, "jitconfig") || strings.Contains(lower, "base64") ||
@@ -80,12 +101,20 @@ func skopeoCommandLogValues(args []string, output []byte) (string, string) {
 			return redactedLogValue, redactedLogValue
 		}
 	}
+
 	return loggedArgs, loggedOutput
 }
 
 // CopyToOCILayout copies srcImageRef into layoutDir as an OCI layout tagged with
 // tag and constrained to the requested OS and architecture.
-func (c *Client) CopyToOCILayout(ctx context.Context, srcImageRef, layoutDir, tag, osName, arch string) error {
+func (c *Client) CopyToOCILayout(
+	ctx context.Context,
+	srcImageRef string,
+	layoutDir string,
+	tag string,
+	osName string,
+	arch string,
+) error {
 	args := []string{
 		"copy",
 		"--image-parallel-copies",
@@ -98,8 +127,16 @@ func (c *Client) CopyToOCILayout(ctx context.Context, srcImageRef, layoutDir, ta
 		"oci:" + layoutDir + ":" + tag,
 	}
 	if out, err := c.run(ctx, c.bin, args...); err != nil {
-		slog.ErrorContext(ctx, "skopeo copy failed", "err", err, "output", strings.TrimSpace(string(out)))
+		slog.ErrorContext(
+			ctx,
+			"skopeo copy failed",
+			"err",
+			err,
+			"output",
+			strings.TrimSpace(string(out)),
+		)
 		return fmt.Errorf("skopeo: copy %s to %s: %w", srcImageRef, layoutDir, err)
 	}
+
 	return nil
 }

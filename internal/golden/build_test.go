@@ -46,6 +46,7 @@ func (s *stubStager) Stage(_ context.Context, _ string) (string, func(), error) 
 	if s.err != nil {
 		return "", nil, s.err
 	}
+
 	return s.ref, func() { s.stopped = true }, nil
 }
 
@@ -55,6 +56,7 @@ func (s *stubTart) Clone(_ context.Context, source, name string, insecure bool) 
 	s.cloneFrom = append(s.cloneFrom, source)
 	s.cloneTo = append(s.cloneTo, name)
 	s.cloneInsecure = append(s.cloneInsecure, insecure)
+
 	return nil
 }
 
@@ -75,11 +77,14 @@ func (s *stubTart) Exec(_ context.Context, _ string, argv ...string) ([]byte, er
 			}
 		}
 	}
+
 	if len(argv) >= 2 && argv[0] == "printenv" && argv[1] == "HOME" {
 		return []byte("/Users/admin\n"), nil
 	}
+
 	if fingerprint, ok := fingerprintFromProvision(argv); ok {
 		s.provisionedFingerprint = fingerprint
+
 		for index := 0; index+1 < len(argv); index++ {
 			switch argv[index] {
 			case "-runner-version":
@@ -88,14 +93,18 @@ func (s *stubTart) Exec(_ context.Context, _ string, argv ...string) ([]byte, er
 				s.provisionedRunner.TarballDigest = argv[index+1]
 			}
 		}
+
 		return nil, nil
 	}
+
 	if len(argv) == 2 && argv[0] == "cat" && argv[1] == RunnerReceiptPath {
 		if s.provisionedRunner.Version != "" {
 			return json.Marshal(s.provisionedRunner)
 		}
+
 		return json.Marshal(s.bakedRunner)
 	}
+
 	if len(argv) == 2 && argv[0] == "cat" && argv[1] == FingerprintPath {
 		// After a provision has run, echo the freshly baked fingerprint so verify
 		// reads what the build just wrote. Before any provision, serve the seeded
@@ -103,11 +112,14 @@ func (s *stubTart) Exec(_ context.Context, _ string, argv ...string) ([]byte, er
 		if s.provisionedFingerprint != "" {
 			return []byte(s.provisionedFingerprint + "\n"), nil
 		}
+
 		if s.catErr != nil {
 			return nil, s.catErr
 		}
+
 		return []byte(s.bakedFingerprint + "\n"), nil
 	}
+
 	return nil, nil
 }
 
@@ -115,20 +127,24 @@ func (s *stubTart) Exec(_ context.Context, _ string, argv ...string) ([]byte, er
 // exec, so the stub can echo it back through the baked fingerprint file.
 func fingerprintFromProvision(argv []string) (string, bool) {
 	provision := false
+
 	for _, arg := range argv {
 		if arg == "golden-provision" {
 			provision = true
 			break
 		}
 	}
+
 	if !provision {
 		return "", false
 	}
+
 	for index := 0; index+1 < len(argv); index++ {
 		if argv[index] == "-fingerprint" {
 			return argv[index+1], true
 		}
 	}
+
 	return "", true
 }
 
@@ -149,6 +165,7 @@ func provisionInvoked(s *stubTart) bool {
 			}
 		}
 	}
+
 	return false
 }
 
@@ -158,17 +175,21 @@ func execInvoked(s *stubTart, want ...string) bool {
 		if len(call) != len(want) {
 			continue
 		}
+
 		match := true
+
 		for index := range call {
 			if call[index] != want[index] {
 				match = false
 				break
 			}
 		}
+
 		if match {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -179,12 +200,14 @@ func runnerVersionFromProvision(s *stubTart) (string, bool) {
 		if _, ok := fingerprintFromProvision(call); !ok {
 			continue
 		}
+
 		for index := 0; index+1 < len(call); index++ {
 			if call[index] == "-runner-version" {
 				return call[index+1], true
 			}
 		}
 	}
+
 	return "", false
 }
 
@@ -207,11 +230,18 @@ func TestEnsureGoldenReusesBuiltImageOffline(t *testing.T) {
 	vm := newDiskTart(t)
 	builder := New(vm)
 	builder.runnerDigest = fakeDigester
-	if err := builder.Build(t.Context(), Options{
-		BaseImage: image, GoldenName: name, BuildVM: name + "-build", RunnerVersion: "2.99.0",
-	}); err != nil {
+	if err := builder.Build(
+		t.Context(),
+		Options{
+			BaseImage:     image,
+			GoldenName:    name,
+			BuildVM:       name + "-build",
+			RunnerVersion: "2.99.0",
+		},
+	); err != nil {
 		t.Fatal(err)
 	}
+
 	vm.provisionCount = 0
 	offline := New(vm)
 	offline.resolveRunner = func(context.Context) (string, error) {
@@ -224,6 +254,7 @@ func TestEnsureGoldenReusesBuiltImageOffline(t *testing.T) {
 	if err != nil || got != name {
 		t.Fatalf("offline EnsureGolden = %q, %v; want %q", got, err, name)
 	}
+
 	if vm.provisionCount != 0 {
 		t.Fatal("offline reuse rebuilt the image")
 	}
@@ -234,16 +265,20 @@ func TestEnsureGoldenReusesBuiltImageOffline(t *testing.T) {
 func ensureFingerprint(t *testing.T, b *Builder, image string) string {
 	t.Helper()
 	goldenName := NameForImage(image)
-	_, fingerprint, _, _, err := b.fingerprintFor(context.Background(), Options{
-		BaseImage:     image,
-		GoldenName:    goldenName,
-		BuildVM:       goldenName + "-build",
-		RunnerVersion: "2.99.0",
-		BinaryPath:    "",
-	})
+	_, fingerprint, _, _, err := b.fingerprintFor(
+		context.Background(),
+		Options{
+			BaseImage:     image,
+			GoldenName:    goldenName,
+			BuildVM:       goldenName + "-build",
+			RunnerVersion: "2.99.0",
+			BinaryPath:    "",
+		},
+	)
 	if err != nil {
 		t.Fatalf("expectedFingerprint: %v", err)
 	}
+
 	return fingerprint
 }
 
@@ -253,6 +288,7 @@ func containsString(list []string, want string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -263,22 +299,31 @@ func TestEnsureGoldenSkipsWhenFingerprintCurrent(t *testing.T) {
 	b := New(s)
 	b.runnerDigest = fakeDigester
 	s.bakedFingerprint = ensureFingerprint(t, b, image)
-	s.bakedRunner = RunnerReceipt{Version: "2.99.0", TarballDigest: sha256Bytes([]byte("fake runner tarball"))}
+	s.bakedRunner = RunnerReceipt{
+		Version:       "2.99.0",
+		TarballDigest: sha256Bytes([]byte("fake runner tarball")),
+	}
 
-	got, err := b.EnsureGolden(context.Background(), EnsureOptions{
-		Image:         image,
-		BuildVM:       goldenName + "-build",
-		RunnerVersion: "2.99.0",
-	})
+	got, err := b.EnsureGolden(
+		context.Background(),
+		EnsureOptions{
+			Image:         image,
+			BuildVM:       goldenName + "-build",
+			RunnerVersion: "2.99.0",
+		},
+	)
 	if err != nil {
 		t.Fatalf("EnsureGolden: %v", err)
 	}
+
 	if got != goldenName {
 		t.Fatalf("golden name = %q, want %q", got, goldenName)
 	}
+
 	if provisionInvoked(s) {
 		t.Fatalf("current golden should not be rebuilt, exec calls = %v", s.execCalls)
 	}
+
 	if containsString(s.deleted, goldenName) {
 		t.Fatalf("current golden should not be deleted, deletes = %v", s.deleted)
 	}
@@ -287,24 +332,33 @@ func TestEnsureGoldenSkipsWhenFingerprintCurrent(t *testing.T) {
 func TestEnsureGoldenRebuildsWhenFingerprintDiffers(t *testing.T) {
 	image := "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5"
 	goldenName := NameForImage(image)
-	s := &stubTart{names: []string{goldenName}, bakedFingerprint: "stale-fingerprint-from-old-binary"}
+	s := &stubTart{
+		names:            []string{goldenName},
+		bakedFingerprint: "stale-fingerprint-from-old-binary",
+	}
 	b := New(s)
 	b.runnerDigest = fakeDigester
 
-	got, err := b.EnsureGolden(context.Background(), EnsureOptions{
-		Image:         image,
-		BuildVM:       goldenName + "-build",
-		RunnerVersion: "2.99.0",
-	})
+	got, err := b.EnsureGolden(
+		context.Background(),
+		EnsureOptions{
+			Image:         image,
+			BuildVM:       goldenName + "-build",
+			RunnerVersion: "2.99.0",
+		},
+	)
 	if err != nil {
 		t.Fatalf("EnsureGolden: %v", err)
 	}
+
 	if got != goldenName {
 		t.Fatalf("golden name = %q, want %q", got, goldenName)
 	}
+
 	if !provisionInvoked(s) {
 		t.Fatalf("stale golden should be rebuilt, exec calls = %v", s.execCalls)
 	}
+
 	if !containsString(s.deleted, goldenName) {
 		t.Fatalf("stale golden should be deleted before rebuild, deletes = %v", s.deleted)
 	}
@@ -317,20 +371,26 @@ func TestEnsureGoldenRebuildsWhenBakedFingerprintUnreadable(t *testing.T) {
 	b := New(s)
 	b.runnerDigest = fakeDigester
 
-	got, err := b.EnsureGolden(context.Background(), EnsureOptions{
-		Image:         image,
-		BuildVM:       goldenName + "-build",
-		RunnerVersion: "2.99.0",
-	})
+	got, err := b.EnsureGolden(
+		context.Background(),
+		EnsureOptions{
+			Image:         image,
+			BuildVM:       goldenName + "-build",
+			RunnerVersion: "2.99.0",
+		},
+	)
 	if err != nil {
 		t.Fatalf("EnsureGolden: %v", err)
 	}
+
 	if got != goldenName {
 		t.Fatalf("golden name = %q, want %q", got, goldenName)
 	}
+
 	if !provisionInvoked(s) {
 		t.Fatalf("unreadable golden should be rebuilt, exec calls = %v", s.execCalls)
 	}
+
 	if !containsString(s.deleted, goldenName) {
 		t.Fatalf("unreadable golden should be deleted before rebuild, deletes = %v", s.deleted)
 	}
@@ -343,31 +403,42 @@ func TestEnsureGoldenBuildsMissingGoldenFromImage(t *testing.T) {
 	b := New(s)
 	b.runnerDigest = fakeDigester
 
-	got, err := b.EnsureGolden(context.Background(), EnsureOptions{
-		Image:         image,
-		BuildVM:       goldenName + "-build",
-		RunnerVersion: "2.99.0",
-	})
+	got, err := b.EnsureGolden(
+		context.Background(),
+		EnsureOptions{
+			Image:         image,
+			BuildVM:       goldenName + "-build",
+			RunnerVersion: "2.99.0",
+		},
+	)
 	if err != nil {
 		t.Fatalf("EnsureGolden: %v", err)
 	}
+
 	if got != goldenName {
 		t.Fatalf("golden name = %q, want %q", got, goldenName)
 	}
+
 	if len(s.cloneFrom) == 0 || s.cloneFrom[0] != image {
 		t.Fatalf("first clone source = %v, want %q", s.cloneFrom, image)
 	}
+
 	if !strings.Contains(strings.Join(s.cloneTo, "\n"), goldenName) {
 		t.Fatalf("clone targets should include derived golden %q, got %v", goldenName, s.cloneTo)
 	}
+
 	if !provisionInvoked(s) {
 		t.Fatalf("absent golden should be built, exec calls = %v", s.execCalls)
 	}
+
 	// The absent path must not read a baked fingerprint, so no -fpcheck clone
 	// runs and the runner-tarball fetch is not paid before Build.
 	for _, clone := range s.cloneTo {
 		if strings.HasPrefix(clone, goldenName+"-fpcheck") {
-			t.Fatalf("absent golden should not run a fingerprint-check clone, cloneTo = %v", s.cloneTo)
+			t.Fatalf(
+				"absent golden should not run a fingerprint-check clone, cloneTo = %v",
+				s.cloneTo,
+			)
 		}
 	}
 }
@@ -379,13 +450,17 @@ func TestProvisionSyncsGuestBeforeSnapshot(t *testing.T) {
 	b := New(s)
 	b.runnerDigest = fakeDigester
 
-	if _, err := b.EnsureGolden(context.Background(), EnsureOptions{
-		Image:         image,
-		BuildVM:       goldenName + "-build",
-		RunnerVersion: "2.99.0",
-	}); err != nil {
+	if _, err := b.EnsureGolden(
+		context.Background(),
+		EnsureOptions{
+			Image:         image,
+			BuildVM:       goldenName + "-build",
+			RunnerVersion: "2.99.0",
+		},
+	); err != nil {
 		t.Fatalf("EnsureGolden: %v", err)
 	}
+
 	// The provisioner's writes must be flushed to the guest disk before the build
 	// snapshots the VM, or the golden can miss the fingerprint and fail verify.
 	if !execInvoked(s, "sync") {
@@ -399,20 +474,29 @@ func TestEnsureGoldenKeepsLiveGoldenWhenRebuildVerifyFails(t *testing.T) {
 	// A stale golden is present and the rebuild's verify fails (xcodebuild check
 	// errors), so the existing golden must survive and only the staging image is
 	// cleaned up.
-	s := &stubTart{names: []string{goldenName}, bakedFingerprint: "stale-fingerprint", failExecArg: "xcodebuild"}
+	s := &stubTart{
+		names:            []string{goldenName},
+		bakedFingerprint: "stale-fingerprint",
+		failExecArg:      "xcodebuild",
+	}
 	b := New(s)
 	b.runnerDigest = fakeDigester
 
-	if _, err := b.EnsureGolden(context.Background(), EnsureOptions{
-		Image:         image,
-		BuildVM:       goldenName + "-build",
-		RunnerVersion: "2.99.0",
-	}); err == nil {
+	if _, err := b.EnsureGolden(
+		context.Background(),
+		EnsureOptions{
+			Image:         image,
+			BuildVM:       goldenName + "-build",
+			RunnerVersion: "2.99.0",
+		},
+	); err == nil {
 		t.Fatal("expected the failed verify to surface as an error")
 	}
+
 	if containsString(s.deleted, goldenName) {
 		t.Fatalf("live golden must survive a failed rebuild, deletes = %v", s.deleted)
 	}
+
 	if !containsString(s.deleted, goldenName+goldenStagingSuffix) {
 		t.Fatalf("failed staging image must be cleaned up, deletes = %v", s.deleted)
 	}
@@ -428,16 +512,21 @@ func TestEnsureGoldenThreadsResolvedRunnerVersionToProvision(t *testing.T) {
 
 	// With an empty RunnerVersion, fingerprintFor resolves the latest version, and
 	// that resolved value (not the empty input) must reach golden-provision.
-	if _, err := b.EnsureGolden(context.Background(), EnsureOptions{
-		Image:   image,
-		BuildVM: goldenName + "-build",
-	}); err != nil {
+	if _, err := b.EnsureGolden(
+		context.Background(),
+		EnsureOptions{
+			Image:   image,
+			BuildVM: goldenName + "-build",
+		},
+	); err != nil {
 		t.Fatalf("EnsureGolden: %v", err)
 	}
+
 	got, ok := runnerVersionFromProvision(s)
 	if !ok {
 		t.Fatalf("golden-provision was not invoked, exec calls = %v", s.execCalls)
 	}
+
 	if got != "9.9.9-resolved" {
 		t.Fatalf("provision -runner-version = %q, want resolved %q", got, "9.9.9-resolved")
 	}
@@ -456,27 +545,35 @@ func TestBuildStagesBaseBeforeFirstClone(t *testing.T) {
 	builder := New(tartStub, WithBaseStager(stager))
 	builder.runnerDigest = fakeDigester
 
-	err := builder.Build(context.Background(), Options{
-		BaseImage:     image,
-		GoldenName:    goldenName,
-		BuildVM:       goldenName + "-build",
-		RunnerVersion: "2.99.0",
-	})
+	err := builder.Build(
+		context.Background(),
+		Options{
+			BaseImage:     image,
+			GoldenName:    goldenName,
+			BuildVM:       goldenName + "-build",
+			RunnerVersion: "2.99.0",
+		},
+	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
+
 	if len(tartStub.cloneFrom) == 0 {
 		t.Fatalf("Build made no clone calls")
 	}
+
 	if got := tartStub.cloneFrom[0]; got != stagedRef {
 		t.Fatalf("first clone source = %q, want %q", got, stagedRef)
 	}
+
 	if got := tartStub.cloneInsecure[0]; !got {
 		t.Fatalf("first clone insecure = %t, want true", got)
 	}
+
 	if !stager.stopped {
 		t.Fatalf("stager stop was not called")
 	}
+
 	if tartStub.provisionedFingerprint == "" {
 		t.Fatalf("provisioner was not asked to bake a fingerprint")
 	}
@@ -494,21 +591,27 @@ func TestBuildFallsBackToBaseImageWhenStageFails(t *testing.T) {
 	builder := New(tartStub, WithBaseStager(stager))
 	builder.runnerDigest = fakeDigester
 
-	err := builder.Build(context.Background(), Options{
-		BaseImage:     image,
-		GoldenName:    goldenName,
-		BuildVM:       goldenName + "-build",
-		RunnerVersion: "2.99.0",
-	})
+	err := builder.Build(
+		context.Background(),
+		Options{
+			BaseImage:     image,
+			GoldenName:    goldenName,
+			BuildVM:       goldenName + "-build",
+			RunnerVersion: "2.99.0",
+		},
+	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
+
 	if len(tartStub.cloneFrom) == 0 {
 		t.Fatalf("Build made no clone calls")
 	}
+
 	if got := tartStub.cloneFrom[0]; got != image {
 		t.Fatalf("first clone source = %q, want %q", got, image)
 	}
+
 	if got := tartStub.cloneInsecure[0]; got {
 		t.Fatalf("first clone insecure = %t, want false", got)
 	}
@@ -519,25 +622,38 @@ func TestProvisionLandsProvisionerViaDiscreteArgv(t *testing.T) {
 	b := New(s)
 	mountBinary := tartSharedMountRoot + "/" + provisionMountName + "/" + provisionBinaryName
 
-	if err := b.provision(context.Background(), "vm", "2.99.0", "runnerdigest99", mountBinary, "fp123"); err != nil {
+	if err := b.provision(
+		context.Background(),
+		"vm",
+		"2.99.0",
+		"runnerdigest99",
+		mountBinary,
+		"fp123",
+	); err != nil {
 		t.Fatalf("provision: %v", err)
 	}
 
 	var provisionCall []string
+
 	for _, call := range s.execCalls {
 		for _, arg := range call {
 			if arg == "bash" || arg == "-lc" {
 				t.Fatalf("provision used a shell: %v", call)
 			}
 		}
-		if len(call) >= 3 && call[0] == "sudo" && call[1] == localProvisionerPath && call[2] == "golden-provision" {
+
+		if len(call) >= 3 && call[0] == "sudo" && call[1] == localProvisionerPath &&
+			call[2] == "golden-provision" {
 			provisionCall = call
 		}
 	}
+
 	if provisionCall == nil {
 		t.Fatalf("provision did not run the landed provisioner, calls = %v", s.execCalls)
 	}
+
 	joined := strings.Join(provisionCall, " ")
+
 	for _, want := range []string{
 		"-runner-version 2.99.0",
 		"-runner-digest runnerdigest99",
@@ -551,9 +667,11 @@ func TestProvisionLandsProvisionerViaDiscreteArgv(t *testing.T) {
 	}
 
 	all := ""
+
 	for _, call := range s.execCalls {
 		all += strings.Join(call, " ") + "\n"
 	}
+
 	for _, want := range []string{
 		"cp " + mountBinary + " " + localProvisionerPath,
 		"xattr -c " + localProvisionerPath,
@@ -566,21 +684,34 @@ func TestProvisionLandsProvisionerViaDiscreteArgv(t *testing.T) {
 }
 
 func TestVerifyChecksFingerprintRunnerAndGuestAgent(t *testing.T) {
-	runner := RunnerReceipt{Version: "2.99.0", TarballDigest: sha256Bytes([]byte("fake runner tarball"))}
+	runner := RunnerReceipt{
+		Version:       "2.99.0",
+		TarballDigest: sha256Bytes([]byte("fake runner tarball")),
+	}
 	s := &stubTart{provisionedFingerprint: "fpABC", provisionedRunner: runner}
 	b := New(s)
-	if err := b.verify(context.Background(), "gha-golden", "gha-golden-verify", "fpABC", runner); err != nil {
+	if err := b.verify(
+		context.Background(),
+		"gha-golden",
+		"gha-golden-verify",
+		"fpABC",
+		runner,
+	); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
+
 	all := ""
+
 	for _, call := range s.execCalls {
 		for _, arg := range call {
 			if arg == "bash" || arg == "-lc" {
 				t.Fatalf("verify used a shell: %v", call)
 			}
 		}
+
 		all += strings.Join(call, " ") + "\n"
 	}
+
 	for _, want := range []string{
 		"test -f /Users/admin/actions-runner/run.sh",
 		"cat " + FingerprintPath,
@@ -598,10 +729,17 @@ func TestVerifyChecksFingerprintRunnerAndGuestAgent(t *testing.T) {
 func TestVerifyRejectsFingerprintMismatch(t *testing.T) {
 	s := &stubTart{provisionedFingerprint: "different"}
 	b := New(s)
-	err := b.verify(context.Background(), "gha-golden", "gha-golden-verify", "expected", RunnerReceipt{})
+	err := b.verify(
+		context.Background(),
+		"gha-golden",
+		"gha-golden-verify",
+		"expected",
+		RunnerReceipt{},
+	)
 	if err == nil {
 		t.Fatal("verify accepted a fingerprint mismatch, want failure")
 	}
+
 	if !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("verify error = %q, want a fingerprint mismatch message", err.Error())
 	}

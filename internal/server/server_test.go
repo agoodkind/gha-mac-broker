@@ -49,8 +49,10 @@ func (b *blockingWebhookBody) Read(p []byte) (int, error) {
 	if b.offset >= len(b.body) {
 		return 0, io.EOF
 	}
+
 	n := copy(p, b.body[b.offset:])
 	b.offset += n
+
 	return n, nil
 }
 
@@ -64,19 +66,23 @@ func (p *testPool) Enqueue(_ context.Context, job runnerpool.Job) error {
 	if p.enqueueErr != nil {
 		return p.enqueueErr
 	}
+
 	p.enqueued = append(p.enqueued, job)
+
 	return nil
 }
 
 func (p *testPool) Ready() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	return p.ready
 }
 
 func (p *testPool) Status(_ context.Context) (runnerpool.Snapshot, []runnerpool.WorkerView) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	return p.snapshot, append([]runnerpool.WorkerView(nil), p.workers...)
 }
 
@@ -89,12 +95,14 @@ func (p *testPool) CancelRun(jobID int64) {
 func (p *testPool) Jobs() []runnerpool.Job {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	return append([]runnerpool.Job(nil), p.enqueued...)
 }
 
 func (p *testPool) CancelledJobs() []int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	return append([]int64(nil), p.cancelled...)
 }
 
@@ -145,6 +153,7 @@ func newTestConfig() *config.Config {
 func signBody(body []byte) string {
 	mac := hmac.New(sha256.New, testSecret)
 	_, _ = mac.Write(body)
+
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -152,11 +161,24 @@ func webhookBody(action string, repo string, labels []string, runID int64) []byt
 	return webhookBodyWithJobID(action, repo, labels, runID, 7000+runID)
 }
 
-func webhookBodyWithJobID(action string, repo string, labels []string, runID int64, jobID int64) []byte {
+func webhookBodyWithJobID(
+	action string,
+	repo string,
+	labels []string,
+	runID int64,
+	jobID int64,
+) []byte {
 	return webhookBodyWithConclusion(action, repo, labels, runID, jobID, "")
 }
 
-func webhookBodyWithConclusion(action string, repo string, labels []string, runID int64, jobID int64, conclusion string) []byte {
+func webhookBodyWithConclusion(
+	action string,
+	repo string,
+	labels []string,
+	runID int64,
+	jobID int64,
+	conclusion string,
+) []byte {
 	payload := webhookPayload{
 		Action:     webhookAction(action),
 		Repository: webhookRepo{FullName: repo},
@@ -171,6 +193,7 @@ func webhookBodyWithConclusion(action string, repo string, labels []string, runI
 		},
 	}
 	body, _ := json.Marshal(payload)
+
 	return body
 }
 
@@ -180,6 +203,7 @@ func postWebhook(t *testing.T, srv *Server, body []byte) *httptest.ResponseRecor
 	req.Header.Set("X-Hub-Signature-256", signBody(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
+
 	return w
 }
 
@@ -192,10 +216,12 @@ func capacityRequest(t *testing.T, srv *Server, target string) capacityResponse 
 	if w.Code != http.StatusOK {
 		t.Fatalf("capacity status = %d, want 200", w.Code)
 	}
+
 	var resp capacityResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
+
 	return resp
 }
 
@@ -253,6 +279,7 @@ func TestWebhookNonQueuedReturns204(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204 for non-queued, got %d", w.Code)
 	}
+
 	if got := len(pool.Jobs()); got != 0 {
 		t.Fatalf("enqueued jobs = %d, want 0", got)
 	}
@@ -268,24 +295,53 @@ func TestWebhookCompletedCancelsCancelledAndSkippedJobs(t *testing.T) {
 		conclusion string
 		wantJobs   []int64
 	}{
-		{name: "cancelled", runID: 42, jobID: 1001, conclusion: "cancelled", wantJobs: []int64{1001}},
-		{name: "skipped", runID: 42, jobID: 1002, conclusion: "skipped", wantJobs: []int64{1001, 1002}},
-		{name: "success", runID: 42, jobID: 1003, conclusion: "success", wantJobs: []int64{1001, 1002}},
+		{
+			name:       "cancelled",
+			runID:      42,
+			jobID:      1001,
+			conclusion: "cancelled",
+			wantJobs:   []int64{1001},
+		},
+		{
+			name:       "skipped",
+			runID:      42,
+			jobID:      1002,
+			conclusion: "skipped",
+			wantJobs:   []int64{1001, 1002},
+		},
+		{
+			name:       "success",
+			runID:      42,
+			jobID:      1003,
+			conclusion: "success",
+			wantJobs:   []int64{1001, 1002},
+		},
 		{name: "empty", runID: 42, jobID: 1004, conclusion: "", wantJobs: []int64{1001, 1002}},
 	}
 
 	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			body := webhookBodyWithConclusion("completed", "owner/repo", []string{"self-hosted"}, testCase.runID, testCase.jobID, testCase.conclusion)
-			w := postWebhook(t, srv, body)
-			if w.Code != http.StatusNoContent {
-				t.Fatalf("status = %d, want 204", w.Code)
-			}
-			gotJobs := pool.CancelledJobs()
-			if fmt.Sprint(gotJobs) != fmt.Sprint(testCase.wantJobs) {
-				t.Fatalf("cancelled jobs = %v, want %v", gotJobs, testCase.wantJobs)
-			}
-		})
+		t.Run(
+			testCase.name,
+			func(t *testing.T) {
+				body := webhookBodyWithConclusion(
+					"completed",
+					"owner/repo",
+					[]string{"self-hosted"},
+					testCase.runID,
+					testCase.jobID,
+					testCase.conclusion,
+				)
+				w := postWebhook(t, srv, body)
+				if w.Code != http.StatusNoContent {
+					t.Fatalf("status = %d, want 204", w.Code)
+				}
+
+				gotJobs := pool.CancelledJobs()
+				if fmt.Sprint(gotJobs) != fmt.Sprint(testCase.wantJobs) {
+					t.Fatalf("cancelled jobs = %v, want %v", gotJobs, testCase.wantJobs)
+				}
+			},
+		)
 	}
 }
 
@@ -297,10 +353,12 @@ func TestWebhookQueuedEnqueuesJobForAnyRepoWithMatchingLabel(t *testing.T) {
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("expected 202 for matching pool label, got %d", w.Code)
 	}
+
 	jobs := pool.Jobs()
 	if len(jobs) != 1 {
 		t.Fatalf("enqueued jobs = %+v, want one", jobs)
 	}
+
 	want := runnerpool.Job{Repo: "other/repo", JobID: 7099, RunID: 99}
 	if jobs[0] != want {
 		t.Fatalf("enqueued job = %+v, want %+v", jobs[0], want)
@@ -315,6 +373,7 @@ func TestWebhookNoMatchingLabelReturns204(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204 when no label matches, got %d", w.Code)
 	}
+
 	if got := len(pool.Jobs()); got != 0 {
 		t.Fatalf("enqueued jobs = %d, want 0", got)
 	}
@@ -328,10 +387,12 @@ func TestWebhookQueuedEnqueuesJobAndReturns202(t *testing.T) {
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("expected 202, got %d", w.Code)
 	}
+
 	jobs := pool.Jobs()
 	if len(jobs) != 1 {
 		t.Fatalf("enqueued jobs = %+v, want one", jobs)
 	}
+
 	want := runnerpool.Job{Repo: "owner/repo", JobID: 1007, RunID: 7}
 	if jobs[0] != want {
 		t.Fatalf("enqueued job = %+v, want %+v", jobs[0], want)
@@ -359,6 +420,7 @@ func TestWebhookQueuedWithUnresolvedDefaultImageReturns204(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", w.Code)
 	}
+
 	if got := len(pool.Jobs()); got != 0 {
 		t.Fatalf("enqueued jobs = %d, want 0", got)
 	}
@@ -394,7 +456,12 @@ func TestWebhookUsesSingleConfigSnapshotDuringRequest(t *testing.T) {
 
 	reloadedConfig := newTestConfig()
 	reloadedConfig.Labels = []string{"other-label"}
-	srv.Reconfigure([]byte("rotated-secret"), reloadedConfig, nil, []*net.IPNet{mustParseCIDR(t, "10.0.0.0/8")})
+	srv.Reconfigure(
+		[]byte("rotated-secret"),
+		reloadedConfig,
+		nil,
+		[]*net.IPNet{mustParseCIDR(t, "10.0.0.0/8")},
+	)
 	close(blockingBody.release)
 
 	select {
@@ -406,10 +473,12 @@ func TestWebhookUsesSingleConfigSnapshotDuringRequest(t *testing.T) {
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", w.Code)
 	}
+
 	jobs := pool.Jobs()
 	if len(jobs) != 1 {
 		t.Fatalf("enqueued jobs = %+v, want one", jobs)
 	}
+
 	want := runnerpool.Job{Repo: "owner/repo", JobID: 1007, RunID: 7}
 	if jobs[0] != want {
 		t.Fatalf("enqueued job = %+v, want %+v", jobs[0], want)
@@ -419,6 +488,7 @@ func TestWebhookUsesSingleConfigSnapshotDuringRequest(t *testing.T) {
 func TestWebhookNonPostMethodReturns405(t *testing.T) {
 	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil)
 	body := webhookBody("queued", "owner/repo", []string{"self-hosted"}, 42)
+
 	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
 		req := httptest.NewRequest(method, "/webhook", strings.NewReader(string(body)))
 		req.Header.Set("X-Hub-Signature-256", signBody(body))
@@ -431,7 +501,15 @@ func TestWebhookNonPostMethodReturns405(t *testing.T) {
 }
 
 func TestCapacityAvailableForAnyRepo(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker(), nil)
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		testCapacityToken,
+		nil,
+		&testPool{ready: true},
+		hostedload.NewTracker(),
+		nil,
+	)
 	resp := capacityRequest(t, srv, "/capacity?repo=other/repo&run_id=1")
 	if !resp.Available {
 		t.Fatal("expected available=true for any repo when runner pool is ready")
@@ -439,7 +517,15 @@ func TestCapacityAvailableForAnyRepo(t *testing.T) {
 }
 
 func TestCapacityAvailableUsesPoolReadiness(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker(), nil)
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		testCapacityToken,
+		nil,
+		&testPool{ready: true},
+		hostedload.NewTracker(),
+		nil,
+	)
 	resp := capacityRequest(t, srv, "/capacity?repo=owner/repo&os=tahoe&xcode=26.5")
 	if !resp.Available {
 		t.Fatal("expected available=true when runner pool is ready")
@@ -447,7 +533,15 @@ func TestCapacityAvailableUsesPoolReadiness(t *testing.T) {
 }
 
 func TestCapacityUnmappedImageReturnsUnavailable(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker(), nil)
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		testCapacityToken,
+		nil,
+		&testPool{ready: true},
+		hostedload.NewTracker(),
+		nil,
+	)
 	resp := capacityRequest(t, srv, "/capacity?repo=owner/repo&os=tahoe&xcode=raw")
 	if resp.Available {
 		t.Fatal("expected available=false for unmapped image")
@@ -455,7 +549,15 @@ func TestCapacityUnmappedImageReturnsUnavailable(t *testing.T) {
 }
 
 func TestCapacityNotAvailableWhenPoolNotReady(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: false}, hostedload.NewTracker(), nil)
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		testCapacityToken,
+		nil,
+		&testPool{ready: false},
+		hostedload.NewTracker(),
+		nil,
+	)
 	resp := capacityRequest(t, srv, "/capacity?repo=owner/repo")
 	if resp.Available {
 		t.Fatal("expected available=false when runner pool is not ready")
@@ -463,7 +565,15 @@ func TestCapacityNotAvailableWhenPoolNotReady(t *testing.T) {
 }
 
 func TestCapacityPublicNoHeaderReturns200(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker(), nil)
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		testCapacityToken,
+		nil,
+		&testPool{ready: true},
+		hostedload.NewTracker(),
+		nil,
+	)
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=10", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
@@ -473,7 +583,15 @@ func TestCapacityPublicNoHeaderReturns200(t *testing.T) {
 }
 
 func TestCapacityPublicIgnoresWrongToken(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker(), nil)
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		testCapacityToken,
+		nil,
+		&testPool{ready: true},
+		hostedload.NewTracker(),
+		nil,
+	)
 	req := httptest.NewRequest(http.MethodGet, "/capacity?repo=owner/repo&run_id=11", nil)
 	req.Header.Set("Authorization", "Bearer wrong-token")
 	w := httptest.NewRecorder()
@@ -484,7 +602,15 @@ func TestCapacityPublicIgnoresWrongToken(t *testing.T) {
 }
 
 func TestCapacityReturns200AndAvailable(t *testing.T) {
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, &testPool{ready: true}, hostedload.NewTracker(), nil)
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		testCapacityToken,
+		nil,
+		&testPool{ready: true},
+		hostedload.NewTracker(),
+		nil,
+	)
 	resp := capacityRequest(t, srv, "/capacity")
 	if !resp.Available {
 		t.Fatal("expected available=true when runner pool is ready")
@@ -492,61 +618,107 @@ func TestCapacityReturns200AndAvailable(t *testing.T) {
 }
 
 func TestCapacityHostedFree(t *testing.T) {
-	t.Run("free when in-progress count is below the limit", func(t *testing.T) {
-		cfg := newTestConfig()
-		cfg.HostedMacOSConcurrencyLimit = 2
-		tracker := hostedload.NewTracker()
-		srv := New(testSecret, cfg, testCapacityToken, nil, &testPool{ready: true}, tracker, nil)
-		tracker.MarkInProgress(1)
-		resp := capacityRequest(t, srv, "/capacity")
-		if !resp.Available {
-			t.Fatal("expected available=true when runner pool is ready")
-		}
-		if !resp.HostedFree {
-			t.Fatal("expected hosted_free=true when count is below the limit")
-		}
-	})
+	t.Run(
+		"free when in-progress count is below the limit",
+		func(t *testing.T) {
+			cfg := newTestConfig()
+			cfg.HostedMacOSConcurrencyLimit = 2
+			tracker := hostedload.NewTracker()
+			srv := New(
+				testSecret,
+				cfg,
+				testCapacityToken,
+				nil,
+				&testPool{ready: true},
+				tracker,
+				nil,
+			)
+			tracker.MarkInProgress(1)
+			resp := capacityRequest(t, srv, "/capacity")
+			if !resp.Available {
+				t.Fatal("expected available=true when runner pool is ready")
+			}
 
-	t.Run("not free when in-progress count reaches the limit", func(t *testing.T) {
-		cfg := newTestConfig()
-		cfg.HostedMacOSConcurrencyLimit = 2
-		tracker := hostedload.NewTracker()
-		srv := New(testSecret, cfg, testCapacityToken, nil, &testPool{ready: true}, tracker, nil)
-		tracker.MarkInProgress(1)
-		tracker.MarkInProgress(2)
-		resp := capacityRequest(t, srv, "/capacity")
-		if resp.HostedFree {
-			t.Fatal("expected hosted_free=false when count is at the limit")
-		}
-	})
+			if !resp.HostedFree {
+				t.Fatal("expected hosted_free=true when count is below the limit")
+			}
+		},
+	)
 
-	t.Run("free regardless of count when the limit is non-positive", func(t *testing.T) {
-		cfg := newTestConfig()
-		cfg.HostedMacOSConcurrencyLimit = 0
-		tracker := hostedload.NewTracker()
-		srv := New(testSecret, cfg, testCapacityToken, nil, &testPool{ready: true}, tracker, nil)
-		tracker.MarkInProgress(1)
-		tracker.MarkInProgress(2)
-		tracker.MarkInProgress(3)
-		resp := capacityRequest(t, srv, "/capacity")
-		if !resp.HostedFree {
-			t.Fatal("expected hosted_free=true when the limit is non-positive")
-		}
-	})
+	t.Run(
+		"not free when in-progress count reaches the limit",
+		func(t *testing.T) {
+			cfg := newTestConfig()
+			cfg.HostedMacOSConcurrencyLimit = 2
+			tracker := hostedload.NewTracker()
+			srv := New(
+				testSecret,
+				cfg,
+				testCapacityToken,
+				nil,
+				&testPool{ready: true},
+				tracker,
+				nil,
+			)
+			tracker.MarkInProgress(1)
+			tracker.MarkInProgress(2)
+			resp := capacityRequest(t, srv, "/capacity")
+			if resp.HostedFree {
+				t.Fatal("expected hosted_free=false when count is at the limit")
+			}
+		},
+	)
 
-	t.Run("spill case reports hosted_free even when unavailable", func(t *testing.T) {
-		cfg := newTestConfig()
-		cfg.HostedMacOSConcurrencyLimit = 2
-		tracker := hostedload.NewTracker()
-		srv := New(testSecret, cfg, testCapacityToken, nil, &testPool{ready: true}, tracker, nil)
-		resp := capacityRequest(t, srv, "/capacity?os=tahoe&xcode=raw")
-		if resp.Available {
-			t.Fatal("expected available=false for an unmapped image")
-		}
-		if !resp.HostedFree {
-			t.Fatal("expected hosted_free=true in the unavailable spill response")
-		}
-	})
+	t.Run(
+		"free regardless of count when the limit is non-positive",
+		func(t *testing.T) {
+			cfg := newTestConfig()
+			cfg.HostedMacOSConcurrencyLimit = 0
+			tracker := hostedload.NewTracker()
+			srv := New(
+				testSecret,
+				cfg,
+				testCapacityToken,
+				nil,
+				&testPool{ready: true},
+				tracker,
+				nil,
+			)
+			tracker.MarkInProgress(1)
+			tracker.MarkInProgress(2)
+			tracker.MarkInProgress(3)
+			resp := capacityRequest(t, srv, "/capacity")
+			if !resp.HostedFree {
+				t.Fatal("expected hosted_free=true when the limit is non-positive")
+			}
+		},
+	)
+
+	t.Run(
+		"spill case reports hosted_free even when unavailable",
+		func(t *testing.T) {
+			cfg := newTestConfig()
+			cfg.HostedMacOSConcurrencyLimit = 2
+			tracker := hostedload.NewTracker()
+			srv := New(
+				testSecret,
+				cfg,
+				testCapacityToken,
+				nil,
+				&testPool{ready: true},
+				tracker,
+				nil,
+			)
+			resp := capacityRequest(t, srv, "/capacity?os=tahoe&xcode=raw")
+			if resp.Available {
+				t.Fatal("expected available=false for an unmapped image")
+			}
+
+			if !resp.HostedFree {
+				t.Fatal("expected hosted_free=true in the unavailable spill response")
+			}
+		},
+	)
 }
 
 func TestStatusRequiresBearerTokenAndReturnsPoolViews(t *testing.T) {
@@ -582,7 +754,15 @@ func TestStatusRequiresBearerTokenAndReturnsPoolViews(t *testing.T) {
 			},
 		},
 	}
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, pool, hostedload.NewTracker(), nil)
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		testCapacityToken,
+		nil,
+		pool,
+		hostedload.NewTracker(),
+		nil,
+	)
 
 	unauthorizedReq := httptest.NewRequest(http.MethodGet, "/status", nil)
 	unauthorizedRecorder := httptest.NewRecorder()
@@ -603,18 +783,23 @@ func TestStatusRequiresBearerTokenAndReturnsPoolViews(t *testing.T) {
 	if err := json.Unmarshal(authorizedRecorder.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal status response: %v", err)
 	}
+
 	if resp.Snapshot.Busy != 1 {
 		t.Fatalf("status busy = %d, want 1", resp.Snapshot.Busy)
 	}
+
 	if len(resp.Workers) != 2 {
 		t.Fatalf("status workers = %+v, want 2 workers", resp.Workers)
 	}
+
 	if resp.Workers[0].Phase != "busy" {
 		t.Fatalf("status worker phase = %q, want busy", resp.Workers[0].Phase)
 	}
+
 	if resp.Workers[0].ActiveJob == nil {
 		t.Fatal("status worker active job = nil, want false")
 	}
+
 	if *resp.Workers[0].ActiveJob {
 		t.Fatal("status worker active job = true, want false")
 	}
@@ -641,7 +826,15 @@ func TestStatusIncludesHostStatsFromProvider(t *testing.T) {
 			Busy:        1,
 		},
 	}
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, pool, hostedload.NewTracker(), fakeStats)
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		testCapacityToken,
+		nil,
+		pool,
+		hostedload.NewTracker(),
+		fakeStats,
+	)
 
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
 	req.Header.Set("Authorization", "Bearer test-capacity-token")
@@ -655,15 +848,19 @@ func TestStatusIncludesHostStatsFromProvider(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal status response: %v", err)
 	}
+
 	if resp.Snapshot.Busy != 1 {
 		t.Fatalf("status snapshot busy = %d, want 1", resp.Snapshot.Busy)
 	}
+
 	if resp.HostStats.Host.IdlePct != 42.5 {
 		t.Fatalf("status host_stats.host.idle_pct = %v, want 42.5", resp.HostStats.Host.IdlePct)
 	}
+
 	if resp.HostStats.Inventory.Busy != 3 {
 		t.Fatalf("status host_stats.inventory.busy = %d, want 3", resp.HostStats.Inventory.Busy)
 	}
+
 	if !resp.HostStats.SampledAt.Equal(sampledAt) {
 		t.Fatalf("status host_stats.sampled_at = %v, want %v", resp.HostStats.SampledAt, sampledAt)
 	}
@@ -671,7 +868,15 @@ func TestStatusIncludesHostStatsFromProvider(t *testing.T) {
 
 func TestStatusNilStatsProviderOmitsHostStats(t *testing.T) {
 	pool := &testPool{ready: true}
-	srv := New(testSecret, newTestConfig(), testCapacityToken, nil, pool, hostedload.NewTracker(), nil)
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		testCapacityToken,
+		nil,
+		pool,
+		hostedload.NewTracker(),
+		nil,
+	)
 
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
 	req.Header.Set("Authorization", "Bearer test-capacity-token")
@@ -685,8 +890,12 @@ func TestStatusNilStatsProviderOmitsHostStats(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal status response: %v", err)
 	}
+
 	if resp.HostStats.Host.IdlePct != 0 {
-		t.Fatalf("status host_stats.host.idle_pct = %v, want zero value", resp.HostStats.Host.IdlePct)
+		t.Fatalf(
+			"status host_stats.host.idle_pct = %v, want zero value",
+			resp.HostStats.Host.IdlePct,
+		)
 	}
 }
 
@@ -696,6 +905,7 @@ func mustParseCIDR(t *testing.T, cidr string) *net.IPNet {
 	if err != nil {
 		t.Fatalf("ParseCIDR(%q): %v", cidr, err)
 	}
+
 	return ipNet
 }
 
@@ -764,7 +974,11 @@ type fakeRunCanceller struct {
 	called chan struct{}
 }
 
-func (f *fakeRunCanceller) CancelActiveRunsForHeadSHA(_ context.Context, repo, headSHA string) (int, error) {
+func (f *fakeRunCanceller) CancelActiveRunsForHeadSHA(
+	_ context.Context,
+	repo string,
+	headSHA string,
+) (int, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, cancelCall{repo: repo, headSHA: headSHA})
 	cancelled := f.cancelled
@@ -777,15 +991,18 @@ func (f *fakeRunCanceller) CancelActiveRunsForHeadSHA(_ context.Context, repo, h
 		default:
 		}
 	}
+
 	if err != nil {
 		return 0, err
 	}
+
 	return cancelled, nil
 }
 
 func (f *fakeRunCanceller) Calls() []cancelCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	return append([]cancelCall(nil), f.calls...)
 }
 
@@ -808,6 +1025,7 @@ func pullRequestBody(action string, repo string, headSHA string, number int) []b
 	payload.PullRequest.Number = number
 	payload.PullRequest.Head.SHA = headSHA
 	body, _ := json.Marshal(payload)
+
 	return body
 }
 
@@ -818,21 +1036,33 @@ func postPullRequestWebhook(t *testing.T, srv *Server, body []byte) *httptest.Re
 	req.Header.Set("X-Github-Event", "pull_request")
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
+
 	return w
 }
 
 func TestPullRequestClosedCancelsRunsForHeadSHA(t *testing.T) {
 	rc := &fakeRunCanceller{cancelled: 2, called: make(chan struct{}, 1)}
-	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil, WithRunCanceller(rc))
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		nil,
+		nil,
+		&testPool{},
+		hostedload.NewTracker(),
+		nil,
+		WithRunCanceller(rc),
+	)
 	w := postPullRequestWebhook(t, srv, pullRequestBody("closed", "agoodkind/lmd", "abc123", 42))
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
 	}
+
 	rc.waitCalled(t)
 	calls := rc.Calls()
 	if len(calls) != 1 {
 		t.Fatalf("cancel calls = %d, want 1", len(calls))
 	}
+
 	if calls[0].repo != "agoodkind/lmd" || calls[0].headSHA != "abc123" {
 		t.Fatalf("cancel call = %+v, want repo agoodkind/lmd head abc123", calls[0])
 	}
@@ -840,11 +1070,21 @@ func TestPullRequestClosedCancelsRunsForHeadSHA(t *testing.T) {
 
 func TestPullRequestNonClosedActionDoesNotCancel(t *testing.T) {
 	rc := &fakeRunCanceller{}
-	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil, WithRunCanceller(rc))
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		nil,
+		nil,
+		&testPool{},
+		hostedload.NewTracker(),
+		nil,
+		WithRunCanceller(rc),
+	)
 	w := postPullRequestWebhook(t, srv, pullRequestBody("opened", "agoodkind/lmd", "abc123", 42))
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
 	}
+
 	if got := len(rc.Calls()); got != 0 {
 		t.Fatalf("cancel calls = %d, want 0 for a non-closed action", got)
 	}
@@ -852,11 +1092,21 @@ func TestPullRequestNonClosedActionDoesNotCancel(t *testing.T) {
 
 func TestPullRequestClosedWithoutHeadSHADoesNotCancel(t *testing.T) {
 	rc := &fakeRunCanceller{}
-	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil, WithRunCanceller(rc))
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		nil,
+		nil,
+		&testPool{},
+		hostedload.NewTracker(),
+		nil,
+		WithRunCanceller(rc),
+	)
 	w := postPullRequestWebhook(t, srv, pullRequestBody("closed", "agoodkind/lmd", "", 42))
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
 	}
+
 	if got := len(rc.Calls()); got != 0 {
 		t.Fatalf("cancel calls = %d, want 0 when head sha is missing", got)
 	}
@@ -872,11 +1122,21 @@ func TestPullRequestClosedWithoutCancellerReturns204(t *testing.T) {
 
 func TestPullRequestClosedCancellerErrorStillReturns204(t *testing.T) {
 	rc := &fakeRunCanceller{err: errors.New("github unavailable"), called: make(chan struct{}, 1)}
-	srv := New(testSecret, newTestConfig(), nil, nil, &testPool{}, hostedload.NewTracker(), nil, WithRunCanceller(rc))
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		nil,
+		nil,
+		&testPool{},
+		hostedload.NewTracker(),
+		nil,
+		WithRunCanceller(rc),
+	)
 	w := postPullRequestWebhook(t, srv, pullRequestBody("closed", "agoodkind/lmd", "abc123", 42))
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d (cancellation is best-effort)", w.Code, http.StatusNoContent)
 	}
+
 	rc.waitCalled(t)
 	if got := len(rc.Calls()); got != 1 {
 		t.Fatalf("cancel calls = %d, want 1", got)
@@ -886,13 +1146,27 @@ func TestPullRequestClosedCancellerErrorStillReturns204(t *testing.T) {
 func TestWorkflowJobWebhookIgnoresPullRequestPath(t *testing.T) {
 	rc := &fakeRunCanceller{}
 	pool := &testPool{}
-	srv := New(testSecret, newTestConfig(), nil, nil, pool, hostedload.NewTracker(), nil, WithRunCanceller(rc))
+	srv := New(
+		testSecret,
+		newTestConfig(),
+		nil,
+		nil,
+		pool,
+		hostedload.NewTracker(),
+		nil,
+		WithRunCanceller(rc),
+	)
 	// A workflow_job delivery carries no X-Github-Event: pull_request header, so it
 	// keeps the existing action switch and never calls the run canceller.
-	w := postWebhook(t, srv, webhookBody("queued", "owner/repo", []string{"self-hosted", "macOS"}, 42))
+	w := postWebhook(
+		t,
+		srv,
+		webhookBody("queued", "owner/repo", []string{"self-hosted", "macOS"}, 42),
+	)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusAccepted)
 	}
+
 	if got := len(rc.Calls()); got != 0 {
 		t.Fatalf("cancel calls = %d, want 0 for a workflow_job delivery", got)
 	}

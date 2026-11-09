@@ -21,22 +21,34 @@ func TestRestartLaunchdBootsOutAndBootstrapsExistingPlist(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
 		t.Fatalf("create plist dir: %v", err)
 	}
+
 	if err := os.WriteFile(plistPath, []byte("plist"), 0o644); err != nil {
 		t.Fatalf("write plist: %v", err)
 	}
+
 	var commands []capturedServiceCommand
-	withRestartTestHooks(t, "darwin", home, func(_ context.Context, name string, args ...string) ([]byte, error) {
-		commands = append(commands, capturedServiceCommand{name: name, args: append([]string(nil), args...)})
-		if name == "launchctl" && len(args) > 0 && args[0] == "print" {
-			return []byte("not loaded"), errors.New("not loaded")
-		}
-		return nil, nil
-	})
+	withRestartTestHooks(
+		t,
+		"darwin",
+		home,
+		func(_ context.Context, name string, args ...string) ([]byte, error) {
+			commands = append(
+				commands,
+				capturedServiceCommand{name: name, args: append([]string(nil), args...)},
+			)
+			if name == "launchctl" && len(args) > 0 && args[0] == "print" {
+				return []byte("not loaded"), errors.New("not loaded")
+			}
+
+			return nil, nil
+		},
+	)
 
 	restarted, err := Restart(context.Background())
 	if err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
+
 	if !restarted {
 		t.Fatal("Restart returned restarted=false, want true")
 	}
@@ -59,19 +71,30 @@ func TestRestartSystemdReloadsAndRestartsExistingUnit(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
 		t.Fatalf("create unit dir: %v", err)
 	}
+
 	if err := os.WriteFile(unitPath, []byte("unit"), 0o644); err != nil {
 		t.Fatalf("write unit: %v", err)
 	}
+
 	var commands []capturedServiceCommand
-	withRestartTestHooks(t, "linux", home, func(_ context.Context, name string, args ...string) ([]byte, error) {
-		commands = append(commands, capturedServiceCommand{name: name, args: append([]string(nil), args...)})
-		return nil, nil
-	})
+	withRestartTestHooks(
+		t,
+		"linux",
+		home,
+		func(_ context.Context, name string, args ...string) ([]byte, error) {
+			commands = append(
+				commands,
+				capturedServiceCommand{name: name, args: append([]string(nil), args...)},
+			)
+			return nil, nil
+		},
+	)
 
 	restarted, err := Restart(context.Background())
 	if err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
+
 	if !restarted {
 		t.Fatal("Restart returned restarted=false, want true")
 	}

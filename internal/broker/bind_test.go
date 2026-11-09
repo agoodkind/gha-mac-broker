@@ -36,9 +36,11 @@ func (s *stubStream) Receive() (*guestproto.JobStatusEvent, error) {
 		s.pos++
 		return s.events[s.pos-1], nil
 	}
+
 	if s.err != nil {
 		return nil, s.err
 	}
+
 	return nil, io.EOF
 }
 
@@ -70,8 +72,10 @@ func (s *tickStream) Receive() (*guestproto.JobStatusEvent, error) {
 	if s.sent >= s.ticks {
 		return nil, io.EOF
 	}
+
 	time.Sleep(s.interval)
 	s.sent++
+
 	return &guestproto.JobStatusEvent{Sequence: uint64(s.sent)}, nil
 }
 
@@ -86,7 +90,10 @@ func (silentGuest) Hello(context.Context) (*guestproto.HelloResponse, error) {
 	return &guestproto.HelloResponse{ProtocolMajor: hostProtocolMajor}, nil
 }
 
-func (silentGuest) RunJob(context.Context, *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error) {
+func (silentGuest) RunJob(
+	context.Context,
+	*guestproto.RunJobRequest,
+) (*guestproto.RunJobResponse, error) {
 	return &guestproto.RunJobResponse{}, nil
 }
 
@@ -119,6 +126,7 @@ func TestDrainStreamIdleTimeoutCancelsAttempt(t *testing.T) {
 	if terminal != nil {
 		t.Fatalf("terminal = %v, want nil", terminal)
 	}
+
 	if !errors.Is(context.Cause(ctx), errDrainIdle) {
 		t.Fatalf("cause = %v, want errDrainIdle", context.Cause(ctx))
 	}
@@ -137,13 +145,21 @@ func TestDrainStreamHeartbeatsResetIdleWatchdog(t *testing.T) {
 	cursor := uint64(0)
 	// Six ticks 20ms apart span 120ms, twice drainIdleTimeout, so the watchdog
 	// only stays quiet if every tick resets it.
-	terminal, err := drainStream(ctx, cancel, &tickStream{interval: 20 * time.Millisecond, ticks: 6}, nil, &cursor)
+	terminal, err := drainStream(
+		ctx,
+		cancel,
+		&tickStream{interval: 20 * time.Millisecond, ticks: 6},
+		nil,
+		&cursor,
+	)
 	if terminal != nil {
 		t.Fatalf("terminal = %v, want nil", terminal)
 	}
+
 	if err != nil {
 		t.Fatalf("err = %v, want nil for a natural stream end", err)
 	}
+
 	if errors.Is(context.Cause(ctx), errDrainIdle) {
 		t.Fatal("idle watchdog tripped despite regular events")
 	}
@@ -167,6 +183,7 @@ func TestDrainToTerminalReturnsErrDrainStalledOnSilentStream(t *testing.T) {
 	if canceled {
 		t.Fatal("canceled = true, want false; an idle timeout is not a parent cancel")
 	}
+
 	if !errors.Is(err, ErrDrainStalled) {
 		t.Fatalf("err = %v, want ErrDrainStalled", err)
 	}
@@ -202,10 +219,15 @@ func (g *stubGuest) Hello(_ context.Context) (*guestproto.HelloResponse, error) 
 	if helloErr != nil {
 		return nil, helloErr
 	}
+
 	if explicit != nil {
 		return explicit, nil
 	}
-	return &guestproto.HelloResponse{ProtocolMajor: hostProtocolMajor, Slots: indexedSlots(defaultAdvertisedSlots)}, nil
+
+	return &guestproto.HelloResponse{
+		ProtocolMajor: hostProtocolMajor,
+		Slots:         indexedSlots(defaultAdvertisedSlots),
+	}, nil
 }
 
 // indexedSlots builds a dense slot inventory covering indices 0..count-1.
@@ -214,20 +236,29 @@ func indexedSlots(count uint32) []*guestproto.SlotInfo {
 	for index := uint32(0); index < count; index++ {
 		slots = append(slots, &guestproto.SlotInfo{Index: index})
 	}
+
 	return slots
 }
 
-func (g *stubGuest) RunJob(_ context.Context, request *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error) {
+func (g *stubGuest) RunJob(
+	_ context.Context,
+	request *guestproto.RunJobRequest,
+) (*guestproto.RunJobResponse, error) {
 	g.mu.Lock()
 	g.runRequests = append(g.runRequests, request)
 	g.mu.Unlock()
 	if g.runErr != nil {
 		return nil, g.runErr
 	}
+
 	return g.runResp, nil
 }
 
-func (g *stubGuest) JobStatus(_ context.Context, _ string, fromSequence uint64) (jobStatusStream, error) {
+func (g *stubGuest) JobStatus(
+	_ context.Context,
+	_ string,
+	fromSequence uint64,
+) (jobStatusStream, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.statusCalls = append(g.statusCalls, fromSequence)
@@ -235,6 +266,7 @@ func (g *stubGuest) JobStatus(_ context.Context, _ string, fromSequence uint64) 
 	if index >= len(g.statusFactory) {
 		index = len(g.statusFactory) - 1
 	}
+
 	return g.statusFactory[index](fromSequence)
 }
 
@@ -243,9 +275,11 @@ func (g *stubGuest) Reattach(ctx context.Context) (*guestproto.ReattachResponse,
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
+
 	if g.reattachErr != nil {
 		return nil, g.reattachErr
 	}
+
 	return g.reattach, nil
 }
 
@@ -253,6 +287,7 @@ func (g *stubGuest) Drain(_ context.Context) (*guestproto.DrainResponse, error) 
 	g.mu.Lock()
 	g.drainCalls++
 	g.mu.Unlock()
+
 	return &guestproto.DrainResponse{Idle: true, ActiveExecutions: 0}, nil
 }
 
@@ -261,18 +296,21 @@ func (g *stubGuest) CancelJob(_ context.Context, executionID string) error {
 	g.cancelCalls = append(g.cancelCalls, executionID)
 	cancelErr := g.cancelErr
 	g.mu.Unlock()
+
 	return cancelErr
 }
 
 func (g *stubGuest) statusCallCursors() []uint64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
 	return append([]uint64(nil), g.statusCalls...)
 }
 
 func (g *stubGuest) cancelledExecutions() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
 	return append([]string(nil), g.cancelCalls...)
 }
 
@@ -302,6 +340,7 @@ func stubBinder(t *testing.T, guest guestConn) *Binder {
 	binder.guestFor = func(_ context.Context, _ *WarmVM) (guestConn, error) {
 		return guest, nil
 	}
+
 	return binder
 }
 
@@ -310,28 +349,45 @@ func TestRunJobAcceptedZeroExitReturnsNil(t *testing.T) {
 		runResp: &guestproto.RunJobResponse{Outcome: guestproto.RunJobResponse_ACCEPTED},
 		statusFactory: []func(uint64) (jobStatusStream, error){
 			func(uint64) (jobStatusStream, error) {
-				return &stubStream{events: []*guestproto.JobStatusEvent{logEvent(1, "hi"), terminalEvent(2, 0)}}, nil
+				return &stubStream{
+					events: []*guestproto.JobStatusEvent{logEvent(1, "hi"), terminalEvent(2, 0)},
+				}, nil
 			},
 		},
 	}
 	binder := stubBinder(t, guest)
-	err := binder.RunJob(context.Background(), &WarmVM{Name: "warm-vm-1"}, "owner/repo", "runner-1", 0, 1, 1001, 42, time.Time{})
+	err := binder.RunJob(
+		context.Background(),
+		&WarmVM{Name: "warm-vm-1"},
+		"owner/repo",
+		"runner-1",
+		0,
+		1,
+		1001,
+		42,
+		time.Time{},
+	)
 	if err != nil {
 		t.Fatalf("RunJob: %v", err)
 	}
+
 	if len(guest.runRequests) != 1 {
 		t.Fatalf("run requests = %d, want 1", len(guest.runRequests))
 	}
+
 	request := guest.runRequests[0]
 	if request.GetExecutionId() != "owner/repo#42#1001" {
 		t.Fatalf("execution id = %q, want owner/repo#42#1001", request.GetExecutionId())
 	}
+
 	if request.GetSlot() != 0 {
 		t.Fatalf("slot = %d, want 0", request.GetSlot())
 	}
+
 	if request.GetMeta().GetJobId() != 1001 || request.GetMeta().GetRunId() != 42 {
 		t.Fatalf("meta = %+v, want job 1001 run 42", request.GetMeta())
 	}
+
 	if request.GetEnv()["GIT_TERMINAL_PROMPT"] != "0" {
 		t.Fatalf("env = %v, want GIT_TERMINAL_PROMPT=0", request.GetEnv())
 	}
@@ -347,10 +403,21 @@ func TestRunJobNonzeroExitReturnsError(t *testing.T) {
 		},
 	}
 	binder := stubBinder(t, guest)
-	err := binder.RunJob(context.Background(), &WarmVM{Name: "warm-vm-1"}, "owner/repo", "runner-1", 0, 1, 1001, 42, time.Time{})
+	err := binder.RunJob(
+		context.Background(),
+		&WarmVM{Name: "warm-vm-1"},
+		"owner/repo",
+		"runner-1",
+		0,
+		1,
+		1001,
+		42,
+		time.Time{},
+	)
 	if err == nil {
 		t.Fatal("RunJob error = nil, want nonzero-exit error")
 	}
+
 	if !errors.Is(err, ErrJobTerminal) {
 		t.Fatalf("RunJob error = %v, want wrapped ErrJobTerminal", err)
 	}
@@ -361,10 +428,21 @@ func TestRunJobConflictReturnsErrorWithoutDraining(t *testing.T) {
 		runResp: &guestproto.RunJobResponse{Outcome: guestproto.RunJobResponse_CONFLICT},
 	}
 	binder := stubBinder(t, guest)
-	err := binder.RunJob(context.Background(), &WarmVM{Name: "warm-vm-1"}, "owner/repo", "runner-1", 0, 1, 1001, 42, time.Time{})
+	err := binder.RunJob(
+		context.Background(),
+		&WarmVM{Name: "warm-vm-1"},
+		"owner/repo",
+		"runner-1",
+		0,
+		1,
+		1001,
+		42,
+		time.Time{},
+	)
 	if err == nil {
 		t.Fatal("RunJob error = nil, want conflict error")
 	}
+
 	if len(guest.statusCallCursors()) != 0 {
 		t.Fatalf("status calls = %v, want none on conflict", guest.statusCallCursors())
 	}
@@ -385,14 +463,24 @@ func TestDrainJobReconnectsFromCursorAfterMidStreamDrop(t *testing.T) {
 		},
 	}
 	binder := stubBinder(t, guest)
-	err := binder.drainJob(context.Background(), guest, "owner/repo#42#1001", 0, &WarmVM{Name: "warm-vm-1"}, 0, 1)
+	err := binder.drainJob(
+		context.Background(),
+		guest,
+		"owner/repo#42#1001",
+		0,
+		&WarmVM{Name: "warm-vm-1"},
+		0,
+		1,
+	)
 	if err != nil {
 		t.Fatalf("drainJob: %v", err)
 	}
+
 	cursors := guest.statusCallCursors()
 	if len(cursors) != 2 {
 		t.Fatalf("status calls = %v, want two (initial + reconnect)", cursors)
 	}
+
 	if cursors[0] != 0 || cursors[1] != 2 {
 		t.Fatalf("reconnect cursors = %v, want [0 2]", cursors)
 	}
@@ -407,7 +495,15 @@ func TestDrainJobExecutionNotFoundFreesSlot(t *testing.T) {
 		},
 	}
 	binder := stubBinder(t, guest)
-	err := binder.drainJob(context.Background(), guest, "owner/repo#42#1001", 0, &WarmVM{Name: "warm-vm-1"}, 0, 1)
+	err := binder.drainJob(
+		context.Background(),
+		guest,
+		"owner/repo#42#1001",
+		0,
+		&WarmVM{Name: "warm-vm-1"},
+		0,
+		1,
+	)
 	if err != nil {
 		t.Fatalf("drainJob = %v, want nil for expired execution", err)
 	}
@@ -429,7 +525,9 @@ func TestDrainJobRecycleCauseCancelsThenDrainsToTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("drainJob = %v, want nil after cancel-drain to zero exit", err)
 	}
-	if cancels := guest.cancelledExecutions(); len(cancels) != 1 || cancels[0] != "owner/repo#42#1001" {
+
+	if cancels := guest.cancelledExecutions(); len(cancels) != 1 ||
+		cancels[0] != "owner/repo#42#1001" {
 		t.Fatalf("cancel calls = %v, want [owner/repo#42#1001]", cancels)
 	}
 }
@@ -456,7 +554,15 @@ func TestDrainJobBoundsTeardownWhenVMUnreachable(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- binder.drainJob(ctx, guest, "owner/repo#42#1001", 0, &WarmVM{Name: "warm-vm-1"}, 0, 1)
+		done <- binder.drainJob(
+			ctx,
+			guest,
+			"owner/repo#42#1001",
+			0,
+			&WarmVM{Name: "warm-vm-1"},
+			0,
+			1,
+		)
 	}()
 	select {
 	case err := <-done:
@@ -466,7 +572,9 @@ func TestDrainJobBoundsTeardownWhenVMUnreachable(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("drainJob did not return; teardown drain is unbounded")
 	}
-	if cancels := guest.cancelledExecutions(); len(cancels) != 1 || cancels[0] != "owner/repo#42#1001" {
+
+	if cancels := guest.cancelledExecutions(); len(cancels) != 1 ||
+		cancels[0] != "owner/repo#42#1001" {
 		t.Fatalf("cancel calls = %v, want one CancelJob attempt", cancels)
 	}
 }
@@ -486,9 +594,11 @@ func TestDrainJobPlainCancelDetachesWithoutCancelingJob(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("drainJob = %v, want context.Canceled detach", err)
 	}
+
 	if cancels := guest.cancelledExecutions(); len(cancels) != 0 {
 		t.Fatalf("cancel calls = %v, want none on plain-cancel detach", cancels)
 	}
+
 	if calls := guest.statusCallCursors(); len(calls) != 0 {
 		t.Fatalf("status calls = %v, want none on plain-cancel detach", calls)
 	}
@@ -508,9 +618,11 @@ func TestRunningSlotsReportsRunningExecutions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunningSlots: %v", err)
 	}
+
 	if !running[0] {
 		t.Fatalf("running = %v, want slot 0 running", running)
 	}
+
 	if running[1] {
 		t.Fatalf("running = %v, want slot 1 not running", running)
 	}
@@ -525,10 +637,18 @@ func TestResumeJobDrainsFromCursor(t *testing.T) {
 		},
 	}
 	binder := stubBinder(t, guest)
-	err := binder.ResumeJob(context.Background(), &WarmVM{Name: "warm-vm-1"}, "owner/repo#42#1001", 7, 0, 1)
+	err := binder.ResumeJob(
+		context.Background(),
+		&WarmVM{Name: "warm-vm-1"},
+		"owner/repo#42#1001",
+		7,
+		0,
+		1,
+	)
 	if err != nil {
 		t.Fatalf("ResumeJob: %v", err)
 	}
+
 	cursors := guest.statusCallCursors()
 	if len(cursors) != 1 || cursors[0] != 7 {
 		t.Fatalf("resume cursors = %v, want [7]", cursors)
@@ -562,19 +682,28 @@ func TestAdoptMarksRunningExecutionSlotBusyWithResumeCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
+
 	if len(adopted) != 1 {
 		t.Fatalf("adopted = %+v, want one busy VM", adopted)
 	}
+
 	if adopted[0].VM.Name != "pool-a-busy" {
 		t.Fatalf("adopted vm = %q, want pool-a-busy", adopted[0].VM.Name)
 	}
+
 	if len(adopted[0].Slots) != 1 {
 		t.Fatalf("adopted slots = %+v, want one busy slot", adopted[0].Slots)
 	}
+
 	slot := adopted[0].Slots[0]
-	if slot.ExecutionID != "owner/repo#42#1001" || slot.ResumeCursor != 12 || slot.RunID != 42 || slot.JobID != 1001 {
-		t.Fatalf("adopted slot = %+v, want execution owner/repo#42#1001 cursor 12 job 1001 run 42", slot)
+	if slot.ExecutionID != "owner/repo#42#1001" || slot.ResumeCursor != 12 || slot.RunID != 42 ||
+		slot.JobID != 1001 {
+		t.Fatalf(
+			"adopted slot = %+v, want execution owner/repo#42#1001 cursor 12 job 1001 run 42",
+			slot,
+		)
 	}
+
 	if !slot.ObservedActive {
 		t.Fatalf("adopted slot observed active = false, want true")
 	}
@@ -607,6 +736,7 @@ func TestAdoptSkipsHungReattachWithinBound(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Adopt did not return; adoption Reattach is unbounded")
 	}
+
 	if len(adopted) != 0 {
 		t.Fatalf("adopted = %+v, want none (hung VM skipped after bounded Reattach)", adopted)
 	}
@@ -638,7 +768,9 @@ func newRunJobTestGitHubClient(t *testing.T) *ghapp.Client {
 			_, _ = w.Write([]byte(`{"token":"ghs_installationtoken"}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/actions/runners/generate-jitconfig":
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"encoded_jit_config":"encoded-jit","runner":{"id":7,"name":"runner-1"}}`))
+			_, _ = w.Write(
+				[]byte(`{"encoded_jit_config":"encoded-jit","runner":{"id":7,"name":"runner-1"}}`),
+			)
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected", http.StatusNotFound)
@@ -648,6 +780,7 @@ func newRunJobTestGitHubClient(t *testing.T) *ghapp.Client {
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, r)
+
 			return recorder.Result(), nil
 		}),
 	}
@@ -655,6 +788,7 @@ func newRunJobTestGitHubClient(t *testing.T) *ghapp.Client {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	return client
 }
 
@@ -664,8 +798,10 @@ func testPrivateKeyPEM(t *testing.T) []byte {
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
+
 	der := x509.MarshalPKCS1PrivateKey(key)
 	block := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: der}
+
 	return pem.EncodeToMemory(block)
 }
 

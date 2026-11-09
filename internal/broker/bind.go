@@ -30,7 +30,6 @@ import (
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/golden"
 	"goodkind.io/gha-mac-broker/internal/guestproto"
-	"goodkind.io/gha-mac-broker/internal/guesttransport"
 	"goodkind.io/gha-mac-broker/internal/tart"
 )
 
@@ -67,73 +66,9 @@ var drainIdleTimeout = 45 * time.Second
 // mismatch means the VM runs an incompatible agent and is skipped.
 const hostProtocolMajor = uint32(1)
 
-// jobStatusStream receives guest execution events for the broker.
-type jobStatusStream interface {
-	Receive() (*guestproto.JobStatusEvent, error)
-	Close() error
-}
-
-// guestConn is the host-side guest-agent surface the binder depends on. The
-// production implementation wraps *guestclient.Client; tests stub it.
-type guestConn interface {
-	Hello(ctx context.Context) (*guestproto.HelloResponse, error)
-	RunJob(ctx context.Context, request *guestproto.RunJobRequest) (*guestproto.RunJobResponse, error)
-	JobStatus(ctx context.Context, executionID string, fromSequence uint64) (jobStatusStream, error)
-	Reattach(ctx context.Context) (*guestproto.ReattachResponse, error)
-	Drain(ctx context.Context) (*guestproto.DrainResponse, error)
-	CancelJob(ctx context.Context, executionID string) error
-}
-
-// WarmVM is a booted VM whose guest agent answers Hello. Name is safe to read
-// from any goroutine once Warm returns. The cached guest endpoint is resolved
-// once (during Warm or Adopt, single threaded) and read on the hot path.
-type WarmVM struct {
-	// Name is the tart VM name used for exec, stop, and delete.
-	Name string
-	// Image is the approved Cirrus tag this VM was cloned for.
-	Image string
-	boot  *exec.Cmd
-	// guestMu guards the cached guest endpoint.
-	guestMu   sync.Mutex
-	guestConn guestConn
-}
-
-// SlotBinding is one busy runner slot discovered on a running VM during adoption.
-type SlotBinding struct {
-	SlotIndex      int
-	Repo           string
-	JobID          int64
-	RunID          int64
-	ExecutionID    string
-	ResumeCursor   uint64
-	BoundAt        time.Time
-	ObservedActive bool
-}
-
 // HasJobMetadata reports whether an adopted binding names a GitHub job and run.
 func (binding SlotBinding) HasJobMetadata() bool {
 	return binding.JobID > 0 && binding.RunID > 0
-}
-
-// AdoptedVM is a running pool VM discovered during broker startup.
-type AdoptedVM struct {
-	VM    *WarmVM
-	Slots []SlotBinding
-}
-
-// Binder performs JIT runner binds against a warm VM substrate. Job execution
-// and adoption go over the guest agent; VM lifecycle goes over tart.
-type Binder struct {
-	cfgMu sync.RWMutex
-	cfg   *config.Config
-	gh    *ghapp.Client
-	vm    *tart.Tart
-	// dialGuest builds a guest-agent client from a connection dialer and token.
-	// It is a field so tests can stub the transport.
-	dialGuest func(ctx context.Context, dial guesttransport.GuestDialer, token string) guestConn
-	// guestFor resolves and caches the guest client for a VM. It is the single
-	// seam tests override to return a stub without a real VM.
-	guestFor func(ctx context.Context, vm *WarmVM) (guestConn, error)
 }
 
 // New builds a Binder from its collaborators.
@@ -148,6 +83,7 @@ func New(cfg *config.Config, gh *ghapp.Client, vm *tart.Tart) *Binder {
 	}
 	binder.dialGuest = newGuestClientAdapter
 	binder.guestFor = binder.resolveGuest
+
 	return binder
 }
 
@@ -161,6 +97,7 @@ func (b *Binder) Reconfigure(cfg *config.Config) {
 func (b *Binder) configSnapshot() *config.Config {
 	b.cfgMu.RLock()
 	defer b.cfgMu.RUnlock()
+
 	return b.cfg
 }
 
@@ -168,17 +105,25 @@ func (b *Binder) configSnapshot() *config.Config {
 // confirms the guest agent answers Hello (caching its endpoint), and verifies
 // its slot inventory. On any failure it tears the partial VM down; the caller
 // owns teardown only on success.
-func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount int) (*WarmVM, error) {
+func (b *Binder) Warm(
+	ctx context.Context,
+	image string,
+	id string,
+	slotCount int,
+) (*WarmVM, error) {
 	slotCount = normalizeSlotCount(slotCount)
 	cfg := b.configSnapshot()
 	vmName := cfg.Tart.VMNamePrefix + "-" + id
 	slog.InfoContext(ctx, "warming vm", "vm", vmName, "image", image, "slot_count", slotCount)
 
-	goldenName, err := golden.New(b.vm).EnsureGolden(ctx, golden.EnsureOptions{
-		Image:         image,
-		BuildVM:       golden.NameForImage(image) + "-build-" + id,
-		RunnerVersion: "",
-	})
+	goldenName, err := golden.New(b.vm).EnsureGolden(
+		ctx,
+		golden.EnsureOptions{
+			Image:         image,
+			BuildVM:       golden.NameForImage(image) + "-build-" + id,
+			RunnerVersion: "",
+		},
+	)
 	if err != nil {
 		slog.ErrorContext(ctx, "ensure golden failed", "err", err, "image", image)
 		return nil, fmt.Errorf("broker: ensure golden for %s: %w", image, err)
@@ -188,7 +133,14 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 	// before cloning, so the clone self-heals even if the startup sweep missed a
 	// VM or a same-instant run-token clash leaves a stale name.
 	if err := b.vm.Delete(ctx, vmName); err != nil {
-		slog.DebugContext(ctx, "pre-clone delete returned error (ignored)", "err", err, "vm", vmName)
+		slog.DebugContext(
+			ctx,
+			"pre-clone delete returned error (ignored)",
+			"err",
+			err,
+			"vm",
+			vmName,
+		)
 	}
 
 	if err := b.vm.Clone(ctx, goldenName, vmName, false); err != nil {
@@ -200,13 +152,16 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 	if err := bootCmd.Start(); err != nil {
 		slog.ErrorContext(ctx, "vm boot failed", "err", err, "vm", vmName)
 		b.teardown(ctx, vmName)
+
 		return nil, fmt.Errorf("broker: boot %s: %w", vmName, err)
 	}
+
 	b.reapBootCommand(context.WithoutCancel(ctx), vmName, bootCmd)
 
 	if err := b.waitForReady(ctx, vmName); err != nil {
 		_ = bootCmd.Process.Kill()
 		b.teardown(ctx, vmName)
+
 		return nil, err
 	}
 
@@ -217,6 +172,7 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 	if err := b.seedSlotCount(ctx, vmName, slotCount); err != nil {
 		_ = bootCmd.Process.Kill()
 		b.teardown(ctx, vmName)
+
 		return nil, err
 	}
 
@@ -227,6 +183,7 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 	if _, err := b.guestFor(ctx, vm); err != nil {
 		_ = bootCmd.Process.Kill()
 		b.teardown(ctx, vmName)
+
 		return nil, err
 	}
 
@@ -238,26 +195,55 @@ func (b *Binder) Warm(ctx context.Context, image string, id string, slotCount in
 // serves that count for the VM's whole life. It runs after the exec channel is
 // ready and before the guest agent is expected to answer Hello.
 func (b *Binder) seedSlotCount(ctx context.Context, vmName string, slotCount int) error {
-	if _, err := b.vm.Exec(ctx, vmName, golden.BakedBinaryPath, guestWriteSlotsSubcommand, strconv.Itoa(slotCount)); err != nil {
-		slog.ErrorContext(ctx, "seed slot count failed", "err", err, "vm", vmName, "slot_count", slotCount)
+	if _, err := b.vm.Exec(
+		ctx,
+		vmName,
+		golden.BakedBinaryPath,
+		guestWriteSlotsSubcommand,
+		strconv.Itoa(slotCount),
+	); err != nil {
+		slog.ErrorContext(
+			ctx,
+			"seed slot count failed",
+			"err",
+			err,
+			"vm",
+			vmName,
+			"slot_count",
+			slotCount,
+		)
+
 		return fmt.Errorf("broker: seed %d slots on %s: %w", slotCount, vmName, err)
 	}
+
 	return nil
 }
 
-func (b *Binder) reapBootCommand(ctx context.Context, vmName string, bootCmd *exec.Cmd) <-chan struct{} {
+func (b *Binder) reapBootCommand(
+	ctx context.Context,
+	vmName string,
+	bootCmd *exec.Cmd,
+) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		defer func() {
 			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "vm boot reaper panic recovered", "err", fmt.Errorf("panic: %v", r), "vm", vmName)
+				slog.ErrorContext(
+					ctx,
+					"vm boot reaper panic recovered",
+					"err",
+					fmt.Errorf("panic: %v", r),
+					"vm",
+					vmName,
+				)
 			}
 		}()
 		if err := bootCmd.Wait(); err != nil {
 			slog.DebugContext(ctx, "vm boot process exited", "err", err, "vm", vmName)
 		}
 	}()
+
 	return done
 }
 
@@ -265,11 +251,22 @@ func (b *Binder) reapBootCommand(ctx context.Context, vmName string, bootCmd *ex
 // warm VM through the guest agent. It dispatches the execution, then drains its
 // status stream to the terminal result. runnerName is the runner registration
 // name. It blocks until the job terminates or the context is canceled.
-func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName string, slotIndex int, slotCount int, jobID int64, runID int64, _ time.Time) error {
+func (b *Binder) RunJob(
+	ctx context.Context,
+	vm *WarmVM,
+	repo string,
+	runnerName string,
+	slotIndex int,
+	slotCount int,
+	jobID int64,
+	runID int64,
+	_ time.Time,
+) error {
 	owner, repoName, ok := strings.Cut(repo, "/")
 	if !ok {
 		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
 	}
+
 	execID := executionID(repo, runID, jobID)
 
 	client, err := b.guestFor(ctx, vm)
@@ -295,12 +292,38 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 			RunnerName: jit.Runner.Name,
 		},
 	}
-	slog.InfoContext(ctx, "dispatching ephemeral job", "repo", repo, "vm", vm.Name, "runner", jit.Runner.Name, "slot", slotIndex, "execution", execID)
+	slog.InfoContext(
+		ctx,
+		"dispatching ephemeral job",
+		"repo",
+		repo,
+		"vm",
+		vm.Name,
+		"runner",
+		jit.Runner.Name,
+		"slot",
+		slotIndex,
+		"execution",
+		execID,
+	)
 	response, err := client.RunJob(ctx, request)
 	if err != nil {
-		slog.ErrorContext(ctx, "job dispatch failed", "err", err, "vm", vm.Name, "slot", slotIndex, "execution", execID)
+		slog.ErrorContext(
+			ctx,
+			"job dispatch failed",
+			"err",
+			err,
+			"vm",
+			vm.Name,
+			"slot",
+			slotIndex,
+			"execution",
+			execID,
+		)
+
 		return fmt.Errorf("broker: dispatch job on %s: %w", vm.Name, err)
 	}
+
 	switch response.GetOutcome() {
 	case guestproto.RunJobResponse_ACCEPTED,
 		guestproto.RunJobResponse_ALREADY_RUNNING,
@@ -310,21 +333,51 @@ func (b *Binder) RunJob(ctx context.Context, vm *WarmVM, repo string, runnerName
 	case guestproto.RunJobResponse_CONFLICT:
 		return fmt.Errorf("broker: guest reported execution conflict for %s on %s", execID, vm.Name)
 	case guestproto.RunJobResponse_OUTCOME_UNSPECIFIED:
-		return fmt.Errorf("broker: guest returned unspecified outcome for %s on %s", execID, vm.Name)
+		return fmt.Errorf(
+			"broker: guest returned unspecified outcome for %s on %s",
+			execID,
+			vm.Name,
+		)
 	default:
-		return fmt.Errorf("broker: guest returned unknown outcome %d for %s on %s", response.GetOutcome(), execID, vm.Name)
+		return fmt.Errorf(
+			"broker: guest returned unknown outcome %d for %s on %s",
+			response.GetOutcome(),
+			execID,
+			vm.Name,
+		)
 	}
+
 	return b.drainJob(ctx, client, execID, 0, vm, slotIndex, slotCount)
 }
 
 // ResumeJob re-attaches to an adopted execution and drains it from its cursor,
 // so a busy slot inherited across a broker restart resolves to its terminal.
-func (b *Binder) ResumeJob(ctx context.Context, vm *WarmVM, executionID string, fromCursor uint64, slotIndex int, slotCount int) error {
+func (b *Binder) ResumeJob(
+	ctx context.Context,
+	vm *WarmVM,
+	executionID string,
+	fromCursor uint64,
+	slotIndex int,
+	slotCount int,
+) error {
 	client, err := b.guestFor(ctx, vm)
 	if err != nil {
 		return err
 	}
-	slog.InfoContext(ctx, "resuming adopted job", "vm", vm.Name, "slot", slotIndex, "execution", executionID, "cursor", fromCursor)
+
+	slog.InfoContext(
+		ctx,
+		"resuming adopted job",
+		"vm",
+		vm.Name,
+		"slot",
+		slotIndex,
+		"execution",
+		executionID,
+		"cursor",
+		fromCursor,
+	)
+
 	return b.drainJob(ctx, client, executionID, fromCursor, vm, slotIndex, slotCount)
 }
 
@@ -344,10 +397,13 @@ func classifyCancel(ctx context.Context) cancelAction {
 	if ctx.Err() == nil {
 		return cancelNone
 	}
+
 	cause := context.Cause(ctx)
-	if cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
+	if cause != nil && !errors.Is(cause, context.Canceled) &&
+		!errors.Is(cause, context.DeadlineExceeded) {
 		return cancelTeardown
 	}
+
 	return cancelDetach
 }
 
@@ -358,7 +414,15 @@ func classifyCancel(ctx context.Context) cancelAction {
 // terminal-unknown outcome that frees the slot, not an error loop. A worker
 // shutdown cancel detaches; a recycle or cancel-run cause cancels the guest job
 // and keeps draining to the terminal.
-func (b *Binder) drainJob(ctx context.Context, client guestConn, execID string, fromSeq uint64, vm *WarmVM, slotIndex int, slotCount int) error {
+func (b *Binder) drainJob(
+	ctx context.Context,
+	client guestConn,
+	execID string,
+	fromSeq uint64,
+	vm *WarmVM,
+	slotIndex int,
+	slotCount int,
+) error {
 	runLog, closeLog := b.openDrainLog(ctx, vm, slotIndex, slotCount)
 	defer closeLog()
 
@@ -371,18 +435,30 @@ func (b *Binder) drainJob(ctx context.Context, client guestConn, execID string, 
 			// slot for reuse on a dead or wedged guest.
 			return err
 		}
+
 		if err != nil {
 			// The job reached a terminal with a nonzero exit. Mark it so the pool can
 			// tell a terminal job failure (free the slot, keep the VM) from a resume
 			// attach or drain failure (recycle the VM).
 			return errors.Join(err, ErrJobTerminal)
 		}
+
 		return nil
 	}
+
 	if classifyCancel(ctx) == cancelDetach {
-		slog.DebugContext(ctx, "detaching drain on worker shutdown", "vm", vm.Name, "execution", execID)
+		slog.DebugContext(
+			ctx,
+			"detaching drain on worker shutdown",
+			"vm",
+			vm.Name,
+			"execution",
+			execID,
+		)
+
 		return context.Canceled
 	}
+
 	// A recycle or cancel-run cause: cancel the guest job, then drain it to its
 	// terminal on a detached, time-bounded context. The timeout guarantees a dead
 	// or unreachable VM cannot spin the teardown drain forever, which would leave
@@ -390,27 +466,71 @@ func (b *Binder) drainJob(ctx context.Context, client guestConn, execID string, 
 	teardownCtx, cancelTeardown := context.WithTimeout(context.WithoutCancel(ctx), drainTimeout)
 	defer cancelTeardown()
 	if err := client.CancelJob(teardownCtx, execID); err != nil {
-		slog.WarnContext(ctx, "guest cancel job failed", "err", err, "vm", vm.Name, "execution", execID)
+		slog.WarnContext(
+			ctx,
+			"guest cancel job failed",
+			"err",
+			err,
+			"vm",
+			vm.Name,
+			"execution",
+			execID,
+		)
 	}
+
 	timedOut, drainErr := b.drainToTerminal(teardownCtx, client, execID, vm, runLog, &cursor)
 	if timedOut {
-		slog.WarnContext(ctx, "teardown drain timed out; proceeding with recycle", "vm", vm.Name, "execution", execID)
+		slog.WarnContext(
+			ctx,
+			"teardown drain timed out; proceeding with recycle",
+			"vm",
+			vm.Name,
+			"execution",
+			execID,
+		)
+
 		return fmt.Errorf("broker: teardown drain timed out for %s on %s", execID, vm.Name)
 	}
+
 	return drainErr
 }
 
 // openDrainLog opens the per-slot run log, or a no-op sink when it cannot be
 // created, and returns a close function for the caller to defer.
-func (b *Binder) openDrainLog(ctx context.Context, vm *WarmVM, slotIndex int, slotCount int) (*os.File, func()) {
+func (b *Binder) openDrainLog(
+	ctx context.Context,
+	vm *WarmVM,
+	slotIndex int,
+	slotCount int,
+) (*os.File, func()) {
 	runLog, logPath, logErr := openRunLog(ctx, vm.Name, slotIndex, slotCount)
 	if logErr != nil {
-		slog.WarnContext(ctx, "run log open failed; draining without a log sink", "err", logErr, "vm", vm.Name, "path", logPath)
+		slog.WarnContext(
+			ctx,
+			"run log open failed; draining without a log sink",
+			"err",
+			logErr,
+			"vm",
+			vm.Name,
+			"path",
+			logPath,
+		)
+
 		return nil, func() {}
 	}
+
 	return runLog, func() {
 		if err := runLog.Close(); err != nil {
-			slog.WarnContext(ctx, "run log close failed", "err", err, "vm", vm.Name, "path", logPath)
+			slog.WarnContext(
+				ctx,
+				"run log close failed",
+				"err",
+				err,
+				"vm",
+				vm.Name,
+				"path",
+				logPath,
+			)
 		}
 	}
 }
@@ -419,26 +539,53 @@ func (b *Binder) openDrainLog(ctx context.Context, vm *WarmVM, slotIndex int, sl
 // terminal result or expires, or ctx is canceled. It reports canceled=true when
 // ctx is done so the caller can decide detach versus teardown, and otherwise
 // returns the terminal outcome (nil for a zero exit or an expired execution).
-func (b *Binder) drainToTerminal(ctx context.Context, client guestConn, execID string, vm *WarmVM, runLog *os.File, cursor *uint64) (bool, error) {
+func (b *Binder) drainToTerminal(
+	ctx context.Context,
+	client guestConn,
+	execID string,
+	vm *WarmVM,
+	runLog *os.File,
+	cursor *uint64,
+) (bool, error) {
 	for {
 		if contextDone(ctx) {
 			return true, nil
 		}
+
 		// Each attempt runs on its own child context so the idle watchdog can
 		// cancel just this stream read without tearing down the parent drain.
 		attemptCtx, cancelAttempt := context.WithCancelCause(ctx)
 		stream, err := client.JobStatus(attemptCtx, execID, *cursor)
 		if isExecutionNotFound(err) {
 			cancelAttempt(nil)
-			slog.WarnContext(ctx, "guest execution not found; freeing slot", "vm", vm.Name, "execution", execID)
+			slog.WarnContext(
+				ctx,
+				"guest execution not found; freeing slot",
+				"vm",
+				vm.Name,
+				"execution",
+				execID,
+			)
+
 			return false, nil
 		}
+
 		if err != nil {
 			cancelAttempt(nil)
-			slog.WarnContext(ctx, "guest job status open failed; retrying", "err", err, "vm", vm.Name, "execution", execID)
+			slog.WarnContext(
+				ctx,
+				"guest job status open failed; retrying",
+				"err",
+				err,
+				"vm",
+				vm.Name,
+				"execution",
+				execID,
+			)
 			sleepWithContext(ctx, drainReconnectBackoff)
 			continue
 		}
+
 		terminal, streamErr := drainStream(attemptCtx, cancelAttempt, stream, runLog, cursor)
 		_ = stream.Close()
 		// Read the cancellation cause before cancelAttempt(nil) overwrites it, so
@@ -448,18 +595,53 @@ func (b *Binder) drainToTerminal(ctx context.Context, client guestConn, execID s
 		if terminal != nil {
 			return false, terminalToError(terminal, execID, vm)
 		}
+
 		if stalled {
-			slog.WarnContext(ctx, "guest status stream stalled; recycling vm", "vm", vm.Name, "execution", execID, "cursor", *cursor, "idle_timeout", drainIdleTimeout)
+			slog.WarnContext(
+				ctx,
+				"guest status stream stalled; recycling vm",
+				"vm",
+				vm.Name,
+				"execution",
+				execID,
+				"cursor",
+				*cursor,
+				"idle_timeout",
+				drainIdleTimeout,
+			)
+
 			return false, ErrDrainStalled
 		}
+
 		if isExecutionNotFound(streamErr) {
-			slog.WarnContext(ctx, "guest execution not found mid-stream; freeing slot", "vm", vm.Name, "execution", execID)
+			slog.WarnContext(
+				ctx,
+				"guest execution not found mid-stream; freeing slot",
+				"vm",
+				vm.Name,
+				"execution",
+				execID,
+			)
+
 			return false, nil
 		}
+
 		if contextDone(ctx) {
 			return true, nil
 		}
-		slog.WarnContext(ctx, "guest status stream dropped before terminal; reconnecting", "err", streamErr, "vm", vm.Name, "execution", execID, "cursor", *cursor)
+
+		slog.WarnContext(
+			ctx,
+			"guest status stream dropped before terminal; reconnecting",
+			"err",
+			streamErr,
+			"vm",
+			vm.Name,
+			"execution",
+			execID,
+			"cursor",
+			*cursor,
+		)
 		sleepWithContext(ctx, drainReconnectBackoff)
 	}
 }
@@ -482,17 +664,26 @@ func contextDone(ctx context.Context) bool {
 // drainIdleTimeout, so a silent stream cannot block the drain forever. The
 // watchdog resets on every event, including the guest's periodic heartbeat, so a
 // live job with regular heartbeats never trips it.
-func drainStream(ctx context.Context, cancelIdle context.CancelCauseFunc, stream jobStatusStream, runLog *os.File, cursor *uint64) (*guestproto.TerminalResult, error) {
+func drainStream(
+	ctx context.Context,
+	cancelIdle context.CancelCauseFunc,
+	stream jobStatusStream,
+	runLog *os.File,
+	cursor *uint64,
+) (*guestproto.TerminalResult, error) {
 	idle := time.AfterFunc(drainIdleTimeout, func() { cancelIdle(errDrainIdle) })
 	defer idle.Stop()
+
 	for {
 		event, err := stream.Receive()
 		if errors.Is(err, io.EOF) {
 			return nil, nil
 		}
+
 		if err != nil {
 			return nil, fmt.Errorf("broker: guest status stream: %w", err)
 		}
+
 		idle.Reset(drainIdleTimeout)
 		*cursor = event.GetSequence()
 		if chunk := event.GetLog(); chunk != nil && runLog != nil {
@@ -503,6 +694,7 @@ func drainStream(ctx context.Context, cancelIdle context.CancelCauseFunc, stream
 				}
 			}
 		}
+
 		if result := event.GetResult(); result != nil {
 			return result, nil
 		}
@@ -541,7 +733,14 @@ func terminalToError(terminal *guestproto.TerminalResult, execID string, vm *War
 	if terminal.GetExitCode() == 0 {
 		return nil
 	}
-	return fmt.Errorf("broker: guest job %s on %s exited %d: %s", execID, vm.Name, terminal.GetExitCode(), terminal.GetMessage())
+
+	return fmt.Errorf(
+		"broker: guest job %s on %s exited %d: %s",
+		execID,
+		vm.Name,
+		terminal.GetExitCode(),
+		terminal.GetMessage(),
+	)
 }
 
 func isExecutionNotFound(err error) bool {
@@ -566,21 +765,29 @@ func gitCredentialEnv() map[string]string {
 	}
 }
 
-func openRunLog(ctx context.Context, vmName string, slotIndex int, slotCount int) (*os.File, string, error) {
+func openRunLog(
+	ctx context.Context,
+	vmName string,
+	slotIndex int,
+	slotCount int,
+) (*os.File, string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		slog.WarnContext(ctx, "resolve home dir for run log failed", "err", err, "vm", vmName)
 		return nil, "", fmt.Errorf("resolve home dir: %w", err)
 	}
+
 	logDir := filepath.Join(home, "Library", "Logs", "gha-mac-broker")
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		slog.WarnContext(ctx, "create run log dir failed", "err", err, "vm", vmName, "path", logDir)
 		return nil, logDir, fmt.Errorf("create run log dir: %w", err)
 	}
+
 	logName := vmName
 	if slotCount > 1 {
 		logName = fmt.Sprintf("%s-slot-%d", vmName, slotIndex)
 	}
+
 	logPath := filepath.Join(logDir, "run-"+safeLogName(logName)+".log")
 	// Truncate rather than append: the pool reuses VM names across jobs, so
 	// appending would grow run-<vm>.log without bound and interleave unrelated
@@ -591,6 +798,7 @@ func openRunLog(ctx context.Context, vmName string, slotIndex int, slotCount int
 		slog.WarnContext(ctx, "open run log failed", "err", err, "vm", vmName, "path", logPath)
 		return nil, logPath, fmt.Errorf("open run log: %w", err)
 	}
+
 	return file, logPath, nil
 }
 
@@ -608,11 +816,14 @@ func (b *Binder) Teardown(ctx context.Context, vm *WarmVM) {
 		if _, err := client.Drain(drainCtx); err != nil {
 			slog.DebugContext(ctx, "guest drain before teardown failed", "err", err, "vm", vm.Name)
 		}
+
 		cancel()
 	}
+
 	if vm.boot != nil && vm.boot.Process != nil {
 		_ = vm.boot.Process.Kill()
 	}
+
 	b.teardown(ctx, vm.Name)
 }
 
@@ -626,10 +837,12 @@ func (b *Binder) CheckAlive(ctx context.Context, vm *WarmVM) error {
 		slog.WarnContext(ctx, "warm vm guest resolve failed", "err", err, "vm", vm.Name)
 		return fmt.Errorf("broker: check alive %s: %w", vm.Name, err)
 	}
+
 	if _, err := client.Hello(ctx); err != nil {
 		slog.WarnContext(ctx, "warm vm hello probe failed", "err", err, "vm", vm.Name)
 		return fmt.Errorf("broker: check alive %s: %w", vm.Name, err)
 	}
+
 	return nil
 }
 
@@ -644,17 +857,21 @@ func (b *Binder) RunningSlots(ctx context.Context, vm *WarmVM) (map[int]bool, er
 		slog.WarnContext(ctx, "running slots guest resolve failed", "err", err, "vm", vm.Name)
 		return nil, fmt.Errorf("broker: running slots resolve %s: %w", vm.Name, err)
 	}
+
 	response, err := client.Reattach(ctx)
 	if err != nil {
 		slog.WarnContext(ctx, "running slots reattach failed", "err", err, "vm", vm.Name)
 		return nil, fmt.Errorf("broker: running slots reattach %s: %w", vm.Name, err)
 	}
+
 	running := make(map[int]bool)
+
 	for _, state := range response.GetExecutions() {
 		if state.GetRunning() {
 			running[int(state.GetSlot())] = true
 		}
 	}
+
 	return running, nil
 }
 
@@ -665,6 +882,7 @@ func (b *Binder) List(ctx context.Context) ([]string, error) {
 		slog.WarnContext(ctx, "list tart vms failed", "err", err)
 		return nil, fmt.Errorf("broker: list tart vms: %w", err)
 	}
+
 	return names, nil
 }
 
@@ -673,7 +891,12 @@ func (b *Binder) List(ctx context.Context) ([]string, error) {
 // dead or incompatible), reads its running executions via Reattach, and marks a
 // slot busy when a running execution names it. It does not clone, delete, or
 // rewrite runner-slot directories.
-func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit int) ([]AdoptedVM, error) {
+func (b *Binder) Adopt(
+	ctx context.Context,
+	image string,
+	slotCount int,
+	limit int,
+) ([]AdoptedVM, error) {
 	// Bound the whole adoption pass so a single frozen guest cannot stall worker
 	// startup. Adoption resolves each running VM's guest with a Hello whose own
 	// readinessTimeout is 90s, but the host supervisor kills a worker that does
@@ -688,42 +911,110 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 		slog.WarnContext(ctx, "list tart vms failed", "err", err)
 		return nil, fmt.Errorf("broker: list tart vms for adoption: %w", err)
 	}
+
 	cfg := b.configSnapshot()
 	prefix := cfg.Tart.VMNamePrefix + "-"
+
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name, prefix) {
 			continue
 		}
+
 		if !strings.EqualFold(entry.State, "running") {
 			continue
 		}
+
 		names = append(names, entry.Name)
 	}
+
 	sort.Strings(names)
-	type adoptionCandidate struct {
-		vm    *WarmVM
-		slots []SlotBinding
+	busyCandidates, idleCandidates := b.adoptionCandidates(ctx, image, names, slotCount)
+
+	selected := make([]adoptionCandidate, 0, len(busyCandidates)+len(idleCandidates))
+
+	addCandidate := func(candidate adoptionCandidate) bool {
+		if limit >= 0 && len(selected) >= limit {
+			return false
+		}
+
+		selected = append(selected, candidate)
+
+		return true
 	}
+	for _, candidate := range busyCandidates {
+		addCandidate(candidate)
+	}
+
+	for _, candidate := range idleCandidates {
+		if addCandidate(candidate) {
+			continue
+		}
+
+		b.teardown(context.WithoutCancel(ctx), candidate.vm.Name)
+	}
+
+	adopted := make([]AdoptedVM, 0, len(selected))
+	for _, candidate := range selected {
+		adopted = append(
+			adopted,
+			AdoptedVM{
+				VM:    candidate.vm,
+				Slots: candidate.slots,
+			},
+		)
+	}
+
+	return adopted, nil
+}
+
+type adoptionCandidate struct {
+	vm    *WarmVM
+	slots []SlotBinding
+}
+
+func (b *Binder) adoptionCandidates(
+	ctx context.Context,
+	image string,
+	names []string,
+	slotCount int,
+) ([]adoptionCandidate, []adoptionCandidate) {
 	busyCandidates := make([]adoptionCandidate, 0, len(names))
 	idleCandidates := make([]adoptionCandidate, 0, len(names))
 	normalizedSlotCount := normalizeSlotCount(slotCount)
+
 	for _, name := range names {
 		vm := &WarmVM{Name: name, Image: image, boot: nil, guestMu: sync.Mutex{}, guestConn: nil}
 		client, err := b.guestFor(ctx, vm)
 		if err != nil {
-			slog.WarnContext(ctx, "skip running vm adoption after guest resolve failure", "err", err, "vm", name)
+			slog.WarnContext(
+				ctx,
+				"skip running vm adoption after guest resolve failure",
+				"err",
+				err,
+				"vm",
+				name,
+			)
 			continue
 		}
+
 		// Bound each adoption Reattach so one unresponsive VM cannot block startup
 		// adoption and every following candidate indefinitely.
 		reattachCtx, cancelReattach := context.WithTimeout(ctx, checkAliveTimeout)
 		response, err := client.Reattach(reattachCtx)
 		cancelReattach()
 		if err != nil {
-			slog.WarnContext(ctx, "skip running vm adoption after reattach failure", "err", err, "vm", name)
+			slog.WarnContext(
+				ctx,
+				"skip running vm adoption after reattach failure",
+				"err",
+				err,
+				"vm",
+				name,
+			)
 			continue
 		}
+
 		candidate := adoptionCandidate{
 			vm:    vm,
 			slots: reattachSlots(response, normalizedSlotCount),
@@ -732,59 +1023,44 @@ func (b *Binder) Adopt(ctx context.Context, image string, slotCount int, limit i
 			busyCandidates = append(busyCandidates, candidate)
 			continue
 		}
+
 		idleCandidates = append(idleCandidates, candidate)
 	}
-	selected := make([]adoptionCandidate, 0, len(busyCandidates)+len(idleCandidates))
-	addCandidate := func(candidate adoptionCandidate) bool {
-		if limit >= 0 && len(selected) >= limit {
-			return false
-		}
-		selected = append(selected, candidate)
-		return true
-	}
-	for _, candidate := range busyCandidates {
-		addCandidate(candidate)
-	}
-	for _, candidate := range idleCandidates {
-		if addCandidate(candidate) {
-			continue
-		}
-		b.teardown(context.WithoutCancel(ctx), candidate.vm.Name)
-	}
-	adopted := make([]AdoptedVM, 0, len(selected))
-	for _, candidate := range selected {
-		adopted = append(adopted, AdoptedVM{
-			VM:    candidate.vm,
-			Slots: candidate.slots,
-		})
-	}
-	return adopted, nil
+
+	return busyCandidates, idleCandidates
 }
 
 // reattachSlots turns a Reattach response into the busy slot bindings for a VM.
 // Only running executions occupy a slot; retained terminals do not.
 func reattachSlots(response *guestproto.ReattachResponse, slotCount int) []SlotBinding {
 	bindings := make([]SlotBinding, 0, slotCount)
+
 	for _, state := range response.GetExecutions() {
 		if !state.GetRunning() {
 			continue
 		}
+
 		slotIndex := int(state.GetSlot())
 		if slotIndex < 0 || slotIndex >= slotCount {
 			continue
 		}
+
 		meta := state.GetMeta()
-		bindings = append(bindings, SlotBinding{
-			SlotIndex:      slotIndex,
-			Repo:           meta.GetRepo(),
-			JobID:          meta.GetJobId(),
-			RunID:          meta.GetRunId(),
-			ExecutionID:    state.GetExecutionId(),
-			ResumeCursor:   state.GetLastSequence(),
-			BoundAt:        time.Time{},
-			ObservedActive: true,
-		})
+		bindings = append(
+			bindings,
+			SlotBinding{
+				SlotIndex:      slotIndex,
+				Repo:           meta.GetRepo(),
+				JobID:          meta.GetJobId(),
+				RunID:          meta.GetRunId(),
+				ExecutionID:    state.GetExecutionId(),
+				ResumeCursor:   state.GetLastSequence(),
+				BoundAt:        time.Time{},
+				ObservedActive: true,
+			},
+		)
 	}
+
 	return bindings
 }
 
@@ -792,9 +1068,20 @@ func reattachSlots(response *guestproto.ReattachResponse, slotCount int) []SlotB
 func (b *Binder) DeleteGolden(ctx context.Context, image string) error {
 	goldenName := golden.NameForImage(image)
 	if err := b.vm.Delete(ctx, goldenName); err != nil {
-		slog.WarnContext(ctx, "delete golden failed", "err", err, "golden", goldenName, "image", image)
+		slog.WarnContext(
+			ctx,
+			"delete golden failed",
+			"err",
+			err,
+			"golden",
+			goldenName,
+			"image",
+			image,
+		)
+
 		return fmt.Errorf("broker: delete golden %s: %w", goldenName, err)
 	}
+
 	return nil
 }
 
@@ -807,17 +1094,21 @@ func (b *Binder) SweepOrphans(ctx context.Context) {
 	if err != nil {
 		return
 	}
+
 	cfg := b.configSnapshot()
 	prefix := cfg.Tart.VMNamePrefix + "-"
 	swept := 0
+
 	for _, name := range names {
 		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
+
 		slog.DebugContext(ctx, "orphan sweep: tearing down stale vm", "vm", name)
 		b.teardown(ctx, name)
 		swept++
 	}
+
 	if swept > 0 {
 		slog.InfoContext(ctx, "orphan sweep complete", "count", swept)
 	}
@@ -829,6 +1120,7 @@ func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
 	if _, _, ok := strings.Cut(repo, "/"); !ok {
 		return fmt.Errorf("broker: repo must be owner/repo, got %q", repo)
 	}
+
 	cfg := b.configSnapshot()
 	jobsPerVM := normalizedJobsPerVM(cfg)
 	vm, err := b.Warm(ctx, cfg.Tart.BaseImage, id, jobsPerVM)
@@ -836,93 +1128,6 @@ func (b *Binder) BindOnce(ctx context.Context, repo, id string) error {
 		return err
 	}
 	defer b.Teardown(ctx, vm)
+
 	return b.RunJob(ctx, vm, repo, vm.Name, 0, jobsPerVM, 0, 0, time.Time{})
-}
-
-func normalizedJobsPerVM(cfg *config.Config) int {
-	if cfg == nil || cfg.JobsPerVM < 1 {
-		return 1
-	}
-	return cfg.JobsPerVM
-}
-
-func normalizeSlotCount(slotCount int) int {
-	if slotCount < 1 {
-		return 1
-	}
-	return slotCount
-}
-
-// bootCommand builds the headless boot command with the cache dir mounted.
-func (b *Binder) bootCommand(ctx context.Context, cfg *config.Config, vmName string) *exec.Cmd {
-	var dirs []tart.DirMount
-	if cfg.Tart.CacheDir != "" {
-		// tart --dir requires the host path to exist, so create it before the
-		// mount. MkdirAll is idempotent and cheap on the warm path.
-		if err := os.MkdirAll(cfg.Tart.CacheDir, 0o700); err != nil {
-			slog.WarnContext(ctx, "create cache dir failed; booting without cache mount", "err", err, "dir", cfg.Tart.CacheDir)
-		} else {
-			// Chmod after MkdirAll: MkdirAll applies 0700 only to dirs it creates,
-			// so tighten an existing looser dir too. The build cache can hold
-			// proprietary source and artifacts, so keep it private to the owner on a
-			// multi-user host.
-			if err := os.Chmod(cfg.Tart.CacheDir, 0o700); err != nil {
-				slog.WarnContext(ctx, "chmod cache dir failed; continuing with existing perms", "err", err, "dir", cfg.Tart.CacheDir)
-			}
-			dirs = []tart.DirMount{{Name: "cache", Path: cfg.Tart.CacheDir}}
-		}
-	}
-	return b.vm.BootCommand(ctx, vmName, tart.BootOptions{NoGraphics: true, Detach: true, Dirs: dirs})
-}
-
-// generateJIT mints the repo-scoped JIT config for one job.
-func (b *Binder) generateJIT(ctx context.Context, owner, repoName, runnerName string) (*ghapp.JITConfig, error) {
-	cfg := b.configSnapshot()
-	installationID, err := b.gh.InstallationID(ctx, owner, repoName)
-	if err != nil {
-		slog.ErrorContext(ctx, "installation lookup failed", "err", err, "repo", owner+"/"+repoName)
-		return nil, fmt.Errorf("broker: installation lookup: %w", err)
-	}
-	token, err := b.gh.InstallationToken(ctx, installationID, repoName)
-	if err != nil {
-		slog.ErrorContext(ctx, "installation token failed", "err", err, "repo", owner+"/"+repoName)
-		return nil, fmt.Errorf("broker: installation token: %w", err)
-	}
-	jit, err := b.gh.GenerateJITConfig(ctx, token, owner, repoName, runnerName, cfg.Labels)
-	if err != nil {
-		slog.ErrorContext(ctx, "generate jitconfig failed", "err", err, "repo", owner+"/"+repoName)
-		return nil, fmt.Errorf("broker: generate jitconfig: %w", err)
-	}
-	return jit, nil
-}
-
-// waitForReady polls the guest vsock channel (`tart exec <vm> true`) until it
-// answers or the timeout elapses. The token read and Hello then confirm the
-// guest agent itself is up.
-func (b *Binder) waitForReady(ctx context.Context, vmName string) error {
-	ctx, cancel := context.WithTimeout(ctx, readinessTimeout)
-	defer cancel()
-	ticker := time.NewTicker(readinessInterval)
-	defer ticker.Stop()
-	for {
-		if _, err := b.vm.Exec(ctx, vmName, "true"); err == nil {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			slog.ErrorContext(ctx, "timed out waiting for vsock readiness", "err", ctx.Err(), "vm", vmName)
-			return fmt.Errorf("broker: waiting for vsock readiness of %s: %w", vmName, ctx.Err())
-		case <-ticker.C:
-		}
-	}
-}
-
-// teardown stops and deletes a VM, best effort.
-func (b *Binder) teardown(ctx context.Context, vmName string) {
-	if err := b.vm.Stop(ctx, vmName); err != nil {
-		slog.WarnContext(ctx, "vm stop failed", "err", err, "vm", vmName)
-	}
-	if err := b.vm.Delete(ctx, vmName); err != nil {
-		slog.WarnContext(ctx, "vm delete failed", "err", err, "vm", vmName)
-	}
 }

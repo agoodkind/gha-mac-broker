@@ -99,10 +99,12 @@ func New(options Options) *Registry {
 	if retention <= 0 {
 		retention = defaultRetention
 	}
+
 	heartbeatInterval := options.HeartbeatInterval
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = defaultHeartbeatInterval
 	}
+
 	registry := &Registry{
 		mu:                sync.Mutex{},
 		executions:        make(map[string]*execution),
@@ -115,10 +117,14 @@ func New(options Options) *Registry {
 		drainedClosed:     false,
 		clock:             clock.System(),
 	}
-	slog.Debug("guest execution registry created",
-		"retention", retention,
-		"heartbeat_interval", heartbeatInterval,
+	slog.Debug(
+		"guest execution registry created",
+		"retention",
+		retention,
+		"heartbeat_interval",
+		heartbeatInterval,
 	)
+
 	return registry
 }
 
@@ -130,9 +136,11 @@ func (r *Registry) Start(spec ExecSpec) (Outcome, error) {
 	if spec.ExecutionID == "" {
 		return OutcomeUnspecified, fmt.Errorf("guestexec: execution ID is required")
 	}
+
 	if spec.Command == "" {
 		return OutcomeUnspecified, fmt.Errorf("guestexec: command is required")
 	}
+
 	if !filepath.IsAbs(spec.Command) {
 		return OutcomeUnspecified, fmt.Errorf("guestexec: command path must be absolute")
 	}
@@ -152,22 +160,34 @@ func (r *Registry) Start(spec ExecSpec) (Outcome, error) {
 	if err != nil {
 		return OutcomeUnspecified, err
 	}
-	outcome, registerErr := r.Register(spec, launched.PID, launched.PGID, launched.Stdout, launched.Stderr)
+
+	outcome, registerErr := r.Register(
+		spec,
+		launched.PID,
+		launched.PGID,
+		launched.Stdout,
+		launched.Stderr,
+	)
 	if registerErr != nil || outcome != OutcomeAccepted {
 		r.discardLaunched(launched)
 		return outcome, registerErr
 	}
 
-	goSafe("start supervisor", func() {
-		observeErr := waitUntilExited(launched.PID)
-		waitErr := launched.Command.Wait()
-		exitCode := int(processExitCode(launched.Command.ProcessState))
-		message := ""
-		if joined := errors.Join(observeErr, waitErr); joined != nil {
-			message = joined.Error()
-		}
-		r.ReportExit(launched.PID, exitCode, message)
-	})
+	goSafe(
+		"start supervisor",
+		func() {
+			observeErr := waitUntilExited(launched.PID)
+			waitErr := launched.Command.Wait()
+			exitCode := int(processExitCode(launched.Command.ProcessState))
+			message := ""
+			if joined := errors.Join(observeErr, waitErr); joined != nil {
+				message = joined.Error()
+			}
+
+			r.ReportExit(launched.PID, exitCode, message)
+		},
+	)
+
 	return OutcomeAccepted, nil
 }
 
@@ -182,9 +202,11 @@ func (r *Registry) CheckAdmission(spec ExecSpec) (Outcome, error) {
 	if spec.ExecutionID == "" {
 		return OutcomeUnspecified, fmt.Errorf("guestexec: execution ID is required")
 	}
+
 	r.mu.Lock()
 	outcome, _, err := r.checkAdmissionLocked(spec)
 	r.mu.Unlock()
+
 	return outcome, err
 }
 
@@ -196,6 +218,7 @@ func (r *Registry) checkAdmissionLocked(spec ExecSpec) (Outcome, bool, error) {
 	if r.draining {
 		return OutcomeUnspecified, false, ErrDraining
 	}
+
 	if existing, found := r.executions[spec.ExecutionID]; found {
 		existing.mu.Lock()
 		sameSlot := existing.slot == spec.Slot
@@ -204,14 +227,18 @@ func (r *Registry) checkAdmissionLocked(spec ExecSpec) (Outcome, bool, error) {
 		if !sameSlot {
 			return OutcomeConflict, false, nil
 		}
+
 		if running {
 			return OutcomeAlreadyRunning, false, nil
 		}
+
 		return OutcomeAlreadyCompleted, false, nil
 	}
+
 	if _, occupied := r.slots[spec.Slot]; occupied {
 		return OutcomeConflict, false, nil
 	}
+
 	return OutcomeAccepted, true, nil
 }
 
@@ -230,9 +257,11 @@ func (r *Registry) Register(
 	if spec.ExecutionID == "" {
 		return OutcomeUnspecified, fmt.Errorf("guestexec: execution ID is required")
 	}
+
 	if spec.Command == "" {
 		return OutcomeUnspecified, fmt.Errorf("guestexec: command is required")
 	}
+
 	if !filepath.IsAbs(spec.Command) {
 		return OutcomeUnspecified, fmt.Errorf("guestexec: command path must be absolute")
 	}
@@ -278,18 +307,31 @@ func (r *Registry) Register(
 	r.slots[spec.Slot] = spec.ExecutionID
 	r.activeCount++
 
-	goSafe("stdout capture", func() {
-		captureOutput(execState, StreamStdout, stdoutR, readers, execState.stopped)
-	})
-	goSafe("stderr capture", func() {
-		captureOutput(execState, StreamStderr, stderrR, readers, execState.stopped)
-	})
-	goSafe("execution heartbeat", func() {
-		r.emitHeartbeats(execState)
-	})
-	goSafe("execution supervisor", func() {
-		r.superviseExecution(execState)
-	})
+	goSafe(
+		"stdout capture",
+		func() {
+			captureOutput(execState, StreamStdout, stdoutR, readers, execState.stopped)
+		},
+	)
+	goSafe(
+		"stderr capture",
+		func() {
+			captureOutput(execState, StreamStderr, stderrR, readers, execState.stopped)
+		},
+	)
+	goSafe(
+		"execution heartbeat",
+		func() {
+			r.emitHeartbeats(execState)
+		},
+	)
+	goSafe(
+		"execution supervisor",
+		func() {
+			r.superviseExecution(execState)
+		},
+	)
+
 	return OutcomeAccepted, nil
 }
 
@@ -304,12 +346,14 @@ func (r *Registry) ReportExit(pid int, exitCode int, message string) {
 	if execState == nil {
 		return
 	}
+
 	execState.mu.Lock()
 	stale := execState.exitReported || !execState.running
 	execState.mu.Unlock()
 	if stale {
 		return
 	}
+
 	execState.reapOnce.Do(func() {
 		execState.exitReport <- ExitReport{PID: pid, ExitCode: exitCode, Message: message}
 	})
@@ -324,7 +368,13 @@ func (r *Registry) Subscribe(
 	execState, found := r.executions[executionID]
 	r.mu.Unlock()
 	if !found {
-		slog.Error("guest execution subscription not found", "err", ErrExecutionNotFound, "execution_id", executionID)
+		slog.Error(
+			"guest execution subscription not found",
+			"err",
+			ErrExecutionNotFound,
+			"execution_id",
+			executionID,
+		)
 		return nil, nil, fmt.Errorf("%w: %s", ErrExecutionNotFound, executionID)
 	}
 
@@ -334,9 +384,13 @@ func (r *Registry) Subscribe(
 	cancel := func() {
 		cancelOnce.Do(func() { close(done) })
 	}
-	goSafe("execution subscriber", func() {
-		execState.stream(fromSequence, events, done)
-	})
+	goSafe(
+		"execution subscriber",
+		func() {
+			execState.stream(fromSequence, events, done)
+		},
+	)
+
 	return events, cancel, nil
 }
 
@@ -346,7 +400,13 @@ func (r *Registry) Cancel(executionID string) error {
 	execState, found := r.executions[executionID]
 	r.mu.Unlock()
 	if !found {
-		slog.Error("guest execution cancellation not found", "err", ErrExecutionNotFound, "execution_id", executionID)
+		slog.Error(
+			"guest execution cancellation not found",
+			"err",
+			ErrExecutionNotFound,
+			"execution_id",
+			executionID,
+		)
 		return fmt.Errorf("%w: %s", ErrExecutionNotFound, executionID)
 	}
 
@@ -355,26 +415,31 @@ func (r *Registry) Cancel(executionID string) error {
 		execState.mu.Unlock()
 		return nil
 	}
+
 	pgid := execState.pgid
 	err := killProcessGroup(pgid)
 	if err == nil {
 		execState.cancelled = true
 	}
+
 	execState.mu.Unlock()
 	if err != nil {
 		slog.Error("guest execution cancellation failed", "err", err, "execution_id", executionID)
 		return fmt.Errorf("guestexec: cancel %s: %w", executionID, err)
 	}
+
 	return nil
 }
 
 // List returns active and retained executions sorted by execution ID.
 func (r *Registry) List() []ExecutionState {
 	r.mu.Lock()
+
 	executions := make([]*execution, 0, len(r.executions))
 	for _, execState := range r.executions {
 		executions = append(executions, execState)
 	}
+
 	r.mu.Unlock()
 
 	states := make([]ExecutionState, 0, len(executions))
@@ -384,19 +449,28 @@ func (r *Registry) List() []ExecutionState {
 		if len(execState.events) > 0 {
 			lastSequence = execState.events[len(execState.events)-1].Sequence
 		}
-		states = append(states, ExecutionState{
-			ExecutionID:  execState.id,
-			Slot:         execState.slot,
-			Meta:         execState.meta,
-			Phase:        execState.phase,
-			Running:      execState.running,
-			LastSequence: lastSequence,
-		})
+
+		states = append(
+			states,
+			ExecutionState{
+				ExecutionID:  execState.id,
+				Slot:         execState.slot,
+				Meta:         execState.meta,
+				Phase:        execState.phase,
+				Running:      execState.running,
+				LastSequence: lastSequence,
+			},
+		)
 		execState.mu.Unlock()
 	}
-	sort.Slice(states, func(i, j int) bool {
-		return states[i].ExecutionID < states[j].ExecutionID
-	})
+
+	sort.Slice(
+		states,
+		func(i, j int) bool {
+			return states[i].ExecutionID < states[j].ExecutionID
+		},
+	)
+
 	return states
 }
 
@@ -407,12 +481,14 @@ func (r *Registry) Drain() DrainState {
 	if r.activeCount == 0 {
 		r.closeDrainedLocked()
 	}
+
 	state := DrainState{
 		Idle:             r.activeCount == 0,
 		ActiveExecutions: r.activeCount,
 		Done:             r.drained,
 	}
 	r.mu.Unlock()
+
 	return state
 }
 
@@ -423,10 +499,13 @@ func (r *Registry) discardLaunched(launched *LaunchedProcess) {
 	_ = killProcessGroup(launched.PGID)
 	_ = launched.Stdout.Close()
 	_ = launched.Stderr.Close()
-	goSafe("discarded launch reaper", func() {
-		_ = waitUntilExited(launched.PID)
-		_ = launched.Command.Wait()
-	})
+	goSafe(
+		"discarded launch reaper",
+		func() {
+			_ = waitUntilExited(launched.PID)
+			_ = launched.Command.Wait()
+		},
+	)
 }
 
 // executionByPIDLocked returns the execution that owns pid, preferring a live
@@ -437,20 +516,24 @@ func (r *Registry) discardLaunched(launched *LaunchedProcess) {
 // of that live execution's state is read under its own mutex.
 func (r *Registry) executionByPIDLocked(pid int) *execution {
 	var fallback *execution
+
 	for _, execState := range r.executions {
 		if execState.processID != pid {
 			continue
 		}
+
 		execState.mu.Lock()
 		live := execState.running && !execState.reaped
 		execState.mu.Unlock()
 		if live {
 			return execState
 		}
+
 		if fallback == nil {
 			fallback = execState
 		}
 	}
+
 	return fallback
 }
 
@@ -484,15 +567,20 @@ func (r *Registry) reapAndComplete(execState *execution, report ExitReport) {
 	if readers != nil {
 		readers.Wait()
 	}
+
 	r.completeExecution(execState)
-	time.AfterFunc(r.retention, func() {
-		r.expire(execState)
-	})
+	time.AfterFunc(
+		r.retention,
+		func() {
+			r.expire(execState)
+		},
+	)
 }
 
 func (r *Registry) emitHeartbeats(execState *execution) {
 	ticker := time.NewTicker(r.heartbeatInterval)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case now := <-ticker.C:
@@ -521,17 +609,22 @@ func (r *Registry) completeExecution(execState *execution) {
 	if execState.cancelled {
 		message = "execution cancelled"
 	}
+
 	execState.phase = "completed"
 	execState.running = false
 	execState.completedAt = r.clock.Now()
 	execState.appendEventLocked(PhaseChange{Phase: "completed"})
-	execState.appendEventLocked(TerminalResult{ExitCode: clampExitCode(execState.exitCode), Message: message})
+	execState.appendEventLocked(TerminalResult{
+		ExitCode: clampExitCode(execState.exitCode),
+		Message:  message,
+	})
 	close(execState.done)
 	delete(r.slots, execState.slot)
 	r.activeCount--
 	if r.draining && r.activeCount == 0 {
 		r.closeDrainedLocked()
 	}
+
 	execState.mu.Unlock()
 	r.mu.Unlock()
 }
@@ -540,6 +633,7 @@ func (r *Registry) closeDrainedLocked() {
 	if r.drainedClosed {
 		return
 	}
+
 	close(r.drained)
 	r.drainedClosed = true
 }
@@ -557,7 +651,9 @@ func captureOutput(
 	if dr, ok := reader.(deadlineReader); ok {
 		_ = dr.SetReadDeadline(time.Time{})
 	}
+
 	buffer := make([]byte, outputReadBufferSize)
+
 	for {
 		select {
 		case <-stopped:
@@ -565,17 +661,23 @@ func captureOutput(
 			return
 		default:
 		}
+
 		bytesRead, err := reader.Read(buffer)
 		if bytesRead > 0 {
 			data := append([]byte(nil), buffer[:bytesRead]...)
-			execState.appendEvent(LogChunk{Stream: stream, Data: data})
+			execState.appendEvent(LogChunk{
+				Stream: stream,
+				Data:   data,
+			})
 		}
+
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				// A read deadline interrupted a blocked read without consuming bytes.
 				// Leave the reader open so a later read resumes from this offset.
 				return
 			}
+
 			_ = reader.Close()
 			if !errors.Is(err, io.EOF) {
 				execState.appendEvent(LogChunk{
@@ -583,6 +685,7 @@ func captureOutput(
 					Data:   fmt.Appendf(nil, "guestexec: capture %v: %v\n", stream, err),
 				})
 			}
+
 			return
 		}
 	}
@@ -600,6 +703,7 @@ func (e *execution) appendHeartbeat(now time.Time) {
 	if !e.running {
 		return
 	}
+
 	e.appendEventLocked(Heartbeat{UnixNanos: now.UnixNano()})
 }
 
@@ -610,6 +714,7 @@ func (e *execution) appendEventLocked(payload EventPayload) {
 		e.retainedLogBytes += len(chunk.Data)
 		e.enforceLogByteCapLocked()
 	}
+
 	close(e.notify)
 	e.notify = make(chan struct{})
 }
@@ -635,10 +740,12 @@ func (e *execution) enforceLogByteCapLocked() {
 		if e.retainedLogBytes <= maxRetainedLogBytes {
 			return
 		}
+
 		chunk, ok := e.events[e.logCapCursor].Payload.(LogChunk)
 		if !ok || len(chunk.Data) == 0 {
 			continue
 		}
+
 		e.retainedLogBytes -= len(chunk.Data)
 		e.events[e.logCapCursor].Payload = LogChunk{Stream: chunk.Stream, Data: nil}
 	}
@@ -646,14 +753,18 @@ func (e *execution) enforceLogByteCapLocked() {
 
 func mergedEnvironment(overrides map[string]string) []string {
 	environment := append([]string(nil), os.Environ()...)
+
 	keys := make([]string, 0, len(overrides))
 	for key := range overrides {
 		keys = append(keys, key)
 	}
+
 	sort.Strings(keys)
+
 	for _, key := range keys {
 		environment = append(environment, key+"="+overrides[key])
 	}
+
 	return environment
 }
 
@@ -662,6 +773,7 @@ func processExitCode(processState *os.ProcessState) int32 {
 	if exitCode < 0 || exitCode > maximumProcessExitCode {
 		return -1
 	}
+
 	return int32(exitCode)
 }
 
@@ -671,6 +783,7 @@ func clampExitCode(exitCode int) int32 {
 	if exitCode < 0 || exitCode > maximumProcessExitCode {
 		return -1
 	}
+
 	return int32(exitCode)
 }
 
@@ -688,6 +801,7 @@ func goSafe(label string, function func()) {
 func (e *execution) stream(fromSequence uint64, output chan<- Event, done <-chan struct{}) {
 	defer close(output)
 	nextSequence := fromSequence + 1
+
 	for {
 		e.mu.Lock()
 		if nextSequence > 0 && nextSequence <= uint64(len(e.events)) {
@@ -699,14 +813,17 @@ func (e *execution) stream(fromSequence uint64, output chan<- Event, done <-chan
 			case <-done:
 				return
 			}
+
 			continue
 		}
+
 		terminal := !e.running
 		notify := e.notify
 		e.mu.Unlock()
 		if terminal {
 			return
 		}
+
 		select {
 		case <-notify:
 		case <-done:
@@ -721,5 +838,6 @@ func cloneEvent(event Event) Event {
 		chunk.Data = append([]byte(nil), chunk.Data...)
 		event.Payload = chunk
 	}
+
 	return event
 }

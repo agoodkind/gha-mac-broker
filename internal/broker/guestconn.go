@@ -33,16 +33,25 @@ type guestClientAdapter struct {
 	*guestclient.Client
 }
 
-func newGuestClientAdapter(ctx context.Context, dial guesttransport.GuestDialer, token string) guestConn {
+func newGuestClientAdapter(
+	ctx context.Context,
+	dial guesttransport.GuestDialer,
+	token string,
+) guestConn {
 	return guestClientAdapter{Client: guestclient.New(ctx, dial, token)}
 }
 
-func (a guestClientAdapter) JobStatus(ctx context.Context, executionID string, fromSequence uint64) (jobStatusStream, error) {
+func (a guestClientAdapter) JobStatus(
+	ctx context.Context,
+	executionID string,
+	fromSequence uint64,
+) (jobStatusStream, error) {
 	stream, err := a.Client.JobStatus(ctx, executionID, fromSequence)
 	if err != nil {
 		slog.WarnContext(ctx, "guest job status open failed", "err", err, "execution", executionID)
 		return nil, fmt.Errorf("broker: guest job status: %w", err)
 	}
+
 	return stream, nil
 }
 
@@ -65,6 +74,7 @@ func (b *Binder) resolveGuest(ctx context.Context, vm *WarmVM) (guestConn, error
 	if err != nil {
 		return nil, err
 	}
+
 	// Reach the guest agent over the tart guest-agent channel by running the
 	// guest-dial relay, which bridges the exec stdio to the agent's loopback
 	// listener. This avoids dialing the guest NAT IP, whose bridge route stays
@@ -78,6 +88,7 @@ func (b *Binder) resolveGuest(ctx context.Context, vm *WarmVM) (guestConn, error
 	}
 
 	vm.guestConn = client
+
 	return vm.guestConn, nil
 }
 
@@ -92,6 +103,7 @@ func (b *Binder) readGuestToken(ctx context.Context, vmName string) (string, err
 	defer cancel()
 	ticker := time.NewTicker(readinessInterval)
 	defer ticker.Stop()
+
 	for {
 		out, err := b.vm.Exec(ctx, vmName, "sudo", "cat", guestsupervisor.TokenPath)
 		if err == nil {
@@ -100,6 +112,7 @@ func (b *Binder) readGuestToken(ctx context.Context, vmName string) (string, err
 				return token, nil
 			}
 		}
+
 		select {
 		case <-ctx.Done():
 			slog.ErrorContext(ctx, "timed out reading guest token", "err", ctx.Err(), "vm", vmName)
@@ -116,17 +129,32 @@ func (b *Binder) waitForGuestHello(ctx context.Context, client guestConn, vmName
 	defer cancel()
 	ticker := time.NewTicker(readinessInterval)
 	defer ticker.Stop()
+
 	for {
 		response, err := client.Hello(ctx)
 		if err == nil {
 			if response.GetProtocolMajor() != hostProtocolMajor {
-				return fmt.Errorf("broker: guest %s speaks protocol %d, want %d", vmName, response.GetProtocolMajor(), hostProtocolMajor)
+				return fmt.Errorf(
+					"broker: guest %s speaks protocol %d, want %d",
+					vmName,
+					response.GetProtocolMajor(),
+					hostProtocolMajor,
+				)
 			}
+
 			return nil
 		}
+
 		select {
 		case <-ctx.Done():
-			slog.ErrorContext(ctx, "timed out waiting for guest hello", "err", ctx.Err(), "vm", vmName)
+			slog.ErrorContext(
+				ctx,
+				"timed out waiting for guest hello",
+				"err",
+				ctx.Err(),
+				"vm",
+				vmName,
+			)
 			return fmt.Errorf("broker: waiting for guest hello on %s: %w", vmName, ctx.Err())
 		case <-ticker.C:
 		}

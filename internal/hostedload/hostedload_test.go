@@ -11,10 +11,12 @@ func TestTrackerMarkInProgressAddsAndDedupes(t *testing.T) {
 	if got := tracker.Count(); got != 1 {
 		t.Fatalf("after one MarkInProgress Count = %d, want 1", got)
 	}
+
 	tracker.MarkInProgress(1)
 	if got := tracker.Count(); got != 1 {
 		t.Fatalf("after duplicate MarkInProgress Count = %d, want 1", got)
 	}
+
 	tracker.MarkInProgress(2)
 	if got := tracker.Count(); got != 2 {
 		t.Fatalf("after second distinct MarkInProgress Count = %d, want 2", got)
@@ -29,10 +31,12 @@ func TestTrackerMarkCompletedRemovesAndIsIdempotent(t *testing.T) {
 	if got := tracker.Count(); got != 1 {
 		t.Fatalf("after MarkCompleted Count = %d, want 1", got)
 	}
+
 	tracker.MarkCompleted(1)
 	if got := tracker.Count(); got != 1 {
 		t.Fatalf("after MarkCompleted of absent id Count = %d, want 1", got)
 	}
+
 	tracker.MarkCompleted(99)
 	if got := tracker.Count(); got != 1 {
 		t.Fatalf("after MarkCompleted of never-present id Count = %d, want 1", got)
@@ -85,14 +89,18 @@ func TestTrackerConcurrentAccess(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(workers)
+
 	for i := 0; i < workers; i++ {
 		go func(id int64) {
 			defer wg.Done()
 			tracker.MarkInProgress(id)
 			tracker.Count()
 			tracker.MarkCompleted(id)
-		}(int64(i))
+		}(
+			int64(i),
+		)
 	}
+
 	wg.Wait()
 
 	if got := tracker.Count(); got != 0 {
@@ -146,10 +154,19 @@ func TestIsHostedMacOSJob(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := IsHostedMacOSJob(tc.jobLabels, poolLabels); got != tc.want {
-				t.Fatalf("IsHostedMacOSJob(%v, %v) = %v, want %v", tc.jobLabels, poolLabels, got, tc.want)
-			}
-		})
+		t.Run(
+			tc.name,
+			func(t *testing.T) {
+				if got := IsHostedMacOSJob(tc.jobLabels, poolLabels); got != tc.want {
+					t.Fatalf(
+						"IsHostedMacOSJob(%v, %v) = %v, want %v",
+						tc.jobLabels,
+						poolLabels,
+						got,
+						tc.want,
+					)
+				}
+			},
+		)
 	}
 }

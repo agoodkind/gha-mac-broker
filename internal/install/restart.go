@@ -16,7 +16,10 @@ var (
 	restartRuntimeOS                      = func() string { return runtime.GOOS }
 	restartUserHome                       = os.UserHomeDir
 	restartStat                           = os.Stat
-	restartCommand   serviceCommandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	restartCommand   serviceCommandRunner = func(ctx context.Context, name string, args ...string) (
+		[]byte,
+		error,
+	) {
 		return command(ctx, name, args...).CombinedOutput()
 	}
 )
@@ -28,6 +31,7 @@ func Restart(ctx context.Context) (bool, error) {
 		slog.ErrorContext(ctx, "resolve home dir failed", "err", err)
 		return false, fmt.Errorf("restart: resolve home dir: %w", err)
 	}
+
 	restartOS := restartRuntimeOS()
 	switch restartOS {
 	case osDarwin:
@@ -46,16 +50,21 @@ func restartLaunchd(ctx context.Context, home string) (bool, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
+
 		slog.ErrorContext(ctx, "stat launchd plist failed", "err", err, "path", plistPath)
+
 		return false, fmt.Errorf("restart: stat plist %s: %w", plistPath, err)
 	}
+
 	target := fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel)
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
 	bootstrapErr := bootoutThenBootstrap(ctx, restartCommand, "restart", target, domain, plistPath)
 	if bootstrapErr != nil {
 		return true, bootstrapErr
 	}
+
 	slog.InfoContext(ctx, "launchd service restarted", "plist", plistPath)
+
 	return true, nil
 }
 
@@ -65,16 +74,21 @@ func restartSystemd(ctx context.Context, home string) (bool, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
+
 		return false, fmt.Errorf("restart: stat unit %s: %w", unitPath, err)
 	}
+
 	if out, err := restartCommand(ctx, "systemctl", "--user", "daemon-reload"); err != nil {
 		slog.ErrorContext(ctx, "systemctl daemon-reload failed", "err", err, "out", string(out))
 		return true, fmt.Errorf("restart: systemctl daemon-reload: %w", err)
 	}
+
 	if out, err := restartCommand(ctx, "systemctl", "--user", "restart", systemdUnit); err != nil {
 		slog.ErrorContext(ctx, "systemctl restart failed", "err", err, "out", string(out))
 		return true, fmt.Errorf("restart: systemctl restart: %w", err)
 	}
+
 	slog.InfoContext(ctx, "systemd service restarted", "unit", unitPath)
+
 	return true, nil
 }

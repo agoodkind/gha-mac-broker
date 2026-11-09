@@ -40,14 +40,21 @@ func startConfigReloadWatcher(ctx context.Context, options configReloadWatcherOp
 	if interval <= 0 {
 		interval = configReloadPollInterval
 	}
+
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				watcher.log.ErrorContext(ctx, "config reload watcher panic recovered", "err", fmt.Errorf("panic: %v", recovered))
+				watcher.log.ErrorContext(
+					ctx,
+					"config reload watcher panic recovered",
+					"err",
+					fmt.Errorf("panic: %v", recovered),
+				)
 			}
 		}()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -64,14 +71,17 @@ func newConfigReloadWatcher(options configReloadWatcherOptions) *configReloadWat
 	if stat == nil {
 		stat = os.Stat
 	}
+
 	load := options.load
 	if load == nil {
 		load = config.Load
 	}
+
 	log := options.log
 	if log == nil {
 		log = slog.Default()
 	}
+
 	return &configReloadWatcher{
 		path:           options.path,
 		stat:           stat,
@@ -88,43 +98,82 @@ func newConfigReloadWatcher(options configReloadWatcherOptions) *configReloadWat
 func (w *configReloadWatcher) poll(ctx context.Context) {
 	info, err := w.stat(w.path)
 	if err != nil {
-		w.log.WarnContext(ctx, "config watch stat failed; keeping current config", "err", err, "path", w.path)
+		w.log.WarnContext(
+			ctx,
+			"config watch stat failed; keeping current config",
+			"err",
+			err,
+			"path",
+			w.path,
+		)
 		return
 	}
+
 	modTime := info.ModTime()
 	if !w.initialized {
 		w.appliedModTime = modTime
 		w.initialized = true
 		w.hasPending = false
+
 		return
 	}
+
 	if modTime.Equal(w.appliedModTime) {
 		w.hasPending = false
 		return
 	}
+
 	if !w.hasPending || !modTime.Equal(w.pendingModTime) {
 		w.pendingModTime = modTime
 		w.hasPending = true
+
 		return
 	}
+
 	cfg, err := w.load(w.path)
 	if err != nil {
-		w.log.ErrorContext(ctx, "config reload failed; keeping current config", "err", err, "path", w.path)
+		w.log.ErrorContext(
+			ctx,
+			"config reload failed; keeping current config",
+			"err",
+			err,
+			"path",
+			w.path,
+		)
 		w.appliedModTime = modTime
 		w.hasPending = false
+
 		return
 	}
+
 	if w.apply == nil {
-		w.log.ErrorContext(ctx, "config reload failed; keeping current config", "err", "missing apply callback", "path", w.path)
+		w.log.ErrorContext(
+			ctx,
+			"config reload failed; keeping current config",
+			"err",
+			"missing apply callback",
+			"path",
+			w.path,
+		)
 		w.appliedModTime = modTime
 		w.pendingModTime = time.Time{}
 		w.hasPending = false
+
 		return
 	}
+
 	if err := w.apply(ctx, cfg); err != nil {
-		w.log.ErrorContext(ctx, "config reload apply failed; keeping current config", "err", err, "path", w.path)
+		w.log.ErrorContext(
+			ctx,
+			"config reload apply failed; keeping current config",
+			"err",
+			err,
+			"path",
+			w.path,
+		)
 		return
 	}
+
 	w.log.InfoContext(ctx, "config reloaded", "path", w.path, "mod_time", modTime)
 	w.appliedModTime = modTime
 	w.hasPending = false

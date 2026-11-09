@@ -92,38 +92,55 @@ type provisionRequest struct {
 func runGoldenProvision(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("golden-provision", flag.ExitOnError)
 	runnerVersion := fs.String("runner-version", "", "actions/runner version to install")
-	runnerDigest := fs.String("runner-digest", "", "expected sha256 of the runner tarball, verified before extraction")
-	binarySource := fs.String("binary", "", "path to the guest broker binary to bake into the image")
+	runnerDigest := fs.String(
+		"runner-digest",
+		"",
+		"expected sha256 of the runner tarball, verified before extraction",
+	)
+	binarySource := fs.String(
+		"binary",
+		"",
+		"path to the guest broker binary to bake into the image",
+	)
 	fingerprint := fs.String("fingerprint", "", "golden fingerprint to persist into the image")
 	runnerDir := fs.String("runner-dir", "", "directory to install the unconfigured runner into")
 	if err := fs.Parse(args); err != nil {
 		slog.ErrorContext(ctx, "golden-provision flag parse failed", "err", err)
 		return fmt.Errorf("golden-provision flags: %w", err)
 	}
+
 	if *runnerVersion == "" {
 		return fmt.Errorf("golden-provision requires -runner-version")
 	}
+
 	if *runnerDigest == "" {
 		return fmt.Errorf("golden-provision requires -runner-digest")
 	}
+
 	if *binarySource == "" {
 		return fmt.Errorf("golden-provision requires -binary")
 	}
+
 	if *fingerprint == "" {
 		return fmt.Errorf("golden-provision requires -fingerprint")
 	}
+
 	if *runnerDir == "" {
 		return fmt.Errorf("golden-provision requires -runner-dir")
 	}
-	return provisionGolden(ctx, provisionRequest{
-		runnerVersion: *runnerVersion,
-		runnerDigest:  *runnerDigest,
-		binarySource:  *binarySource,
-		fingerprint:   *fingerprint,
-		paths:         defaultProvisionPaths(*runnerDir),
-		download:      downloadRunnerTarball,
-		sign:          codesignAdhoc,
-	})
+
+	return provisionGolden(
+		ctx,
+		provisionRequest{
+			runnerVersion: *runnerVersion,
+			runnerDigest:  *runnerDigest,
+			binarySource:  *binarySource,
+			fingerprint:   *fingerprint,
+			paths:         defaultProvisionPaths(*runnerDir),
+			download:      downloadRunnerTarball,
+			sign:          codesignAdhoc,
+		},
+	)
 }
 
 // provisionGolden runs the provisioning steps in order: install the runner, bake
@@ -131,35 +148,84 @@ func runGoldenProvision(ctx context.Context, args []string) error {
 // delete the retired watchdog. Every file write is pure Go via os primitives; the
 // only external tools are xattr and codesign for the binary signature fixup.
 func provisionGolden(ctx context.Context, req provisionRequest) error {
-	if err := installRunner(ctx, req.download, req.runnerVersion, req.runnerDigest, req.paths.runnerDir); err != nil {
+	if err := installRunner(
+		ctx,
+		req.download,
+		req.runnerVersion,
+		req.runnerDigest,
+		req.paths.runnerDir,
+	); err != nil {
 		return err
 	}
-	if err := installBakedBinary(ctx, req.binarySource, req.paths.binaryDest, req.sign); err != nil {
+
+	if err := installBakedBinary(
+		ctx,
+		req.binarySource,
+		req.paths.binaryDest,
+		req.sign,
+	); err != nil {
 		return err
 	}
-	if err := writeBakedFile(req.paths.plistDest, golden.GuestAgentPlist(), bakedFileMode); err != nil {
-		slog.ErrorContext(ctx, "write guest agent plist failed", "err", err, "dest", req.paths.plistDest)
+
+	if err := writeBakedFile(
+		req.paths.plistDest,
+		golden.GuestAgentPlist(),
+		bakedFileMode,
+	); err != nil {
+		slog.ErrorContext(
+			ctx,
+			"write guest agent plist failed",
+			"err",
+			err,
+			"dest",
+			req.paths.plistDest,
+		)
 		return fmt.Errorf("golden-provision: write guest agent plist: %w", err)
 	}
+
 	runner := golden.RunnerReceipt{Version: req.runnerVersion, TarballDigest: req.runnerDigest}
 	if err := runner.Validate(); err != nil {
 		return fmt.Errorf("golden-provision: runner receipt: %w", err)
 	}
+
 	receipt, err := json.Marshal(runner)
 	if err != nil {
 		return fmt.Errorf("golden-provision: encode runner receipt: %w", err)
 	}
+
 	if err := writeBakedFile(req.paths.runnerReceiptDest, receipt, bakedFileMode); err != nil {
 		return fmt.Errorf("golden-provision: write runner receipt: %w", err)
 	}
-	if err := writeBakedFile(req.paths.fingerprintDest, []byte(req.fingerprint+"\n"), bakedFileMode); err != nil {
-		slog.ErrorContext(ctx, "write fingerprint failed", "err", err, "dest", req.paths.fingerprintDest)
+
+	if err := writeBakedFile(
+		req.paths.fingerprintDest,
+		[]byte(req.fingerprint+"\n"),
+		bakedFileMode,
+	); err != nil {
+		slog.ErrorContext(
+			ctx,
+			"write fingerprint failed",
+			"err",
+			err,
+			"dest",
+			req.paths.fingerprintDest,
+		)
 		return fmt.Errorf("golden-provision: write fingerprint: %w", err)
 	}
+
 	if err := removeLegacyWatchdog(ctx, req.paths); err != nil {
 		return err
 	}
-	slog.InfoContext(ctx, "golden provisioned", "fingerprint", req.fingerprint, "runner_dir", req.paths.runnerDir)
+
+	slog.InfoContext(
+		ctx,
+		"golden provisioned",
+		"fingerprint",
+		req.fingerprint,
+		"runner_dir",
+		req.paths.runnerDir,
+	)
+
 	return nil
 }
 
@@ -168,11 +234,18 @@ func provisionGolden(ctx context.Context, req provisionRequest) error {
 // it, unconfigured, into runnerDir and confirms the runner entrypoint landed. The
 // digest check ties the baked runner bytes to the golden fingerprint, so a re-tag,
 // CDN inconsistency, or MITM on the guest fetch is rejected rather than baked in.
-func installRunner(ctx context.Context, download runnerDownloader, version, expectedDigest, runnerDir string) error {
+func installRunner(
+	ctx context.Context,
+	download runnerDownloader,
+	version string,
+	expectedDigest string,
+	runnerDir string,
+) error {
 	body, err := download(ctx, version)
 	if err != nil {
 		return err
 	}
+
 	defer func() { _ = body.Close() }()
 
 	tarball, err := os.CreateTemp("", "gha-runner-*.tar.gz")
@@ -180,6 +253,7 @@ func installRunner(ctx context.Context, download runnerDownloader, version, expe
 		slog.ErrorContext(ctx, "create runner temp file failed", "err", err)
 		return fmt.Errorf("golden-provision: create runner temp file: %w", err)
 	}
+
 	tarballPath := tarball.Name()
 	defer func() {
 		_ = tarball.Close()
@@ -191,12 +265,26 @@ func installRunner(ctx context.Context, download runnerDownloader, version, expe
 		slog.ErrorContext(ctx, "download runner to temp file failed", "err", err)
 		return fmt.Errorf("golden-provision: buffer runner tarball: %w", err)
 	}
+
 	got := hex.EncodeToString(digest.Sum(nil))
 	if got != expectedDigest {
-		mismatchErr := fmt.Errorf("runner tarball digest %s does not match expected %s", got, expectedDigest)
-		slog.ErrorContext(ctx, "runner tarball digest mismatch", "err", mismatchErr, "version", version)
+		mismatchErr := fmt.Errorf(
+			"runner tarball digest %s does not match expected %s",
+			got,
+			expectedDigest,
+		)
+		slog.ErrorContext(
+			ctx,
+			"runner tarball digest mismatch",
+			"err",
+			mismatchErr,
+			"version",
+			version,
+		)
+
 		return fmt.Errorf("golden-provision: %w", mismatchErr)
 	}
+
 	if _, err := tarball.Seek(0, io.SeekStart); err != nil {
 		slog.ErrorContext(ctx, "rewind runner temp file failed", "err", err)
 		return fmt.Errorf("golden-provision: rewind runner tarball: %w", err)
@@ -205,10 +293,23 @@ func installRunner(ctx context.Context, download runnerDownloader, version, expe
 	if err := extractRunnerTarball(ctx, tarball, runnerDir); err != nil {
 		return err
 	}
+
 	if _, err := os.Stat(filepath.Join(runnerDir, runnerRunScript)); err != nil {
-		slog.ErrorContext(ctx, "runner entrypoint missing after extract", "err", err, "runner_dir", runnerDir)
-		return fmt.Errorf("golden-provision: runner %s missing after extract: %w", runnerRunScript, err)
+		slog.ErrorContext(
+			ctx,
+			"runner entrypoint missing after extract",
+			"err",
+			err,
+			"runner_dir",
+			runnerDir,
+		)
+		return fmt.Errorf(
+			"golden-provision: runner %s missing after extract: %w",
+			runnerRunScript,
+			err,
+		)
 	}
+
 	return nil
 }
 
@@ -222,18 +323,22 @@ func downloadRunnerTarball(ctx context.Context, version string) (io.ReadCloser, 
 		slog.ErrorContext(ctx, "build runner request failed", "err", err, "url", url)
 		return nil, fmt.Errorf("golden-provision: build runner request: %w", err)
 	}
+
 	client := &http.Client{Timeout: runnerDownloadTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		slog.ErrorContext(ctx, "download runner failed", "err", err, "url", url)
 		return nil, fmt.Errorf("golden-provision: download runner %s: %w", url, err)
 	}
+
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
 		statusErr := fmt.Errorf("status %d", resp.StatusCode)
 		slog.ErrorContext(ctx, "download runner bad status", "err", statusErr, "url", url)
+
 		return nil, fmt.Errorf("golden-provision: download runner %s: %w", url, statusErr)
 	}
+
 	return resp.Body, nil
 }
 
@@ -245,26 +350,32 @@ func extractRunnerTarball(ctx context.Context, gzStream io.Reader, destDir strin
 		slog.ErrorContext(ctx, "create runner dir failed", "err", err, "dir", destDir)
 		return fmt.Errorf("golden-provision: create runner dir %s: %w", destDir, err)
 	}
+
 	gzipReader, err := gzip.NewReader(gzStream)
 	if err != nil {
 		slog.ErrorContext(ctx, "open runner gzip failed", "err", err)
 		return fmt.Errorf("golden-provision: open runner gzip: %w", err)
 	}
+
 	defer func() { _ = gzipReader.Close() }()
 	tarReader := tar.NewReader(gzipReader)
+
 	for {
 		header, err := tarReader.Next()
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
+
 		if err != nil {
 			slog.ErrorContext(ctx, "read runner tar failed", "err", err)
 			return fmt.Errorf("golden-provision: read runner tar: %w", err)
 		}
+
 		target, err := safeJoin(ctx, destDir, header.Name)
 		if err != nil {
 			return err
 		}
+
 		if err := extractTarEntry(ctx, tarReader, header, destDir, target); err != nil {
 			return err
 		}
@@ -278,6 +389,7 @@ func withinDest(destDir, path string) bool {
 	if err != nil {
 		return false
 	}
+
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
@@ -288,8 +400,10 @@ func safeJoin(ctx context.Context, destDir, name string) (string, error) {
 	if !withinDest(destDir, target) {
 		escapeErr := fmt.Errorf("tar entry %q escapes runner dir", name)
 		slog.ErrorContext(ctx, "tar entry escapes runner dir", "err", escapeErr, "dir", destDir)
+
 		return "", fmt.Errorf("golden-provision: %w", escapeErr)
 	}
+
 	return target, nil
 }
 
@@ -298,7 +412,13 @@ func safeJoin(ctx context.Context, destDir, name string) (string, error) {
 // symlink or hardlink whose resolved target escapes destDir is rejected rather
 // than created, and regular files open with O_NOFOLLOW so an entry can never
 // overwrite through a planted link. Unknown entry types are skipped.
-func extractTarEntry(ctx context.Context, tarReader io.Reader, header *tar.Header, destDir, target string) error {
+func extractTarEntry(
+	ctx context.Context,
+	tarReader io.Reader,
+	header *tar.Header,
+	destDir string,
+	target string,
+) error {
 	entryMode := header.FileInfo().Mode().Perm()
 	switch header.Typeflag {
 	case tar.TypeDir:
@@ -306,6 +426,7 @@ func extractTarEntry(ctx context.Context, tarReader io.Reader, header *tar.Heade
 			slog.ErrorContext(ctx, "create tar dir failed", "err", err, "target", target)
 			return fmt.Errorf("golden-provision: create dir %s: %w", target, err)
 		}
+
 		return nil
 	case tar.TypeReg:
 		return writeTarRegular(ctx, tarReader, target, entryMode)
@@ -314,7 +435,14 @@ func extractTarEntry(ctx context.Context, tarReader io.Reader, header *tar.Heade
 	case tar.TypeLink:
 		return writeTarHardlink(ctx, destDir, target, header.Linkname)
 	default:
-		slog.DebugContext(ctx, "skipping unsupported tar entry type", "type", header.Typeflag, "target", target)
+		slog.DebugContext(
+			ctx,
+			"skipping unsupported tar entry type",
+			"type",
+			header.Typeflag,
+			"target",
+			target,
+		)
 		return nil
 	}
 }
@@ -322,27 +450,37 @@ func extractTarEntry(ctx context.Context, tarReader io.Reader, header *tar.Heade
 // writeTarRegular writes a regular tar entry, opening the final component with
 // O_NOFOLLOW so a pre-existing symlink at target cannot be followed and written
 // through to another location.
-func writeTarRegular(ctx context.Context, tarReader io.Reader, target string, mode os.FileMode) error {
+func writeTarRegular(
+	ctx context.Context,
+	tarReader io.Reader,
+	target string,
+	mode os.FileMode,
+) error {
 	if err := os.MkdirAll(filepath.Dir(target), bakedDirMode); err != nil {
 		slog.ErrorContext(ctx, "create tar parent failed", "err", err, "target", target)
 		return fmt.Errorf("golden-provision: create parent of %s: %w", target, err)
 	}
+
 	file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY|syscall.O_NOFOLLOW, mode)
 	if err != nil {
 		slog.ErrorContext(ctx, "create tar file failed", "err", err, "target", target)
 		return fmt.Errorf("golden-provision: create %s: %w", target, err)
 	}
+
 	// The tar body is bounded by the archive, and the runner release is a
 	// trusted GitHub asset, so a full copy of the entry is intended here.
 	if _, err := io.Copy(file, tarReader); err != nil { // #nosec G110 -- trusted release asset
 		_ = file.Close()
 		slog.ErrorContext(ctx, "write tar file failed", "err", err, "target", target)
+
 		return fmt.Errorf("golden-provision: write %s: %w", target, err)
 	}
+
 	if err := file.Close(); err != nil {
 		slog.ErrorContext(ctx, "close tar file failed", "err", err, "target", target)
 		return fmt.Errorf("golden-provision: close %s: %w", target, err)
 	}
+
 	return nil
 }
 
@@ -352,19 +490,23 @@ func writeTarSymlink(ctx context.Context, destDir, target, linkname string) erro
 	if filepath.IsAbs(linkname) {
 		return rejectEscapingLink(ctx, "symlink", target, linkname)
 	}
+
 	resolved := filepath.Clean(filepath.Join(filepath.Dir(target), linkname))
 	if !withinDest(destDir, resolved) {
 		return rejectEscapingLink(ctx, "symlink", target, linkname)
 	}
+
 	if err := os.MkdirAll(filepath.Dir(target), bakedDirMode); err != nil {
 		slog.ErrorContext(ctx, "create symlink parent failed", "err", err, "target", target)
 		return fmt.Errorf("golden-provision: create parent of %s: %w", target, err)
 	}
+
 	_ = os.Remove(target)
 	if err := os.Symlink(linkname, target); err != nil {
 		slog.ErrorContext(ctx, "create symlink failed", "err", err, "target", target)
 		return fmt.Errorf("golden-provision: symlink %s: %w", target, err)
 	}
+
 	return nil
 }
 
@@ -375,19 +517,23 @@ func writeTarHardlink(ctx context.Context, destDir, target, linkname string) err
 	if filepath.IsAbs(linkname) {
 		return rejectEscapingLink(ctx, "hardlink", target, linkname)
 	}
+
 	source := filepath.Clean(filepath.Join(destDir, linkname))
 	if !withinDest(destDir, source) {
 		return rejectEscapingLink(ctx, "hardlink", target, linkname)
 	}
+
 	if err := os.MkdirAll(filepath.Dir(target), bakedDirMode); err != nil {
 		slog.ErrorContext(ctx, "create hardlink parent failed", "err", err, "target", target)
 		return fmt.Errorf("golden-provision: create parent of %s: %w", target, err)
 	}
+
 	_ = os.Remove(target)
 	if err := os.Link(source, target); err != nil {
 		slog.ErrorContext(ctx, "create hardlink failed", "err", err, "target", target)
 		return fmt.Errorf("golden-provision: hardlink %s: %w", target, err)
 	}
+
 	return nil
 }
 
@@ -395,6 +541,7 @@ func writeTarHardlink(ctx context.Context, destDir, target, linkname string) err
 func rejectEscapingLink(ctx context.Context, kind, target, linkname string) error {
 	escapeErr := fmt.Errorf("%s entry %q -> %q escapes runner dir", kind, target, linkname)
 	slog.ErrorContext(ctx, "tar link escapes runner dir", "err", escapeErr, "kind", kind)
+
 	return fmt.Errorf("golden-provision: %w", escapeErr)
 }
 
@@ -404,10 +551,13 @@ func installBakedBinary(ctx context.Context, source, dest string, sign binarySig
 	if err := copyFileMode(ctx, source, dest, bakedBinaryMode); err != nil {
 		return err
 	}
+
 	if err := sign(ctx, dest); err != nil {
 		return err
 	}
+
 	slog.InfoContext(ctx, "baked guest binary", "source", source, "dest", dest)
+
 	return nil
 }
 
@@ -419,17 +569,20 @@ func copyFileMode(ctx context.Context, source, dest string, mode os.FileMode) er
 		slog.ErrorContext(ctx, "create binary dir failed", "err", err, "dir", destDir)
 		return fmt.Errorf("golden-provision: create dir %s: %w", destDir, err)
 	}
+
 	in, err := os.Open(source)
 	if err != nil {
 		slog.ErrorContext(ctx, "open source binary failed", "err", err, "source", source)
 		return fmt.Errorf("golden-provision: open source %s: %w", source, err)
 	}
+
 	defer func() { _ = in.Close() }()
 	temp, err := os.CreateTemp(destDir, ".gha-provision-*")
 	if err != nil {
 		slog.ErrorContext(ctx, "create temp binary failed", "err", err, "dir", destDir)
 		return fmt.Errorf("golden-provision: create temp in %s: %w", destDir, err)
 	}
+
 	tempPath := temp.Name()
 	removeTemp := true
 	defer func() {
@@ -440,22 +593,29 @@ func copyFileMode(ctx context.Context, source, dest string, mode os.FileMode) er
 	if _, err := io.Copy(temp, in); err != nil {
 		_ = temp.Close()
 		slog.ErrorContext(ctx, "copy binary failed", "err", err, "temp", tempPath)
+
 		return fmt.Errorf("golden-provision: copy to %s: %w", tempPath, err)
 	}
+
 	if err := temp.Chmod(mode); err != nil {
 		_ = temp.Close()
 		slog.ErrorContext(ctx, "chmod temp binary failed", "err", err, "temp", tempPath)
+
 		return fmt.Errorf("golden-provision: chmod %s: %w", tempPath, err)
 	}
+
 	if err := temp.Close(); err != nil {
 		slog.ErrorContext(ctx, "close temp binary failed", "err", err, "temp", tempPath)
 		return fmt.Errorf("golden-provision: close %s: %w", tempPath, err)
 	}
+
 	if err := os.Rename(tempPath, dest); err != nil {
 		slog.ErrorContext(ctx, "rename binary failed", "err", err, "temp", tempPath, "dest", dest)
 		return fmt.Errorf("golden-provision: rename to %s: %w", dest, err)
 	}
+
 	removeTemp = false
+
 	return nil
 }
 
@@ -467,10 +627,12 @@ func writeBakedFile(dest string, content []byte, mode os.FileMode) error {
 		slog.Error("create baked file dir failed", "err", err, "dir", destDir)
 		return fmt.Errorf("golden-provision: create dir %s: %w", destDir, err)
 	}
+
 	if err := os.WriteFile(dest, content, mode); err != nil {
 		slog.Error("write baked file failed", "err", err, "dest", dest)
 		return fmt.Errorf("golden-provision: write %s: %w", dest, err)
 	}
+
 	return nil
 }
 
@@ -484,6 +646,7 @@ func removeLegacyWatchdog(ctx context.Context, paths provisionPaths) error {
 			return fmt.Errorf("golden-provision: remove %s: %w", path, err)
 		}
 	}
+
 	return nil
 }
 
@@ -496,16 +659,56 @@ func codesignAdhoc(ctx context.Context, path string) error {
 	// but a nonzero exit is tolerated so a missing quarantine attribute is not fatal.
 	xattrCmd := exec.CommandContext(ctx, "xattr", "-c", path)
 	if out, err := xattrCmd.CombinedOutput(); err != nil {
-		slog.WarnContext(ctx, "xattr clear returned nonzero; continuing", "err", err, "path", path, "output", strings.TrimSpace(string(out)))
+		slog.WarnContext(
+			ctx,
+			"xattr clear returned nonzero; continuing",
+			"err",
+			err,
+			"path",
+			path,
+			"output",
+			strings.TrimSpace(string(out)),
+		)
 	} else {
-		slog.DebugContext(ctx, "xattr command output", "path", path, "output", strings.TrimSpace(string(out)))
+		slog.DebugContext(
+			ctx,
+			"xattr command output",
+			"path",
+			path,
+			"output",
+			strings.TrimSpace(string(out)),
+		)
 	}
+
 	signCmd := exec.CommandContext(ctx, "codesign", "-s", "-", "-f", path)
 	out, err := signCmd.CombinedOutput()
 	if err != nil {
-		slog.ErrorContext(ctx, "codesign failed", "err", err, "path", path, "output", strings.TrimSpace(string(out)))
-		return fmt.Errorf("golden-provision: codesign %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+		slog.ErrorContext(
+			ctx,
+			"codesign failed",
+			"err",
+			err,
+			"path",
+			path,
+			"output",
+			strings.TrimSpace(string(out)),
+		)
+		return fmt.Errorf(
+			"golden-provision: codesign %s: %w: %s",
+			path,
+			err,
+			strings.TrimSpace(string(out)),
+		)
 	}
-	slog.DebugContext(ctx, "codesign command output", "path", path, "output", strings.TrimSpace(string(out)))
+
+	slog.DebugContext(
+		ctx,
+		"codesign command output",
+		"path",
+		path,
+		"output",
+		strings.TrimSpace(string(out)),
+	)
+
 	return nil
 }

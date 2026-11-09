@@ -32,14 +32,25 @@ type layoutCopier struct {
 	calls          []copyCall
 }
 
-func (c *layoutCopier) CopyToOCILayout(ctx context.Context, srcImageRef, layoutDir, tag, osName, arch string) error {
-	c.calls = append(c.calls, copyCall{
-		srcImageRef: srcImageRef,
-		layoutDir:   layoutDir,
-		tag:         tag,
-		os:          osName,
-		arch:        arch,
-	})
+func (c *layoutCopier) CopyToOCILayout(
+	ctx context.Context,
+	srcImageRef string,
+	layoutDir string,
+	tag string,
+	osName string,
+	arch string,
+) error {
+	c.calls = append(
+		c.calls,
+		copyCall{
+			srcImageRef: srcImageRef,
+			layoutDir:   layoutDir,
+			tag:         tag,
+			os:          osName,
+			arch:        arch,
+		},
+	)
+
 	return writeTinyOCILayout(ctx, layoutDir, tag, c)
 }
 
@@ -53,6 +64,7 @@ func blobPath(layoutDir string, digest string) string {
 	if !found {
 		return filepath.Join(layoutDir, "blobs", "unknown", digest)
 	}
+
 	return filepath.Join(layoutDir, "blobs", algorithm, hexValue)
 }
 
@@ -61,9 +73,11 @@ func writeBlob(layoutDir string, digest string, body []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+
 	if err := os.WriteFile(path, body, 0o644); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -71,47 +85,62 @@ func writeTinyOCILayout(_ context.Context, layoutDir string, _ string, copier *l
 	configDigest := digestOf(copier.configBytes)
 	layerOneDigest := digestOf(copier.layerOneBytes)
 	layerTwoDigest := digestOf(copier.layerTwoBytes)
-	copier.manifestBytes = []byte(fmt.Sprintf(
-		`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",`+
-			`"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},`+
-			`"layers":[`+
-			`{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d},`+
-			`{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}`+
-			`]}`,
-		configDigest,
-		len(copier.configBytes),
-		layerOneDigest,
-		len(copier.layerOneBytes),
-		layerTwoDigest,
-		len(copier.layerTwoBytes),
-	))
+	copier.manifestBytes = []byte(
+		fmt.Sprintf(
+			`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",`+
+				`"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},`+
+				`"layers":[`+
+				`{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d},`+
+				`{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}`+
+				`]}`,
+			configDigest,
+			len(copier.configBytes),
+			layerOneDigest,
+			len(copier.layerOneBytes),
+			layerTwoDigest,
+			len(copier.layerTwoBytes),
+		),
+	)
 	copier.manifestDigest = digestOf(copier.manifestBytes)
-	indexBytes := []byte(fmt.Sprintf(
-		`{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d}]}`,
-		copier.manifestDigest,
-		len(copier.manifestBytes),
-	))
+	indexBytes := []byte(
+		fmt.Sprintf(
+			`{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d}]}`,
+			copier.manifestDigest,
+			len(copier.manifestBytes),
+		),
+	)
 	if err := os.MkdirAll(layoutDir, 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(layoutDir, "oci-layout"), []byte(`{"imageLayoutVersion":"1.0.0"}`), 0o644); err != nil {
+
+	if err := os.WriteFile(
+		filepath.Join(layoutDir, "oci-layout"),
+		[]byte(`{"imageLayoutVersion":"1.0.0"}`),
+		0o644,
+	); err != nil {
 		return err
 	}
+
 	if err := os.WriteFile(filepath.Join(layoutDir, "index.json"), indexBytes, 0o644); err != nil {
 		return err
 	}
+
 	if err := writeBlob(layoutDir, configDigest, copier.configBytes); err != nil {
 		return err
 	}
+
 	if err := writeBlob(layoutDir, layerOneDigest, copier.layerOneBytes); err != nil {
 		return err
 	}
+
 	if err := writeBlob(layoutDir, layerTwoDigest, copier.layerTwoBytes); err != nil {
 		return err
 	}
+
 	if err := writeBlob(layoutDir, copier.manifestDigest, copier.manifestBytes); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -121,15 +150,18 @@ func getBody(ctx context.Context, t *testing.T, url string) (int, []byte) {
 	if err != nil {
 		t.Fatalf("build request %s: %v", url, err)
 	}
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("get %s: %v", url, err)
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read %s: %v", url, err)
 	}
+
 	return resp.StatusCode, body
 }
 
@@ -139,6 +171,7 @@ func requireLoopbackListen(t *testing.T) {
 	if err != nil {
 		t.Skipf("loopback listen unavailable in this environment: %v", err)
 	}
+
 	if err := listener.Close(); err != nil {
 		t.Fatalf("close loopback probe listener: %v", err)
 	}
@@ -148,7 +181,9 @@ func TestStageServesOCILayoutManifestAndBlobsOnLoopback(t *testing.T) {
 	requireLoopbackListen(t)
 
 	copier := &layoutCopier{
-		configBytes:    []byte(`{"architecture":"arm64","os":"darwin","rootfs":{"type":"layers","diff_ids":[]}}`),
+		configBytes: []byte(
+			`{"architecture":"arm64","os":"darwin","rootfs":{"type":"layers","diff_ids":[]}}`,
+		),
 		layerOneBytes:  []byte("fake-layer-one-payload"),
 		layerTwoBytes:  []byte("fake-layer-two-payload"),
 		manifestBytes:  nil,
@@ -156,7 +191,10 @@ func TestStageServesOCILayoutManifestAndBlobsOnLoopback(t *testing.T) {
 		calls:          nil,
 	}
 	layoutDir := t.TempDir()
-	stager := New(Options{Copier: copier, Dir: layoutDir})
+	stager := New(Options{
+		Copier: copier,
+		Dir:    layoutDir,
+	})
 	ctx := context.Background()
 
 	ref, stop, err := stager.Stage(ctx, "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5")
@@ -165,19 +203,24 @@ func TestStageServesOCILayoutManifestAndBlobsOnLoopback(t *testing.T) {
 	}
 	defer stop()
 
-	if !strings.HasPrefix(ref, "localhost:") || !strings.HasSuffix(ref, "/cirruslabs/macos-tahoe-xcode:26.5") {
+	if !strings.HasPrefix(ref, "localhost:") ||
+		!strings.HasSuffix(ref, "/cirruslabs/macos-tahoe-xcode:26.5") {
 		t.Fatalf("unexpected ref %q", ref)
 	}
+
 	if len(copier.calls) != 1 {
 		t.Fatalf("copy calls = %d, want 1", len(copier.calls))
 	}
+
 	call := copier.calls[0]
 	if call.srcImageRef != "ghcr.io/cirruslabs/macos-tahoe-xcode:26.5" {
 		t.Fatalf("src image = %q", call.srcImageRef)
 	}
+
 	if call.layoutDir != layoutDir {
 		t.Fatalf("layout dir = %q, want %q", call.layoutDir, layoutDir)
 	}
+
 	if call.tag != "26.5" || call.os != "darwin" || call.arch != "arm64" {
 		t.Fatalf("copy call = %+v", call)
 	}
@@ -189,6 +232,7 @@ func TestStageServesOCILayoutManifestAndBlobsOnLoopback(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("manifest status %d", status)
 	}
+
 	if !bytes.Equal(gotManifest, copier.manifestBytes) {
 		t.Fatalf("served manifest mismatch:\n got %s\nwant %s", gotManifest, copier.manifestBytes)
 	}
@@ -198,6 +242,7 @@ func TestStageServesOCILayoutManifestAndBlobsOnLoopback(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("layer status %d", status)
 	}
+
 	if !bytes.Equal(gotLayer, copier.layerOneBytes) {
 		t.Fatalf("served layer blob mismatch")
 	}
@@ -206,13 +251,17 @@ func TestStageServesOCILayoutManifestAndBlobsOnLoopback(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("digest manifest status %d", status)
 	}
+
 	if !bytes.Equal(gotDigestManifest, copier.manifestBytes) {
 		t.Fatalf("served digest manifest mismatch")
 	}
 }
 
 func TestStageRefusesNonCirrusImage(t *testing.T) {
-	stager := New(Options{Copier: nil, Dir: t.TempDir()})
+	stager := New(Options{
+		Copier: nil,
+		Dir:    t.TempDir(),
+	})
 	_, _, err := stager.Stage(context.Background(), "ghcr.io/example/not-cirrus:1.0")
 	if err == nil {
 		t.Fatal("expected refusal of non-cirrus image")
