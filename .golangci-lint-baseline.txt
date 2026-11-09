@@ -1,4 +1,4 @@
-# golangci-lint: generated_at=2026-11-09T02:37:29Z
+# golangci-lint: generated_at=2026-11-09T16:14:38Z
 cmd/gha-mac-broker/deploy.go:96:3: missing whitespace below this line (after-block) (wsl_v5)	# golangci-lint:first_added=2026-11-09T02:37:29Z last_seen=2026-11-09T02:37:29Z
 cmd/gha-mac-broker/deploy.go:80:2: missing whitespace above this line (too many lines above return) (wsl_v5)	# golangci-lint:first_added=2026-11-08T23:08:32Z last_seen=2026-11-09T02:37:29Z
 cmd/gha-mac-broker/golden_provision.go:508:2: missing whitespace below this line (after-block) (wsl_v5)	# golangci-lint:first_added=2026-11-09T02:37:29Z last_seen=2026-11-09T02:37:29Z
