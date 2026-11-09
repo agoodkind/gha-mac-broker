@@ -147,7 +147,16 @@ type serverConfig struct {
 }
 
 // New builds a Server and registers its routes on an internal mux.
-func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet, p pooler, hostedTracker *hostedload.Tracker, stats statsProvider, opts ...Option) *Server {
+func New(
+	webhookKey []byte,
+	cfg *config.Config,
+	capacityToken []byte,
+	webhookCIDRs []*net.IPNet,
+	p pooler,
+	hostedTracker *hostedload.Tracker,
+	stats statsProvider,
+	opts ...Option,
+) *Server {
 	s := &Server{
 		mux:           http.NewServeMux(),
 		mu:            sync.RWMutex{},
@@ -160,9 +169,11 @@ func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCID
 		stats:         stats,
 		runs:          nil,
 	}
+
 	for _, opt := range opts {
 		opt(s)
 	}
+
 	s.mux.HandleFunc("/webhook", s.handleWebhook)
 	s.mux.HandleFunc("/capacity", s.handleCapacity)
 	s.mux.HandleFunc("/status", s.handleStatus)
@@ -170,11 +181,17 @@ func New(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCID
 	if len(webhookCIDRs) == 0 {
 		slog.Warn("webhook IP guard disabled: no CIDRs configured")
 	}
+
 	return s
 }
 
 // Reconfigure swaps the config dependent request state used by live handlers.
-func (s *Server) Reconfigure(webhookKey []byte, cfg *config.Config, capacityToken []byte, webhookCIDRs []*net.IPNet) {
+func (s *Server) Reconfigure(
+	webhookKey []byte,
+	cfg *config.Config,
+	capacityToken []byte,
+	webhookCIDRs []*net.IPNet,
+) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.webhookKey = append([]byte(nil), webhookKey...)
@@ -189,6 +206,7 @@ func (s *Server) Reconfigure(webhookKey []byte, cfg *config.Config, capacityToke
 func (s *Server) configSnapshot() serverConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
 	return serverConfig{
 		webhookKey:    s.webhookKey,
 		capacityToken: s.capacityToken,
@@ -210,40 +228,73 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
 	liveConfig := s.configSnapshot()
 	if !s.checkWebhookIP(w, r, liveConfig) {
 		return
 	}
+
 	slog.InfoContext(r.Context(), "webhook received")
 	body, ok := s.readVerifiedBody(w, r, liveConfig)
 	if !ok {
 		return
 	}
+
 	var payload webhookPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		slog.WarnContext(r.Context(), "webhook unmarshal failed", "err", err)
 		http.Error(w, "bad request", http.StatusBadRequest)
+
 		return
 	}
+
 	if r.Header.Get(githubEventHeader) == eventPullRequest {
 		s.handlePullRequestClose(w, r, payload)
 		return
 	}
+
 	switch payload.Action {
 	case webhookActionQueued:
 		s.dispatchJob(w, r, payload, liveConfig)
 	case webhookActionInProgress:
-		slog.DebugContext(r.Context(), "workflow job in progress", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "runner", payload.WorkflowJob.RunnerName, "runner_id", payload.WorkflowJob.RunnerID)
+		slog.DebugContext(
+			r.Context(),
+			"workflow job in progress",
+			"repo",
+			payload.Repository.FullName,
+			"run_id",
+			payload.WorkflowJob.RunID,
+			"runner",
+			payload.WorkflowJob.RunnerName,
+			"runner_id",
+			payload.WorkflowJob.RunnerID,
+		)
 		if hostedload.IsHostedMacOSJob(payload.WorkflowJob.Labels, liveConfig.cfg.Labels) {
 			s.hostedTracker.MarkInProgress(payload.WorkflowJob.ID)
 		}
+
 		w.WriteHeader(http.StatusNoContent)
 	case webhookActionCompleted:
-		slog.DebugContext(r.Context(), "workflow job completed", "repo", payload.Repository.FullName, "run_id", payload.WorkflowJob.RunID, "job_id", payload.WorkflowJob.ID, "status", payload.WorkflowJob.Status, "conclusion", payload.WorkflowJob.Conclusion)
+		slog.DebugContext(
+			r.Context(),
+			"workflow job completed",
+			"repo",
+			payload.Repository.FullName,
+			"run_id",
+			payload.WorkflowJob.RunID,
+			"job_id",
+			payload.WorkflowJob.ID,
+			"status",
+			payload.WorkflowJob.Status,
+			"conclusion",
+			payload.WorkflowJob.Conclusion,
+		)
 		s.hostedTracker.MarkCompleted(payload.WorkflowJob.ID)
-		if payload.WorkflowJob.Conclusion == "cancelled" || payload.WorkflowJob.Conclusion == "skipped" {
+		if payload.WorkflowJob.Conclusion == "cancelled" ||
+			payload.WorkflowJob.Conclusion == "skipped" {
 			s.pool.CancelRun(payload.WorkflowJob.ID)
 		}
+
 		w.WriteHeader(http.StatusNoContent)
 	case webhookActionClosed:
 		// A pull_request close is handled above via the event header and returns
@@ -263,24 +314,47 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 // commit's run on the default branch, which carries a different sha. The work is
 // best-effort: any failure is logged and the webhook still returns 204 so GitHub
 // does not retry a partial cancel.
-func (s *Server) handlePullRequestClose(w http.ResponseWriter, r *http.Request, payload webhookPayload) {
+func (s *Server) handlePullRequestClose(
+	w http.ResponseWriter,
+	r *http.Request,
+	payload webhookPayload,
+) {
 	ctx := r.Context()
 	if payload.Action != webhookActionClosed {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+
 	repo := payload.Repository.FullName
 	headSHA := payload.PullRequest.Head.SHA
 	if repo == "" || headSHA == "" {
-		slog.WarnContext(ctx, "pull_request closed webhook missing repo or head sha", "repo", repo, "pr", payload.PullRequest.Number)
+		slog.WarnContext(
+			ctx,
+			"pull_request closed webhook missing repo or head sha",
+			"repo",
+			repo,
+			"pr",
+			payload.PullRequest.Number,
+		)
 		w.WriteHeader(http.StatusNoContent)
+
 		return
 	}
+
 	if s.runs == nil {
-		slog.WarnContext(ctx, "pull_request closed but no run canceller wired; skipping", "repo", repo, "pr", payload.PullRequest.Number)
+		slog.WarnContext(
+			ctx,
+			"pull_request closed but no run canceller wired; skipping",
+			"repo",
+			repo,
+			"pr",
+			payload.PullRequest.Number,
+		)
 		w.WriteHeader(http.StatusNoContent)
+
 		return
 	}
+
 	// Ack immediately and cancel on a detached context, so a slow GitHub API
 	// sequence is not aborted when GitHub closes the webhook delivery at its
 	// deadline. Cancellation is idempotent, so a redelivered close is harmless.
@@ -290,7 +364,18 @@ func (s *Server) handlePullRequestClose(w http.ResponseWriter, r *http.Request, 
 	go func() {
 		defer func() {
 			if rec := recover(); rec != nil {
-				slog.ErrorContext(bg, "panic cancelling closed pull request runs", "err", fmt.Errorf("panic: %v", rec), "repo", repo, "pr", pr, "head_sha", headSHA)
+				slog.ErrorContext(
+					bg,
+					"panic cancelling closed pull request runs",
+					"err",
+					fmt.Errorf("panic: %v", rec),
+					"repo",
+					repo,
+					"pr",
+					pr,
+					"head_sha",
+					headSHA,
+				)
 			}
 		}()
 		s.cancelClosedPullRequestRuns(bg, repo, headSHA, pr)
@@ -307,51 +392,122 @@ func (s *Server) cancelClosedPullRequestRuns(ctx context.Context, repo, headSHA 
 	defer cancel()
 	cancelled, err := s.runs.CancelActiveRunsForHeadSHA(ctx, repo, headSHA)
 	if err != nil {
-		slog.WarnContext(ctx, "cancel in-flight runs for closed pull request failed", "err", err, "repo", repo, "pr", pr, "head_sha", headSHA, "cancelled", cancelled)
+		slog.WarnContext(
+			ctx,
+			"cancel in-flight runs for closed pull request failed",
+			"err",
+			err,
+			"repo",
+			repo,
+			"pr",
+			pr,
+			"head_sha",
+			headSHA,
+			"cancelled",
+			cancelled,
+		)
 		return
 	}
-	slog.InfoContext(ctx, "cancelled in-flight runs for closed pull request", "repo", repo, "pr", pr, "head_sha", headSHA, "cancelled", cancelled)
+
+	slog.InfoContext(
+		ctx,
+		"cancelled in-flight runs for closed pull request",
+		"repo",
+		repo,
+		"pr",
+		pr,
+		"head_sha",
+		headSHA,
+		"cancelled",
+		cancelled,
+	)
 }
 
-func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request, liveConfig serverConfig) ([]byte, bool) {
+func (s *Server) readVerifiedBody(
+	w http.ResponseWriter,
+	r *http.Request,
+	liveConfig serverConfig,
+) ([]byte, bool) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
 	if err != nil {
 		slog.WarnContext(r.Context(), "webhook body read error", "err", err)
 		http.Error(w, "read error", http.StatusBadRequest)
+
 		return nil, false
 	}
+
 	sig := r.Header.Get("X-Hub-Signature-256")
 	if !verifySignature(liveConfig.webhookKey, body, sig) {
 		slog.InfoContext(r.Context(), "webhook rejected", "reason", "bad signature")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+
 		return nil, false
 	}
+
 	return body, true
 }
 
-func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, payload webhookPayload, liveConfig serverConfig) {
+func (s *Server) dispatchJob(
+	w http.ResponseWriter,
+	r *http.Request,
+	payload webhookPayload,
+	liveConfig serverConfig,
+) {
 	ctx := r.Context()
 	repo := payload.Repository.FullName
 	if !hasLabel(liveConfig.cfg, payload.WorkflowJob.Labels) {
-		slog.InfoContext(ctx, "webhook ignored", "reason", "no matching label", "repo", repo, "labels", payload.WorkflowJob.Labels)
+		slog.InfoContext(
+			ctx,
+			"webhook ignored",
+			"reason",
+			"no matching label",
+			"repo",
+			repo,
+			"labels",
+			payload.WorkflowJob.Labels,
+		)
 		w.WriteHeader(http.StatusNoContent)
+
 		return
 	}
+
 	if _, resolved := liveConfig.cfg.ResolveImage("", ""); !resolved {
-		slog.WarnContext(ctx, "no default image configured; ignoring pool job", "repo", repo, "run_id", payload.WorkflowJob.RunID)
+		slog.WarnContext(
+			ctx,
+			"no default image configured; ignoring pool job",
+			"repo",
+			repo,
+			"run_id",
+			payload.WorkflowJob.RunID,
+		)
 		w.WriteHeader(http.StatusNoContent)
+
 		return
 	}
+
 	job := runnerpool.Job{
 		Repo:  repo,
 		JobID: payload.WorkflowJob.ID,
 		RunID: payload.WorkflowJob.RunID,
 	}
 	if err := s.pool.Enqueue(ctx, job); err != nil {
-		slog.WarnContext(ctx, "runner pool enqueue failed", "err", err, "repo", repo, "run_id", payload.WorkflowJob.RunID, "job_id", payload.WorkflowJob.ID)
+		slog.WarnContext(
+			ctx,
+			"runner pool enqueue failed",
+			"err",
+			err,
+			"repo",
+			repo,
+			"run_id",
+			payload.WorkflowJob.RunID,
+			"job_id",
+			payload.WorkflowJob.ID,
+		)
 		http.Error(w, "pool unavailable", http.StatusServiceUnavailable)
+
 		return
 	}
+
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -360,6 +516,7 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
 	// /capacity is intentionally public. It returns only a coarse availability
 	// boolean and takes no action, so any consumer can probe it with no per-repo
 	// secret, which lets swift-makefile route every consumer to the pool from one
@@ -384,6 +541,7 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, capacityResponse{Available: false, HostedFree: hostedFree})
 		return
 	}
+
 	writeJSON(w, capacityResponse{Available: s.pool.Ready(), HostedFree: hostedFree})
 }
 
@@ -392,14 +550,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
 	if !s.checkBearerToken(w, r) {
 		return
 	}
+
 	var resp statusResponse
 	resp.Snapshot, resp.Workers = s.pool.Status(r.Context())
 	if s.stats != nil {
 		resp.HostStats = s.stats.Latest()
 	}
+
 	writeJSON(w, resp)
 }
 
@@ -417,6 +578,7 @@ func hasLabel(cfg *config.Config, jobLabels []string) bool {
 			}
 		}
 	}
+
 	return false
 }
 
@@ -426,38 +588,50 @@ func (s *Server) checkBearerToken(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
+
 	const bearerPrefix = "Bearer "
 	auth := r.Header.Get("Authorization")
 	if len(auth) < len(bearerPrefix) || !strings.EqualFold(auth[:len(bearerPrefix)], bearerPrefix) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
+
 	provided := []byte(auth[len(bearerPrefix):])
 	if subtle.ConstantTimeCompare(provided, liveConfig.capacityToken) != 1 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
+
 	return true
 }
 
-func (s *Server) checkWebhookIP(w http.ResponseWriter, r *http.Request, liveConfig serverConfig) bool {
+func (s *Server) checkWebhookIP(
+	w http.ResponseWriter,
+	r *http.Request,
+	liveConfig serverConfig,
+) bool {
 	if len(liveConfig.webhookCIDRs) == 0 {
 		return true
 	}
+
 	ipStr := webhookClientIP(r)
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		slog.WarnContext(r.Context(), "webhook: unparseable client IP", "raw", ipStr)
 		http.Error(w, "forbidden", http.StatusForbidden)
+
 		return false
 	}
+
 	for _, cidr := range liveConfig.webhookCIDRs {
 		if cidr.Contains(ip) {
 			return true
 		}
 	}
+
 	slog.WarnContext(r.Context(), "webhook: client IP not in allowlist", "ip", ipStr)
 	http.Error(w, "forbidden", http.StatusForbidden)
+
 	return false
 }
 
@@ -465,13 +639,16 @@ func webhookClientIP(r *http.Request) string {
 	if ip := r.Header.Get("Cf-Connecting-Ip"); ip != "" {
 		return ip
 	}
+
 	if ip := r.Header.Get("True-Client-Ip"); ip != "" {
 		return ip
 	}
+
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
+
 	return host
 }
 
@@ -484,8 +661,10 @@ func writeJSON[T jsonResponse](w http.ResponseWriter, payload T) {
 	if err != nil {
 		slog.Error("marshal failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
+
 		return
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
@@ -496,12 +675,15 @@ func verifySignature(secret []byte, body []byte, sigHeader string) bool {
 	if !strings.HasPrefix(sigHeader, prefix) {
 		return false
 	}
+
 	sig, err := hex.DecodeString(sigHeader[len(prefix):])
 	if err != nil {
 		return false
 	}
+
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write(body)
 	expected := mac.Sum(nil)
+
 	return hmac.Equal(expected, sig)
 }

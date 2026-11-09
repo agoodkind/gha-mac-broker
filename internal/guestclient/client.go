@@ -36,6 +36,7 @@ func New(ctx context.Context, dial guesttransport.GuestDialer, token string) *Cl
 	)
 	rpcClient := connect.NewClient(httpTransport, transport.Interceptor())
 	service := guestprotoconnect.NewGuestAgentServiceClient(rpcClient)
+
 	return &Client{service: service}
 }
 
@@ -49,6 +50,7 @@ func (client *Client) Hello(ctx context.Context) (*guestproto.HelloResponse, err
 		slog.WarnContext(ctx, "guestclient hello failed", "err", err)
 		return nil, fmt.Errorf("guestclient hello: %w", err)
 	}
+
 	return response, nil
 }
 
@@ -62,6 +64,7 @@ func (client *Client) RunJob(
 		slog.WarnContext(ctx, "guestclient run job failed", "err", err)
 		return nil, fmt.Errorf("guestclient run job: %w", err)
 	}
+
 	return response, nil
 }
 
@@ -80,8 +83,12 @@ func (client *Client) JobStatus(
 	)
 	if err != nil {
 		slog.WarnContext(ctx, "guestclient job status failed", "err", err)
-		return guestprotoconnect.GuestAgentServiceJobStatusClientStream{}, fmt.Errorf("guestclient job status: %w", err)
+		return guestprotoconnect.GuestAgentServiceJobStatusClientStream{}, fmt.Errorf(
+			"guestclient job status: %w",
+			err,
+		)
 	}
+
 	return stream, nil
 }
 
@@ -95,6 +102,7 @@ func (client *Client) Reattach(ctx context.Context) (*guestproto.ReattachRespons
 		slog.WarnContext(ctx, "guestclient reattach failed", "err", err)
 		return nil, fmt.Errorf("guestclient reattach: %w", err)
 	}
+
 	return response, nil
 }
 
@@ -108,6 +116,7 @@ func (client *Client) Drain(ctx context.Context) (*guestproto.DrainResponse, err
 		slog.WarnContext(ctx, "guestclient drain failed", "err", err)
 		return nil, fmt.Errorf("guestclient drain: %w", err)
 	}
+
 	return response, nil
 }
 
@@ -121,5 +130,6 @@ func (client *Client) CancelJob(ctx context.Context, executionID string) error {
 		slog.WarnContext(ctx, "guestclient cancel job failed", "err", err)
 		return fmt.Errorf("guestclient cancel job: %w", err)
 	}
+
 	return nil
 }

@@ -31,6 +31,7 @@ func fixtureRunnerTarballBytes(t *testing.T) []byte {
 		if err := tarWriter.WriteHeader(header); err != nil {
 			t.Fatalf("write header %s: %v", name, err)
 		}
+
 		if _, err := tarWriter.Write([]byte(body)); err != nil {
 			t.Fatalf("write body %s: %v", name, err)
 		}
@@ -39,18 +40,22 @@ func fixtureRunnerTarballBytes(t *testing.T) []byte {
 	if err := tarWriter.WriteHeader(dirHeader); err != nil {
 		t.Fatalf("write dir header: %v", err)
 	}
+
 	writeFile("run.sh", 0o755, "#!/bin/sh\necho runner\n")
 	writeFile("bin/Runner.Listener", 0o755, "listener")
 	symlinkHeader := &tar.Header{Name: "run", Linkname: "run.sh", Typeflag: tar.TypeSymlink}
 	if err := tarWriter.WriteHeader(symlinkHeader); err != nil {
 		t.Fatalf("write symlink header: %v", err)
 	}
+
 	if err := tarWriter.Close(); err != nil {
 		t.Fatalf("close tar: %v", err)
 	}
+
 	if err := gzipWriter.Close(); err != nil {
 		t.Fatalf("close gzip: %v", err)
 	}
+
 	return buffer.Bytes()
 }
 
@@ -79,16 +84,20 @@ func TestExtractRunnerTarballLandsExecutableEntrypoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat run.sh: %v", err)
 	}
+
 	if info.Mode().Perm()&0o100 == 0 {
 		t.Fatalf("run.sh mode = %v, want owner-executable", info.Mode().Perm())
 	}
+
 	if _, err := os.Stat(filepath.Join(destDir, "bin", "Runner.Listener")); err != nil {
 		t.Fatalf("nested runner file missing: %v", err)
 	}
+
 	linkTarget, err := os.Readlink(filepath.Join(destDir, "run"))
 	if err != nil {
 		t.Fatalf("readlink run: %v", err)
 	}
+
 	if linkTarget != "run.sh" {
 		t.Fatalf("symlink target = %q, want run.sh", linkTarget)
 	}
@@ -103,9 +112,11 @@ func TestExtractRunnerTarballRejectsPathEscape(t *testing.T) {
 	if err := tarWriter.WriteHeader(header); err != nil {
 		t.Fatalf("write header: %v", err)
 	}
+
 	if _, err := tarWriter.Write([]byte("bad")); err != nil {
 		t.Fatalf("write body: %v", err)
 	}
+
 	_ = tarWriter.Close()
 	_ = gzipWriter.Close()
 
@@ -119,16 +130,24 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 	root := t.TempDir()
 	runnerDir := filepath.Join(root, "home", "actions-runner")
 	watchdogScript := filepath.Join(root, "usr", "local", "bin", "gha-broker-watchdog.sh")
-	watchdogPlist := filepath.Join(root, "Library", "LaunchDaemons", "io.goodkind.gha-broker-watchdog.plist")
+	watchdogPlist := filepath.Join(
+		root,
+		"Library",
+		"LaunchDaemons",
+		"io.goodkind.gha-broker-watchdog.plist",
+	)
 	if err := os.MkdirAll(filepath.Dir(watchdogScript), 0o755); err != nil {
 		t.Fatalf("mkdir watchdog script dir: %v", err)
 	}
+
 	if err := os.MkdirAll(filepath.Dir(watchdogPlist), 0o755); err != nil {
 		t.Fatalf("mkdir watchdog plist dir: %v", err)
 	}
+
 	if err := os.WriteFile(watchdogScript, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("seed watchdog script: %v", err)
 	}
+
 	if err := os.WriteFile(watchdogPlist, []byte("<plist/>"), 0o644); err != nil {
 		t.Fatalf("seed watchdog plist: %v", err)
 	}
@@ -139,9 +158,21 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 	}
 
 	paths := provisionPaths{
-		binaryDest:        filepath.Join(root, "usr", "local", "bin", "gha-mac-broker"),
-		plistDest:         filepath.Join(root, "Library", "LaunchDaemons", "io.goodkind.gha-mac-broker-guest.plist"),
-		fingerprintDest:   filepath.Join(root, "usr", "local", "share", "gha-guest", "golden.fingerprint"),
+		binaryDest: filepath.Join(root, "usr", "local", "bin", "gha-mac-broker"),
+		plistDest: filepath.Join(
+			root,
+			"Library",
+			"LaunchDaemons",
+			"io.goodkind.gha-mac-broker-guest.plist",
+		),
+		fingerprintDest: filepath.Join(
+			root,
+			"usr",
+			"local",
+			"share",
+			"gha-guest",
+			"golden.fingerprint",
+		),
 		runnerReceiptDest: filepath.Join(root, "usr", "local", "share", "gha-guest", "runner.json"),
 		watchdogScript:    watchdogScript,
 		watchdogPlist:     watchdogPlist,
@@ -164,6 +195,7 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 			if path != paths.binaryDest {
 				t.Fatalf("sign called on %q, want %q", path, paths.binaryDest)
 			}
+
 			return nil
 		},
 	}
@@ -175,20 +207,29 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(runnerDir, "run.sh")); err != nil {
 		t.Fatalf("runner run.sh missing: %v", err)
 	}
+
 	bakedBinary, err := os.ReadFile(paths.binaryDest)
 	if err != nil {
 		t.Fatalf("read baked binary: %v", err)
 	}
+
 	if string(bakedBinary) != "guest broker binary" {
 		t.Fatalf("baked binary = %q, want source content", string(bakedBinary))
 	}
+
 	binaryInfo, err := os.Stat(paths.binaryDest)
 	if err != nil {
 		t.Fatalf("stat baked binary: %v", err)
 	}
+
 	if binaryInfo.Mode().Perm() != bakedBinaryMode {
-		t.Fatalf("baked binary mode = %v, want %v", binaryInfo.Mode().Perm(), os.FileMode(bakedBinaryMode))
+		t.Fatalf(
+			"baked binary mode = %v, want %v",
+			binaryInfo.Mode().Perm(),
+			os.FileMode(bakedBinaryMode),
+		)
 	}
+
 	if signed != 1 {
 		t.Fatalf("sign call count = %d, want 1", signed)
 	}
@@ -197,6 +238,7 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read baked plist: %v", err)
 	}
+
 	if !bytes.Equal(plist, golden.GuestAgentPlist()) {
 		t.Fatal("baked plist does not match embedded guest agent plist")
 	}
@@ -205,24 +247,33 @@ func TestProvisionGoldenWritesBakedFilesAndRemovesWatchdog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read fingerprint: %v", err)
 	}
+
 	if string(fingerprint) != "deadbeef\n" {
 		t.Fatalf("fingerprint file = %q, want %q", string(fingerprint), "deadbeef\n")
 	}
+
 	receiptBytes, err := os.ReadFile(paths.runnerReceiptDest)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	var receipt golden.RunnerReceipt
 	if err := json.Unmarshal(receiptBytes, &receipt); err != nil {
 		t.Fatal(err)
 	}
+
 	if receipt.Version != req.runnerVersion || receipt.TarballDigest != sha256Hex(tarballBytes) {
-		t.Fatalf("runner receipt = %+v; want version %s and verified archive digest", receipt, req.runnerVersion)
+		t.Fatalf(
+			"runner receipt = %+v; want version %s and verified archive digest",
+			receipt,
+			req.runnerVersion,
+		)
 	}
 
 	if _, err := os.Stat(watchdogScript); !os.IsNotExist(err) {
 		t.Fatalf("watchdog script still present, stat err = %v", err)
 	}
+
 	if _, err := os.Stat(watchdogPlist); !os.IsNotExist(err) {
 		t.Fatalf("watchdog plist still present, stat err = %v", err)
 	}
@@ -242,13 +293,16 @@ func TestExtractRunnerTarballRejectsEscapingSymlink(t *testing.T) {
 	if err := tarWriter.WriteHeader(symlink); err != nil {
 		t.Fatalf("write symlink header: %v", err)
 	}
+
 	through := &tar.Header{Name: "evil/x.plist", Mode: 0o644, Size: 3, Typeflag: tar.TypeReg}
 	if err := tarWriter.WriteHeader(through); err != nil {
 		t.Fatalf("write regular header: %v", err)
 	}
+
 	if _, err := tarWriter.Write([]byte("bad")); err != nil {
 		t.Fatalf("write body: %v", err)
 	}
+
 	_ = tarWriter.Close()
 	_ = gzipWriter.Close()
 
@@ -256,9 +310,11 @@ func TestExtractRunnerTarballRejectsEscapingSymlink(t *testing.T) {
 	if err == nil {
 		t.Fatal("extractRunnerTarball accepted an escaping symlink, want rejection")
 	}
+
 	if _, statErr := os.Lstat(filepath.Join(destDir, "evil")); !os.IsNotExist(statErr) {
 		t.Fatalf("escaping symlink was created, stat err = %v", statErr)
 	}
+
 	if _, statErr := os.Stat(outsideFile); !os.IsNotExist(statErr) {
 		t.Fatalf("file written outside runner dir, stat err = %v", statErr)
 	}
@@ -271,13 +327,23 @@ func TestInstallRunnerRejectsDigestMismatch(t *testing.T) {
 		return io.NopCloser(bytes.NewReader(tarballBytes)), nil
 	}
 
-	err := installRunner(context.Background(), download, "2.335.1", "0000expecteddoesnotmatch", runnerDir)
+	err := installRunner(
+		context.Background(),
+		download,
+		"2.335.1",
+		"0000expecteddoesnotmatch",
+		runnerDir,
+	)
 	if err == nil {
-		t.Fatal("installRunner accepted a runner tarball whose digest did not match, want rejection")
+		t.Fatal(
+			"installRunner accepted a runner tarball whose digest did not match, want rejection",
+		)
 	}
+
 	if !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("installRunner error = %q, want a digest mismatch message", err.Error())
 	}
+
 	if _, statErr := os.Stat(filepath.Join(runnerDir, "run.sh")); !os.IsNotExist(statErr) {
 		t.Fatalf("runner was extracted despite digest mismatch, stat err = %v", statErr)
 	}
@@ -286,17 +352,24 @@ func TestInstallRunnerRejectsDigestMismatch(t *testing.T) {
 func TestProvisionGoldenDoesNotWriteReceiptForUnverifiedRunner(t *testing.T) {
 	root := t.TempDir()
 	receiptPath := filepath.Join(root, "runner.json")
-	err := provisionGolden(t.Context(), provisionRequest{
-		runnerVersion: "2.335.1",
-		runnerDigest:  strings.Repeat("0", 64),
-		paths:         provisionPaths{runnerDir: filepath.Join(root, "actions-runner"), runnerReceiptDest: receiptPath},
-		download: func(context.Context, string) (io.ReadCloser, error) {
-			return fixtureRunnerTarball(t), nil
+	err := provisionGolden(
+		t.Context(),
+		provisionRequest{
+			runnerVersion: "2.335.1",
+			runnerDigest:  strings.Repeat("0", 64),
+			paths: provisionPaths{
+				runnerDir:         filepath.Join(root, "actions-runner"),
+				runnerReceiptDest: receiptPath,
+			},
+			download: func(context.Context, string) (io.ReadCloser, error) {
+				return fixtureRunnerTarball(t), nil
+			},
 		},
-	})
+	)
 	if err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("unverified tarball result = %v; want digest mismatch", err)
 	}
+
 	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
 		t.Fatalf("unverified runner wrote receipt: %v", err)
 	}

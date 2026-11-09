@@ -44,6 +44,7 @@ import (
 	"goodkind.io/gha-mac-broker/internal/fastpull"
 	"goodkind.io/gha-mac-broker/internal/ghapp"
 	"goodkind.io/gha-mac-broker/internal/golden"
+	"goodkind.io/gha-mac-broker/internal/help"
 	"goodkind.io/gha-mac-broker/internal/hostedload"
 	"goodkind.io/gha-mac-broker/internal/install"
 	"goodkind.io/gha-mac-broker/internal/runnerpool"
@@ -110,6 +111,7 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+
 	args := os.Args[2:]
 
 	var err error
@@ -146,6 +148,7 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+
 	if err != nil {
 		slog.ErrorContext(ctx, "command failed", "err", err)
 		os.Exit(1)
@@ -153,7 +156,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gha-mac-broker <version|jitconfig|bind|serve|status|build-golden|install|uninstall|update|deploy|guest-agent|golden-provision|guest-dial|guest-write-slots> [flags]")
+	writeUserLine(os.Stderr, help.Usage)
 }
 
 func writeUserLine(writer io.Writer, line string) {
@@ -164,7 +167,12 @@ func runStatus(ctx context.Context, args []string) error {
 	return runStatusWithWriters(ctx, args, os.Stdout, os.Stderr)
 }
 
-func runStatusWithWriters(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+func runStatusWithWriters(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	stderr io.Writer,
+) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to broker config TOML (default: XDG path)")
@@ -172,33 +180,41 @@ func runStatusWithWriters(ctx context.Context, args []string, stdout io.Writer, 
 		slog.ErrorContext(ctx, "status flag parse failed", "err", err)
 		return fmt.Errorf("status flags: %w", err)
 	}
+
 	if *configPath == "" {
 		*configPath = config.DefaultConfigPath()
 	}
+
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return fmt.Errorf("status: load config: %w", err)
 	}
+
 	capacityToken, err := cfg.ReadCapacityToken()
 	if err != nil {
 		return fmt.Errorf("status: read capacity token: %w", err)
 	}
+
 	if len(capacityToken) == 0 {
 		return fmt.Errorf("status: capacity token is not configured")
 	}
+
 	statusURL, err := statusEndpoint(ctx, cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
 	if err != nil {
 		return fmt.Errorf("status: build request: %w", err)
 	}
+
 	req.Header.Set("Authorization", "Bearer "+string(capacityToken))
 	resp, err := statusHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("status: request: %w", err)
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -206,20 +222,32 @@ func runStatusWithWriters(ctx context.Context, args []string, stdout io.Writer, 
 		if message == "" {
 			return fmt.Errorf("status: server returned %d", resp.StatusCode)
 		}
+
 		return fmt.Errorf("status: server returned %d: %s", resp.StatusCode, message)
 	}
+
 	if _, err := io.Copy(stdout, resp.Body); err != nil {
 		return fmt.Errorf("status: copy response: %w", err)
 	}
+
 	return nil
 }
 
 func statusEndpoint(ctx context.Context, listenAddr string) (string, error) {
 	_, port, err := net.SplitHostPort(listenAddr)
 	if err != nil {
-		slog.ErrorContext(ctx, "status listen address parse failed", "err", err, "listen_addr", listenAddr)
+		slog.ErrorContext(
+			ctx,
+			"status listen address parse failed",
+			"err",
+			err,
+			"listen_addr",
+			listenAddr,
+		)
+
 		return "", fmt.Errorf("status: parse listen_addr %q: %w", listenAddr, err)
 	}
+
 	// Dial localhost so the CLI reaches the daemon whether it bound IPv6 or IPv4
 	// loopback. On macOS localhost resolves to IPv6 first, matching the daemon's
 	// default ::1 bind.
@@ -230,11 +258,17 @@ func runUpdate(ctx context.Context, args []string) error {
 	return runUpdateWithWriters(ctx, args, os.Stdout, os.Stderr)
 }
 
-func runUpdateWithWriters(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+func runUpdateWithWriters(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	stderr io.Writer,
+) error {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "usage: gha-mac-broker update check|apply|status")
 		return fmt.Errorf("update requires check, apply, or status")
 	}
+
 	switch updateCommandName(args[0]) {
 	case updateCommandCheck:
 		return runUpdateCheck(ctx, args[1:], stdout, stderr)
@@ -255,17 +289,23 @@ func runUpdateCheck(ctx context.Context, args []string, stdout io.Writer, stderr
 		slog.ErrorContext(ctx, "update check flag parse failed", "err", err)
 		return fmt.Errorf("update check flags: %w", err)
 	}
-	result, err := checkUpdate(ctx, updateopts.Options(updateopts.Overrides{
-		Client:      nil,
-		InstallPath: "",
-		DryRun:      false,
-		Log:         nil,
-	}))
+
+	result, err := checkUpdate(
+		ctx,
+		updateopts.Options(updateopts.Overrides{
+			Client:      nil,
+			InstallPath: "",
+			DryRun:      false,
+			Log:         nil,
+		}),
+	)
 	if err != nil {
 		slog.ErrorContext(ctx, "update check failed", "err", err)
 		return fmt.Errorf("update check: %w", err)
 	}
+
 	printUpdateCheckResult(stdout, result)
+
 	return nil
 }
 
@@ -277,38 +317,49 @@ func runUpdateApply(ctx context.Context, args []string, stdout io.Writer, stderr
 		slog.ErrorContext(ctx, "update apply flag parse failed", "err", err)
 		return fmt.Errorf("update apply flags: %w", err)
 	}
-	result, err := applyUpdate(ctx, updateopts.Options(updateopts.Overrides{
-		Client:      nil,
-		InstallPath: "",
-		DryRun:      *dryRun,
-		Log:         nil,
-	}))
+
+	result, err := applyUpdate(
+		ctx,
+		updateopts.Options(updateopts.Overrides{
+			Client:      nil,
+			InstallPath: "",
+			DryRun:      *dryRun,
+			Log:         nil,
+		}),
+	)
 	if err != nil {
 		slog.ErrorContext(ctx, "update apply failed", "err", err)
 		return fmt.Errorf("update apply: %w", err)
 	}
+
 	if !result.UpdateAvailable {
 		writeUserLine(stdout, "gha-mac-broker: already current")
 		return nil
 	}
+
 	if result.DryRun {
 		writeUserLine(stdout, "gha-mac-broker: update apply dry run ok")
 		return nil
 	}
+
 	if !result.Applied {
 		writeUserLine(stdout, "gha-mac-broker: update available but not applied")
 		return nil
 	}
+
 	restarted, err := reloadOrRestart(ctx)
 	if err != nil {
 		slog.ErrorContext(ctx, "update apply service reconcile failed", "err", err)
 		return fmt.Errorf("update apply restart: %w", err)
 	}
+
 	if restarted {
 		writeUserLine(stdout, "gha-mac-broker: update applied and service restarted")
 		return nil
 	}
+
 	writeUserLine(stdout, "gha-mac-broker: update applied; service not installed")
+
 	return nil
 }
 
@@ -319,6 +370,7 @@ func runUpdateStatus(ctx context.Context, args []string, stdout io.Writer, stder
 		slog.ErrorContext(ctx, "update status flag parse failed", "err", err)
 		return fmt.Errorf("update status flags: %w", err)
 	}
+
 	options := updateopts.Options(updateopts.Overrides{
 		Client:      nil,
 		InstallPath: "",
@@ -330,27 +382,34 @@ func runUpdateStatus(ctx context.Context, args []string, stdout io.Writer, stder
 		slog.ErrorContext(ctx, "update status load failed", "err", err, "path", options.StatePath)
 		return fmt.Errorf("update status: %w", err)
 	}
+
 	writeUserLine(stdout, "current version:   "+options.Config.CurrentVersion)
 	writeUserLine(stdout, "current commit:    "+options.Config.CurrentCommit)
 	writeUserLine(stdout, "current buildHash: "+options.Config.CurrentBuildHash)
 	if !state.LastCheckAt.IsZero() {
 		writeUserLine(stdout, "last check:        "+state.LastCheckAt.Format(time.RFC3339))
 	}
+
 	if !state.NextCheckAt.IsZero() {
 		writeUserLine(stdout, "next check:        "+state.NextCheckAt.Format(time.RFC3339))
 	}
+
 	if state.LatestTag != "" {
 		writeUserLine(stdout, "latest tag:        "+state.LatestTag)
 	}
+
 	if state.AppliedTag != "" {
 		writeUserLine(stdout, "applied tag:       "+state.AppliedTag)
 	}
+
 	if state.LastResult != "" {
 		writeUserLine(stdout, "last result:       "+state.LastResult)
 	}
+
 	if state.LastError != "" {
 		writeUserLine(stdout, "last error:        "+state.LastError)
 	}
+
 	return nil
 }
 
@@ -362,6 +421,7 @@ func printUpdateCheckResult(stdout io.Writer, result selfupdate.CheckResult) {
 		writeUserLine(stdout, "update available: yes")
 		return
 	}
+
 	writeUserLine(stdout, "update available: no")
 }
 
@@ -370,33 +430,44 @@ func printUpdateCheckResult(stdout io.Writer, result selfupdate.CheckResult) {
 func runInstall(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	configPath := fs.String("config", config.DefaultConfigPath(), "path to broker config TOML")
-	binPath := fs.String("bin", "", "path to the installed broker binary (default $HOME/.local/bin/gha-mac-broker)")
+	binPath := fs.String(
+		"bin",
+		"",
+		"path to the installed broker binary (default $HOME/.local/bin/gha-mac-broker)",
+	)
 	if err := fs.Parse(args); err != nil {
 		slog.ErrorContext(ctx, "install flag parse failed", "err", err)
 		return fmt.Errorf("install flags: %w", err)
 	}
+
 	if *binPath == "" {
 		defaultBinPath, err := defaultInstallBinPath(ctx)
 		if err != nil {
 			return err
 		}
+
 		*binPath = defaultBinPath
 	}
+
 	cfg, err := buildInstallConfig(ctx, *configPath, *binPath)
 	if err != nil {
 		return err
 	}
+
 	exe, err := currentExecutable()
 	if err != nil {
 		slog.ErrorContext(ctx, "resolve executable failed", "err", err)
 		return fmt.Errorf("install: resolve executable: %w", err)
 	}
+
 	if err := installRunningBinary(ctx, exe, cfg.BinPath); err != nil {
 		return err
 	}
+
 	if err := installBroker(ctx, cfg); err != nil {
 		return fmt.Errorf("run install: %w", err)
 	}
+
 	return nil
 }
 
@@ -408,18 +479,22 @@ func runUninstall(ctx context.Context, args []string) error {
 		slog.ErrorContext(ctx, "uninstall flag parse failed", "err", err)
 		return fmt.Errorf("uninstall flags: %w", err)
 	}
+
 	exe, err := currentExecutable()
 	if err != nil {
 		slog.ErrorContext(ctx, "resolve executable failed", "err", err)
 		return fmt.Errorf("uninstall: resolve executable: %w", err)
 	}
+
 	cfg, err := buildInstallConfig(ctx, *configPath, exe)
 	if err != nil {
 		return err
 	}
+
 	if err := install.Uninstall(ctx, cfg); err != nil {
 		return fmt.Errorf("run uninstall: %w", err)
 	}
+
 	return nil
 }
 
@@ -432,6 +507,7 @@ func buildInstallConfig(ctx context.Context, configPath, binPath string) (instal
 		slog.ErrorContext(ctx, "resolve home dir failed", "err", err)
 		return zero, fmt.Errorf("resolve home dir: %w", err)
 	}
+
 	return install.Config{
 		BinPath:    binPath,
 		Home:       home,
@@ -451,6 +527,7 @@ func defaultLogPath(home string) string {
 	if runtime.GOOS == "darwin" {
 		return filepath.Join(home, "Library", "Logs", "gha-mac-broker.log")
 	}
+
 	return filepath.Join(home, ".local", "state", "gha-mac-broker", "gha-mac-broker.log")
 }
 
@@ -460,10 +537,18 @@ func defaultLogPath(home string) string {
 func runBuildGolden(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("build-golden", flag.ExitOnError)
 	tartBin := fs.String("tart", "tart", "tart binary")
-	baseImage := fs.String("base-image", config.DefaultBaseImage, "Cirrus base image to clone (manual override; install reads tart.base_image from config)")
+	baseImage := fs.String(
+		"base-image",
+		config.DefaultBaseImage,
+		"Cirrus base image to clone (manual override; install reads tart.base_image from config)",
+	)
 	goldenName := fs.String("golden", "gha-golden", "golden image name to (re)build")
 	buildVM := fs.String("build-vm", "gha-golden-build", "scratch VM name used during the build")
-	runnerVersion := fs.String("runner-version", "", "actions/runner version to install (default: latest)")
+	runnerVersion := fs.String(
+		"runner-version",
+		"",
+		"actions/runner version to install (default: latest)",
+	)
 	if err := fs.Parse(args); err != nil {
 		slog.ErrorContext(ctx, "build-golden flag parse failed", "err", err)
 		return fmt.Errorf("build-golden flags: %w", err)
@@ -475,6 +560,7 @@ func runBuildGolden(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+
 		version = resolved
 	}
 
@@ -483,19 +569,26 @@ func runBuildGolden(ctx context.Context, args []string) error {
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("build-golden: load config %s: %w", config.DefaultConfigPath(), err)
 		}
+
 		cfg = config.Default()
 	}
+
 	builder := golden.New(tart.New(*tartBin), golden.WithBaseStager(fastPullStager(cfg)))
-	if err := builder.Build(ctx, golden.Options{
-		BaseImage:     *baseImage,
-		GoldenName:    *goldenName,
-		BuildVM:       *buildVM,
-		RunnerVersion: version,
-		BinaryPath:    "",
-	}); err != nil {
+	if err := builder.Build(
+		ctx,
+		golden.Options{
+			BaseImage:     *baseImage,
+			GoldenName:    *goldenName,
+			BuildVM:       *buildVM,
+			RunnerVersion: version,
+			BinaryPath:    "",
+		},
+	); err != nil {
 		return fmt.Errorf("build-golden: %w", err)
 	}
+
 	slog.InfoContext(ctx, "golden build complete", "golden", *goldenName)
+
 	return nil
 }
 
@@ -506,6 +599,7 @@ func fastPullStager(cfg *config.Config) golden.BaseStager {
 	if cfg.Tart.FastPull != nil && !*cfg.Tart.FastPull {
 		return nil
 	}
+
 	return fastpull.New(fastpull.Options{
 		Copier: skopeo.New("skopeo", cfg.Tart.FastPullParallel),
 		Dir:    cfg.Tart.FastPullDir,
@@ -521,26 +615,35 @@ type runnerRelease struct {
 // resolveRunnerVersion fetches the latest actions/runner release tag and returns
 // it without the leading "v".
 func resolveRunnerVersion(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/actions/runner/releases/latest", nil)
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		"https://api.github.com/repos/actions/runner/releases/latest",
+		nil,
+	)
 	if err != nil {
 		slog.ErrorContext(ctx, "build request failed", "err", err)
 		return "", fmt.Errorf("build-golden: build request: %w", err)
 	}
+
 	client := &http.Client{Timeout: httpTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		slog.ErrorContext(ctx, "resolve runner version request failed", "err", err)
 		return "", fmt.Errorf("build-golden: fetch latest runner: %w", err)
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("build-golden: latest runner status %d", resp.StatusCode)
 	}
+
 	var rel runnerRelease
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
 		slog.ErrorContext(ctx, "decode runner release failed", "err", err)
 		return "", fmt.Errorf("build-golden: decode runner release: %w", err)
 	}
+
 	return strings.TrimPrefix(rel.TagName, "v"), nil
 }
 
@@ -551,17 +654,20 @@ func loadDeps(ctx context.Context, configPath string) (*config.Config, *ghapp.Cl
 		slog.ErrorContext(ctx, "load config failed", "err", err)
 		return nil, nil, fmt.Errorf("load config: %w", err)
 	}
+
 	pemKey, err := cfg.ReadPrivateKey()
 	if err != nil {
 		slog.ErrorContext(ctx, "read private key failed", "err", err)
 		return nil, nil, fmt.Errorf("read private key: %w", err)
 	}
+
 	httpClient := &http.Client{Timeout: httpTimeout}
 	gh, err := ghapp.New(cfg.App.AppID, pemKey, ghapp.WithHTTPClient(httpClient))
 	if err != nil {
 		slog.ErrorContext(ctx, "init github app failed", "err", err)
 		return nil, nil, fmt.Errorf("init github app: %w", err)
 	}
+
 	return cfg, gh, nil
 }
 
@@ -578,12 +684,15 @@ func runJITConfig(ctx context.Context, args []string) error {
 		slog.ErrorContext(ctx, "jitconfig flag parse failed", "err", err)
 		return fmt.Errorf("jitconfig flags: %w", err)
 	}
+
 	if *configPath == "" {
 		*configPath = config.DefaultConfigPath()
 	}
+
 	if *repo == "" {
 		return fmt.Errorf("jitconfig requires -repo")
 	}
+
 	owner, repoName, ok := strings.Cut(*repo, "/")
 	if !ok {
 		return fmt.Errorf("repo must be owner/repo, got %q", *repo)
@@ -598,10 +707,12 @@ func runJITConfig(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("installation lookup: %w", err)
 	}
+
 	token, err := gh.InstallationToken(ctx, installationID, repoName)
 	if err != nil {
 		return fmt.Errorf("installation token: %w", err)
 	}
+
 	jit, err := gh.GenerateJITConfig(ctx, token, owner, repoName, *name, cfg.Labels)
 	if err != nil {
 		return fmt.Errorf("generate jitconfig: %w", err)
@@ -611,6 +722,7 @@ func runJITConfig(ctx context.Context, args []string) error {
 	fmt.Printf("runner:       %s (id %d)\n", jit.Runner.Name, jit.Runner.ID)
 	fmt.Printf("labels:       %s\n", strings.Join(cfg.Labels, ", "))
 	fmt.Printf("encoded_jit_config:\n%s\n", jit.EncodedJITConfig)
+
 	return nil
 }
 
@@ -626,9 +738,11 @@ func runBind(ctx context.Context, args []string) error {
 		slog.ErrorContext(ctx, "bind flag parse failed", "err", err)
 		return fmt.Errorf("bind flags: %w", err)
 	}
+
 	if *configPath == "" {
 		*configPath = config.DefaultConfigPath()
 	}
+
 	if *repo == "" {
 		return fmt.Errorf("bind requires -repo")
 	}
@@ -637,6 +751,7 @@ func runBind(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+
 	vm := tart.New(cfg.Tart.Binary)
 	binder := broker.New(cfg, gh, vm)
 
@@ -644,9 +759,11 @@ func runBind(ctx context.Context, args []string) error {
 	if bindID == "" {
 		bindID = strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
+
 	if err := binder.BindOnce(ctx, *repo, bindID); err != nil {
 		return fmt.Errorf("bind: %w", err)
 	}
+
 	return nil
 }
 
@@ -664,26 +781,50 @@ func deleteStaleRunners(ctx context.Context, cfg *config.Config, cleaner staleRu
 		slog.WarnContext(ctx, "installed repository list failed; continuing startup", "err", err)
 		return
 	}
+
 	for _, repo := range repos {
 		runners, err := cleaner.ListRunners(ctx, repo)
 		if err != nil {
-			slog.WarnContext(ctx, "stale runner list failed; continuing startup", "err", err, "repo", repo)
+			slog.WarnContext(
+				ctx,
+				"stale runner list failed; continuing startup",
+				"err",
+				err,
+				"repo",
+				repo,
+			)
 			continue
 		}
+
 		for _, runner := range runners {
 			if !strings.EqualFold(runner.Status, "offline") {
 				continue
 			}
+
 			if !strings.HasPrefix(runner.Name, runnerNamePrefix) {
 				continue
 			}
+
 			if err := cleaner.DeleteRunner(ctx, repo, runner.ID); err != nil {
-				slog.WarnContext(ctx, "stale runner delete failed; continuing startup", "err", err, "repo", repo, "runner", runner.Name, "runner_id", runner.ID)
+				slog.WarnContext(
+					ctx,
+					"stale runner delete failed; continuing startup",
+					"err",
+					err,
+					"repo",
+					repo,
+					"runner",
+					runner.Name,
+					"runner_id",
+					runner.ID,
+				)
 				continue
 			}
+
 			totalDeleted++
 		}
 	}
+
 	if totalDeleted > 0 {
 		slog.InfoContext(ctx, "stale offline runners deleted", "count", totalDeleted)
 	}
@@ -695,15 +836,31 @@ type runnerPoolBinder interface {
 	runnerpool.SlotProber
 }
 
-func newRunnerPool(ctx context.Context, cfg *config.Config, binder runnerPoolBinder, github runnerpool.RunnerLister) (*runnerpool.Pool, error) {
+func newRunnerPool(
+	ctx context.Context,
+	cfg *config.Config,
+	binder runnerPoolBinder,
+	github runnerpool.RunnerLister,
+) (*runnerpool.Pool, error) {
 	runToken, err := newRunToken(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return runnerpool.New(runnerPoolOptionsFromConfig(cfg, runToken, time.Now), binder, binder, github, binder), nil
+
+	return runnerpool.New(
+		runnerPoolOptionsFromConfig(cfg, runToken, time.Now),
+		binder,
+		binder,
+		github,
+		binder,
+	), nil
 }
 
-func runnerPoolOptionsFromConfig(cfg *config.Config, runToken string, now func() time.Time) runnerpool.Options {
+func runnerPoolOptionsFromConfig(
+	cfg *config.Config,
+	runToken string,
+	now func() time.Time,
+) runnerpool.Options {
 	return runnerpool.Options{
 		RunnerCount:    cfg.RunnerCount,
 		JobsPerVM:      cfg.JobsPerVM,
@@ -721,9 +878,18 @@ func runnerPoolOptionsFromConfig(cfg *config.Config, runToken string, now func()
 func configInitialModTime(ctx context.Context, path string) time.Time {
 	info, err := os.Stat(path)
 	if err != nil {
-		slog.WarnContext(ctx, "config watch initial stat failed; watcher will initialize on first poll", "err", err, "path", path)
+		slog.WarnContext(
+			ctx,
+			"config watch initial stat failed; watcher will initialize on first poll",
+			"err",
+			err,
+			"path",
+			path,
+		)
+
 		return time.Time{}
 	}
+
 	return info.ModTime()
 }
 
@@ -733,10 +899,17 @@ func newRunToken(ctx context.Context) (string, error) {
 		slog.ErrorContext(ctx, "generate run token entropy failed", "err", err)
 		return "", fmt.Errorf("serve: generate run token entropy: %w", err)
 	}
+
 	return time.Now().Format("060102T150405") + "-" + hex.EncodeToString(entropy[:]), nil
 }
 
-func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, cleaner staleRunnerCleaner, p *runnerpool.Pool) {
+func startServeLoops(
+	ctx context.Context,
+	stop func(),
+	cfg *config.Config,
+	cleaner staleRunnerCleaner,
+	p *runnerpool.Pool,
+) {
 	startUpdateSchedulerInBackground(ctx, stop, slog.Default())
 	deleteStaleRunners(ctx, cfg, cleaner)
 	p.Start(ctx)
@@ -751,19 +924,33 @@ func startServeLoops(ctx context.Context, stop func(), cfg *config.Config, clean
 const hostedLoadReconcileInterval = 5 * time.Minute
 
 type hostedJobLister interface {
-	ListInProgressHostedMacOSJobs(ctx context.Context, poolLabels []string) (map[int64]struct{}, error)
+	ListInProgressHostedMacOSJobs(
+		ctx context.Context,
+		poolLabels []string,
+	) (map[int64]struct{}, error)
 }
 
-func startHostedLoadReconcile(ctx context.Context, lister hostedJobLister, tracker *hostedload.Tracker, poolLabels []string) {
+func startHostedLoadReconcile(
+	ctx context.Context,
+	lister hostedJobLister,
+	tracker *hostedload.Tracker,
+	poolLabels []string,
+) {
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				slog.ErrorContext(ctx, "hosted load reconcile goroutine panic recovered", "err", recovered)
+				slog.ErrorContext(
+					ctx,
+					"hosted load reconcile goroutine panic recovered",
+					"err",
+					recovered,
+				)
 			}
 		}()
 		reconcileHostedLoadOnce(ctx, lister, tracker, poolLabels)
 		ticker := time.NewTicker(hostedLoadReconcileInterval)
 		defer ticker.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -775,12 +962,18 @@ func startHostedLoadReconcile(ctx context.Context, lister hostedJobLister, track
 	}()
 }
 
-func reconcileHostedLoadOnce(ctx context.Context, lister hostedJobLister, tracker *hostedload.Tracker, poolLabels []string) {
+func reconcileHostedLoadOnce(
+	ctx context.Context,
+	lister hostedJobLister,
+	tracker *hostedload.Tracker,
+	poolLabels []string,
+) {
 	jobs, err := lister.ListInProgressHostedMacOSJobs(ctx, poolLabels)
 	if err != nil {
 		slog.WarnContext(ctx, "hosted load reconcile failed; keeping live counter", "err", err)
 		return
 	}
+
 	tracker.Reconcile(jobs)
 	slog.DebugContext(ctx, "hosted load reconciled", "in_progress_hosted_macos", len(jobs))
 }
@@ -789,7 +982,12 @@ func startUpdateSchedulerInBackground(ctx context.Context, stop func(), log *slo
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				log.ErrorContext(ctx, "update scheduler goroutine panic recovered", "err", recovered)
+				log.ErrorContext(
+					ctx,
+					"update scheduler goroutine panic recovered",
+					"err",
+					recovered,
+				)
 			}
 		}()
 		startUpdateScheduler(ctx, stop, log)
@@ -800,22 +998,26 @@ func startUpdateScheduler(ctx context.Context, stop func(), log *slog.Logger) {
 	if stop == nil {
 		return
 	}
-	runSelfUpdateScheduler(ctx, selfupdate.SchedulerHooks{
-		Enabled: func() bool {
-			return true
+
+	runSelfUpdateScheduler(
+		ctx,
+		selfupdate.SchedulerHooks{
+			Enabled: func() bool {
+				return true
+			},
+			Mode: func() string {
+				return selfupdate.ModeApply
+			},
+			Options: func() selfupdate.Options {
+				return updateopts.Options(updateopts.Overrides{
+					Client:      nil,
+					InstallPath: "",
+					DryRun:      false,
+					Log:         log,
+				})
+			},
+			StopForRelaunch: stop,
+			Log:             log,
 		},
-		Mode: func() string {
-			return selfupdate.ModeApply
-		},
-		Options: func() selfupdate.Options {
-			return updateopts.Options(updateopts.Overrides{
-				Client:      nil,
-				InstallPath: "",
-				DryRun:      false,
-				Log:         log,
-			})
-		},
-		StopForRelaunch: stop,
-		Log:             log,
-	})
+	)
 }

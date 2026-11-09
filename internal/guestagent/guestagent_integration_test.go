@@ -49,11 +49,7 @@ func TestJobStatusReconnectDoesNotCancelExecution(t *testing.T) {
 		waitForServer(t, serverDone)
 	})
 
-	firstClient := guestclient.New(
-		ctx,
-		tcpDialer(listener.Addr().String()),
-		testBootToken,
-	)
+	firstClient := guestclient.New(ctx, tcpDialer(listener.Addr().String()), testBootToken)
 	hello, err := firstClient.Hello(ctx)
 	if err != nil {
 		t.Fatalf("Hello: %v", err)
@@ -70,23 +66,30 @@ func TestJobStatusReconnectDoesNotCancelExecution(t *testing.T) {
 		markerCommand,
 		markerPath,
 	)
-	runResponse, err := firstClient.RunJob(ctx, &guestproto.RunJobRequest{
-		ExecutionId: executionID,
-		Slot:        0,
-		JitConfig:   script,
-		Env:         map[string]string{"PHASE0_ENV": "expected"},
-		Meta: &guestproto.JobMeta{
-			Repo:       "owner/repo",
-			JobId:      42,
-			RunId:      99,
-			RunnerName: "phase0-runner",
+	runResponse, err := firstClient.RunJob(
+		ctx,
+		&guestproto.RunJobRequest{
+			ExecutionId: executionID,
+			Slot:        0,
+			JitConfig:   script,
+			Env:         map[string]string{"PHASE0_ENV": "expected"},
+			Meta: &guestproto.JobMeta{
+				Repo:       "owner/repo",
+				JobId:      42,
+				RunId:      99,
+				RunnerName: "phase0-runner",
+			},
 		},
-	})
+	)
 	if err != nil {
 		t.Fatalf("RunJob: %v", err)
 	}
 	if runResponse.GetOutcome() != guestproto.RunJobResponse_ACCEPTED {
-		t.Fatalf("RunJob outcome = %v, want %v", runResponse.GetOutcome(), guestproto.RunJobResponse_ACCEPTED)
+		t.Fatalf(
+			"RunJob outcome = %v, want %v",
+			runResponse.GetOutcome(),
+			guestproto.RunJobResponse_ACCEPTED,
+		)
 	}
 
 	streamContext, cancelStream := context.WithCancel(ctx)
@@ -98,11 +101,7 @@ func TestJobStatusReconnectDoesNotCancelExecution(t *testing.T) {
 	cursor := firstEvents[len(firstEvents)-1].GetSequence()
 	cancelStream()
 
-	secondClient := guestclient.New(
-		ctx,
-		tcpDialer(listener.Addr().String()),
-		testBootToken,
-	)
+	secondClient := guestclient.New(ctx, tcpDialer(listener.Addr().String()), testBootToken)
 	secondStream, err := secondClient.JobStatus(ctx, executionID, cursor)
 	if err != nil {
 		t.Fatalf("JobStatus resumed: %v", err)
@@ -111,14 +110,22 @@ func TestJobStatusReconnectDoesNotCancelExecution(t *testing.T) {
 
 	assertContiguousProtoSequences(t, resumedEvents, cursor+1)
 	if resumedEvents[0].GetSequence() <= cursor {
-		t.Fatalf("first resumed sequence = %d, want sequence after %d", resumedEvents[0].GetSequence(), cursor)
+		t.Fatalf(
+			"first resumed sequence = %d, want sequence after %d",
+			resumedEvents[0].GetSequence(),
+			cursor,
+		)
 	}
 	if !containsProtoLog(resumedEvents, "line-2") || !containsProtoLog(resumedEvents, "line-3") {
 		t.Fatalf("resumed logs = %q, want line-2 and line-3", joinedProtoLogs(resumedEvents))
 	}
 	result := terminalProtoResult(t, resumedEvents)
 	if result.GetExitCode() != 0 {
-		t.Fatalf("terminal exit code = %d, want 0; message = %q", result.GetExitCode(), result.GetMessage())
+		t.Fatalf(
+			"terminal exit code = %d, want 0; message = %q",
+			result.GetExitCode(),
+			result.GetMessage(),
+		)
 	}
 	if _, err := os.Stat(markerPath); err != nil {
 		t.Fatalf("child did not finish after client disconnect: %v", err)
@@ -136,7 +143,11 @@ func TestJobStatusReconnectDoesNotCancelExecution(t *testing.T) {
 		t.Fatalf("reattach execution_id = %q, want %q", state.GetExecutionId(), executionID)
 	}
 	if state.GetLastSequence() < resumedEvents[len(resumedEvents)-1].GetSequence() {
-		t.Fatalf("reattach last_sequence = %d, want at least %d", state.GetLastSequence(), resumedEvents[len(resumedEvents)-1].GetSequence())
+		t.Fatalf(
+			"reattach last_sequence = %d, want at least %d",
+			state.GetLastSequence(),
+			resumedEvents[len(resumedEvents)-1].GetSequence(),
+		)
 	}
 }
 
@@ -145,7 +156,10 @@ func TestJobStatusReconnectDoesNotCancelExecution(t *testing.T) {
 // GitHub runner. The production runner executor is exercised by runner_test.go.
 type scriptSpecBuilder struct{}
 
-func (scriptSpecBuilder) Build(_ context.Context, request guestagent.JobRequest) (guestexec.ExecSpec, error) {
+func (scriptSpecBuilder) Build(_ context.Context, request guestagent.JobRequest) (
+	guestexec.ExecSpec,
+	error,
+) {
 	return guestexec.ExecSpec{
 		ExecutionID: request.ExecutionID,
 		Slot:        request.Slot,
@@ -247,7 +261,13 @@ func assertContiguousProtoSequences(
 	for i, event := range events {
 		want := first + uint64(i)
 		if event.GetSequence() != want {
-			t.Fatalf("event %d sequence = %d, want %d; events = %v", i, event.GetSequence(), want, events)
+			t.Fatalf(
+				"event %d sequence = %d, want %d; events = %v",
+				i,
+				event.GetSequence(),
+				want,
+				events,
+			)
 		}
 	}
 }

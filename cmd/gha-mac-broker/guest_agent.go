@@ -58,7 +58,10 @@ func runGuestAgent(ctx context.Context, args []string) error {
 	// token the broker cached. The golden's baked launchd unit (KeepAlive, no env
 	// token) boots cleanly instead of crashlooping. The host reads the file over
 	// the tart-exec control channel and dials the guest agent with it.
-	token, err := guestsupervisor.EnsureBootToken(os.Getenv(guestAgentCredentialEnv), guestsupervisor.TokenPath)
+	token, err := guestsupervisor.EnsureBootToken(
+		os.Getenv(guestAgentCredentialEnv),
+		guestsupervisor.TokenPath,
+	)
 	if err != nil {
 		return fmt.Errorf("guest-agent resolve token: %w", err)
 	}
@@ -71,7 +74,12 @@ func runGuestAgent(ctx context.Context, args []string) error {
 	// The host seeds the pool's jobs_per_vm into the slot-count file at VM warm, so
 	// wait for it and serve that count for this guest's whole life. The -slots flag
 	// is only the fallback default for a dev run or a never-seeded VM.
-	slotCountValue := guestsupervisor.AwaitSlotCount(ctx, guestsupervisor.SlotCountPath, slotCountAwaitTimeout, uint32(*slotCount))
+	slotCountValue := guestsupervisor.AwaitSlotCount(
+		ctx,
+		guestsupervisor.SlotCountPath,
+		slotCountAwaitTimeout,
+		uint32(*slotCount),
+	)
 
 	resolvedListenAddr := *listenAddr
 	if resolvedListenAddr == "" {
@@ -83,19 +91,29 @@ func runGuestAgent(ctx context.Context, args []string) error {
 		return fmt.Errorf("guest-agent listen %q: %w", resolvedListenAddr, err)
 	}
 
-	handler := guestagent.NewHTTPHandler(nil, guestagent.Options{
-		SlotCount:         slotCountValue,
-		BootID:            "",
-		AgentBuild:        "",
-		GoldenFingerprint: readGoldenFingerprint(ctx),
-		ChildLauncher:     nil,
-		SpecBuilder:       nil,
-	})
+	handler := guestagent.NewHTTPHandler(
+		nil,
+		guestagent.Options{
+			SlotCount:         slotCountValue,
+			BootID:            "",
+			AgentBuild:        "",
+			GoldenFingerprint: readGoldenFingerprint(ctx),
+			ChildLauncher:     nil,
+			SpecBuilder:       nil,
+		},
+	)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	slog.InfoContext(ctx, "guest agent starting", "addr", listener.Addr().String(), "slot_count", slotCountValue)
+	slog.InfoContext(
+		ctx,
+		"guest agent starting",
+		"addr",
+		listener.Addr().String(),
+		"slot_count",
+		slotCountValue,
+	)
 	if err := guesttransport.Serve(ctx, listener, handler, token); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
@@ -118,7 +136,14 @@ func defaultGuestAgentListenAddr() string {
 func readGoldenFingerprint(ctx context.Context) string {
 	content, err := os.ReadFile(golden.FingerprintPath)
 	if err != nil {
-		slog.DebugContext(ctx, "golden fingerprint file absent; reporting empty", "path", golden.FingerprintPath, "err", err)
+		slog.DebugContext(
+			ctx,
+			"golden fingerprint file absent; reporting empty",
+			"path",
+			golden.FingerprintPath,
+			"err",
+			err,
+		)
 		return ""
 	}
 	return strings.TrimSpace(string(content))

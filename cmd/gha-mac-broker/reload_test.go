@@ -74,6 +74,7 @@ func TestConfigReloadWatcherKeepsCurrentConfigAfterInvalidReload(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("jobs_per_vm = 0\n"), 0o600); err != nil {
 		t.Fatalf("write invalid config: %v", err)
 	}
+
 	setReloadConfigModTime(t, configPath, invalidChange)
 	watcher.poll(context.Background())
 	watcher.poll(context.Background())
@@ -119,9 +120,11 @@ func TestConfigReloadWatcherDropsPendingReloadWithoutApplyCallback(t *testing.T)
 	if loadCount != 1 {
 		t.Fatalf("load count = %d, want 1", loadCount)
 	}
+
 	if !watcher.appliedModTime.Equal(changedModTime) {
 		t.Fatalf("applied mod time = %v, want %v", watcher.appliedModTime, changedModTime)
 	}
+
 	if watcher.hasPending {
 		t.Fatal("has pending = true, want false")
 	}
@@ -141,16 +144,19 @@ func TestConfigReloadWatcherPanicRecoveryUsesInjectedLogger(t *testing.T) {
 	records := make(chan slog.Record, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	startConfigReloadWatcher(ctx, configReloadWatcherOptions{
-		path:           configPath,
-		initialModTime: initialModTime,
-		interval:       time.Millisecond,
-		load:           config.Load,
-		apply: func(_ context.Context, _ *config.Config) error {
-			panic("reload apply failed")
+	startConfigReloadWatcher(
+		ctx,
+		configReloadWatcherOptions{
+			path:           configPath,
+			initialModTime: initialModTime,
+			interval:       time.Millisecond,
+			load:           config.Load,
+			apply: func(_ context.Context, _ *config.Config) error {
+				panic("reload apply failed")
+			},
+			log: slog.New(reloadTestLogHandler{records: records}),
 		},
-		log: slog.New(reloadTestLogHandler{records: records}),
-	})
+	)
 
 	select {
 	case record := <-records:
@@ -164,7 +170,8 @@ func TestConfigReloadWatcherPanicRecoveryUsesInjectedLogger(t *testing.T) {
 
 func writeReloadConfig(t *testing.T, path string, jobsPerVM int) {
 	t.Helper()
-	body := fmt.Sprintf(`
+	body := fmt.Sprintf(
+		`
 listen_addr = "[::1]:8080"
 runner_count = 1
 jobs_per_vm = %d
@@ -178,7 +185,13 @@ private_key_path = %q
 base_image = %q
 cache_dir = %q
 fast_pull_dir = %q
-`, jobsPerVM, filepath.Join(filepath.Dir(path), "key.pem"), config.DefaultBaseImage, filepath.Join(filepath.Dir(path), "cache"), filepath.Join(filepath.Dir(path), "fastpull"))
+`,
+		jobsPerVM,
+		filepath.Join(filepath.Dir(path), "key.pem"),
+		config.DefaultBaseImage,
+		filepath.Join(filepath.Dir(path), "cache"),
+		filepath.Join(filepath.Dir(path), "fastpull"),
+	)
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}

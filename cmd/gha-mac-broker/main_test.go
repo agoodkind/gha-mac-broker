@@ -32,6 +32,7 @@ func (c *staleRunnerClient) ListInstalledRepos(_ context.Context) ([]string, err
 	if c.listReposErr != nil {
 		return nil, c.listReposErr
 	}
+
 	return append([]string(nil), c.repos...), nil
 }
 
@@ -39,6 +40,7 @@ func (c *staleRunnerClient) ListRunners(_ context.Context, _ string) ([]ghapp.Ru
 	if c.listErr != nil {
 		return nil, c.listErr
 	}
+
 	return append([]ghapp.Runner(nil), c.runners...), nil
 }
 
@@ -64,12 +66,14 @@ func testServeConfig() *config.Config {
 			WebhookCIDRsPath:  "",
 		},
 		Tart: config.TartConfig{
-			Binary:           "tart",
-			GoldenImage:      "",
-			BaseImage:        config.DefaultBaseImage,
-			WarmBudget:       2,
-			GoldenBudget:     3,
-			Images:           []config.ImageMapping{{MacOS: "tahoe", Xcode: "26.5", Tag: config.DefaultBaseImage}},
+			Binary:       "tart",
+			GoldenImage:  "",
+			BaseImage:    config.DefaultBaseImage,
+			WarmBudget:   2,
+			GoldenBudget: 3,
+			Images: []config.ImageMapping{
+				{MacOS: "tahoe", Xcode: "26.5", Tag: config.DefaultBaseImage},
+			},
 			VMNamePrefix:     "gha",
 			CacheDir:         "",
 			FastPull:         nil,
@@ -87,16 +91,19 @@ func TestRunInstallDefaultsBinToHomeLocalBin(t *testing.T) {
 	if err := os.WriteFile(sourcePath, []byte("broker binary"), 0o755); err != nil {
 		t.Fatalf("write source binary: %v", err)
 	}
+
 	capturedConfig := runInstallWithStubbedInstaller(t, sourcePath, nil)
 
 	wantBinPath := filepath.Join(home, ".local", "bin", "gha-mac-broker")
 	if capturedConfig.BinPath != wantBinPath {
 		t.Fatalf("bin path = %q, want %q", capturedConfig.BinPath, wantBinPath)
 	}
+
 	copiedBinary, err := os.ReadFile(wantBinPath)
 	if err != nil {
 		t.Fatalf("read copied binary: %v", err)
 	}
+
 	if string(copiedBinary) != "broker binary" {
 		t.Fatalf("copied binary = %q, want source content", string(copiedBinary))
 	}
@@ -109,6 +116,7 @@ func TestRunInstallHonorsExplicitBin(t *testing.T) {
 	if err := os.WriteFile(sourcePath, []byte("broker binary"), 0o755); err != nil {
 		t.Fatalf("write source binary: %v", err)
 	}
+
 	explicitBinPath := filepath.Join(t.TempDir(), "custom-broker")
 	capturedConfig := runInstallWithStubbedInstaller(
 		t,
@@ -119,6 +127,7 @@ func TestRunInstallHonorsExplicitBin(t *testing.T) {
 	if capturedConfig.BinPath != explicitBinPath {
 		t.Fatalf("bin path = %q, want explicit %q", capturedConfig.BinPath, explicitBinPath)
 	}
+
 	if _, err := os.Stat(explicitBinPath); err != nil {
 		t.Fatalf("stat explicit copied binary: %v", err)
 	}
@@ -131,6 +140,7 @@ func TestRunInstallHelpDoesNotResolveHome(t *testing.T) {
 			fmt.Fprintf(os.Stderr, "runInstall: %v\n", err)
 			os.Exit(2)
 		}
+
 		return
 	}
 
@@ -151,10 +161,12 @@ func TestCopyBinaryRejectsNonRegularSource(t *testing.T) {
 	if err == nil {
 		t.Fatal("copyBinary returned nil, want non-regular source error")
 	}
+
 	errorMessage := err.Error()
 	if !strings.Contains(errorMessage, sourcePath) {
 		t.Fatalf("copyBinary error = %q, want source path %q", errorMessage, sourcePath)
 	}
+
 	if !strings.Contains(errorMessage, "not a regular file") {
 		t.Fatalf("copyBinary error = %q, want not a regular file", errorMessage)
 	}
@@ -183,6 +195,7 @@ func runInstallWithStubbedInstaller(t *testing.T, sourcePath string, args []stri
 	if err := runInstall(context.Background(), args); err != nil {
 		t.Fatalf("runInstall: %v", err)
 	}
+
 	return capturedConfig
 }
 
@@ -192,8 +205,10 @@ func TestRunStatusUsesCapacityTokenAndListenPort(t *testing.T) {
 	if err := os.WriteFile(tokenPath, []byte("status-token\n"), 0o600); err != nil {
 		t.Fatalf("write capacity token: %v", err)
 	}
+
 	configPath := filepath.Join(dir, "config.toml")
-	configBody := fmt.Sprintf(`
+	configBody := fmt.Sprintf(
+		`
 listen_addr = "[::1]:23456"
 runner_count = 1
 labels = ["self-hosted"]
@@ -206,7 +221,10 @@ capacity_token_path = %q
 
 [tart]
 base_image = %q
-`, tokenPath, config.DefaultBaseImage)
+`,
+		tokenPath,
+		config.DefaultBaseImage,
+	)
 	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -216,10 +234,13 @@ base_image = %q
 	statusHTTPClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			capturedRequest = req
+
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader(`{"snapshot":{"ready":true},"workers":[]}`)),
+				Body: io.NopCloser(
+					strings.NewReader(`{"snapshot":{"ready":true},"workers":[]}`),
+				),
 			}, nil
 		}),
 	}
@@ -229,18 +250,33 @@ base_image = %q
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	if err := runStatusWithWriters(context.Background(), []string{"-config", configPath}, &stdout, &stderr); err != nil {
+	if err := runStatusWithWriters(
+		context.Background(),
+		[]string{"-config", configPath},
+		&stdout,
+		&stderr,
+	); err != nil {
 		t.Fatalf("runStatusWithWriters: %v\nstderr=%s", err, stderr.String())
 	}
+
 	if capturedRequest == nil {
 		t.Fatal("status request was not sent")
 	}
+
 	if capturedRequest.URL.String() != "http://localhost:23456/status" {
-		t.Fatalf("status url = %q, want http://localhost:23456/status", capturedRequest.URL.String())
+		t.Fatalf(
+			"status url = %q, want http://localhost:23456/status",
+			capturedRequest.URL.String(),
+		)
 	}
+
 	if capturedRequest.Header.Get("Authorization") != "Bearer status-token" {
-		t.Fatalf("authorization = %q, want bearer token", capturedRequest.Header.Get("Authorization"))
+		t.Fatalf(
+			"authorization = %q, want bearer token",
+			capturedRequest.Header.Get("Authorization"),
+		)
 	}
+
 	if !strings.Contains(stdout.String(), `"workers":[]`) {
 		t.Fatalf("stdout = %q, want status JSON", stdout.String())
 	}
@@ -252,8 +288,13 @@ func TestStatusEndpointUsesLocalhost(t *testing.T) {
 		if err != nil {
 			t.Fatalf("statusEndpoint(%q): %v", listenAddr, err)
 		}
+
 		if statusURL != "http://localhost:23456/status" {
-			t.Fatalf("status url for %q = %q, want http://localhost:23456/status", listenAddr, statusURL)
+			t.Fatalf(
+				"status url for %q = %q, want http://localhost:23456/status",
+				listenAddr,
+				statusURL,
+			)
 		}
 	}
 }
@@ -274,6 +315,7 @@ func TestDeleteStaleRunnersDeletesOfflineRunners(t *testing.T) {
 	if len(client.deleted) != 1 {
 		t.Fatalf("deleted runners = %v, want [11]", client.deleted)
 	}
+
 	if client.deleted[0] != 11 {
 		t.Fatalf("deleted runner = %d, want 11", client.deleted[0])
 	}
@@ -298,6 +340,7 @@ func TestDeleteStaleRunnersOnlyDeletesOfflineRunnersWithConfiguredPrefix(t *test
 	if len(client.deleted) != 1 {
 		t.Fatalf("deleted runners = %v, want [11]", client.deleted)
 	}
+
 	if client.deleted[0] != 11 {
 		t.Fatalf("deleted runner = %d, want 11", client.deleted[0])
 	}
@@ -337,25 +380,32 @@ func TestDeleteStaleRunnersRepoListErrorDoesNotBlockStartup(t *testing.T) {
 func TestRunUpdateApplyRestartsServiceAfterAppliedUpdate(t *testing.T) {
 	var capturedOptions selfupdate.Options
 	restarted := false
-	withUpdateTestHooks(t, updateTestHooks{
-		apply: func(_ context.Context, options selfupdate.Options) (selfupdate.ApplyResult, error) {
-			capturedOptions = options
-			return selfupdate.ApplyResult{
-				CheckResult: selfupdate.CheckResult{
-					CurrentVersion:  "202607030215-16-122a5cc",
-					LatestTag:       "202607030301-b-1d33d4f",
-					AssetName:       "gha-mac-broker_darwin_arm64.tar.gz",
-					UpdateAvailable: true,
-				},
-				Applied: true,
-				DryRun:  false,
-			}, nil
+	withUpdateTestHooks(
+		t,
+		updateTestHooks{
+			apply: func(_ context.Context, options selfupdate.Options) (
+				selfupdate.ApplyResult,
+				error,
+			) {
+				capturedOptions = options
+
+				return selfupdate.ApplyResult{
+					CheckResult: selfupdate.CheckResult{
+						CurrentVersion:  "202607030215-16-122a5cc",
+						LatestTag:       "202607030301-b-1d33d4f",
+						AssetName:       "gha-mac-broker_darwin_arm64.tar.gz",
+						UpdateAvailable: true,
+					},
+					Applied: true,
+					DryRun:  false,
+				}, nil
+			},
+			restart: func(_ context.Context) (bool, error) {
+				restarted = true
+				return true, nil
+			},
 		},
-		restart: func(_ context.Context) (bool, error) {
-			restarted = true
-			return true, nil
-		},
-	})
+	)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
@@ -363,12 +413,15 @@ func TestRunUpdateApplyRestartsServiceAfterAppliedUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runUpdateWithWriters: %v\nstderr=%s", err, stderr.String())
 	}
+
 	if !restarted {
 		t.Fatal("service restart was not triggered")
 	}
+
 	if capturedOptions.Config.ValidateMatch != "gha-mac-broker " {
 		t.Fatalf("validate match = %q, want gha-mac-broker ", capturedOptions.Config.ValidateMatch)
 	}
+
 	if !strings.Contains(stdout.String(), "gha-mac-broker: update applied and service restarted") {
 		t.Fatalf("stdout = %q, want applied restart message", stdout.String())
 	}
@@ -376,37 +429,51 @@ func TestRunUpdateApplyRestartsServiceAfterAppliedUpdate(t *testing.T) {
 
 func TestRunUpdateApplyDryRunDoesNotRestartService(t *testing.T) {
 	restarted := false
-	withUpdateTestHooks(t, updateTestHooks{
-		apply: func(_ context.Context, options selfupdate.Options) (selfupdate.ApplyResult, error) {
-			if !options.DryRun {
-				t.Fatal("dry-run option was not passed to selfupdate.Apply")
-			}
-			return selfupdate.ApplyResult{
-				CheckResult: selfupdate.CheckResult{
-					CurrentVersion:  "202607030215-16-122a5cc",
-					LatestTag:       "202607030301-b-1d33d4f",
-					AssetName:       "gha-mac-broker_darwin_arm64.tar.gz",
-					UpdateAvailable: true,
-				},
-				Applied: false,
-				DryRun:  true,
-			}, nil
+	withUpdateTestHooks(
+		t,
+		updateTestHooks{
+			apply: func(_ context.Context, options selfupdate.Options) (
+				selfupdate.ApplyResult,
+				error,
+			) {
+				if !options.DryRun {
+					t.Fatal("dry-run option was not passed to selfupdate.Apply")
+				}
+
+				return selfupdate.ApplyResult{
+					CheckResult: selfupdate.CheckResult{
+						CurrentVersion:  "202607030215-16-122a5cc",
+						LatestTag:       "202607030301-b-1d33d4f",
+						AssetName:       "gha-mac-broker_darwin_arm64.tar.gz",
+						UpdateAvailable: true,
+					},
+					Applied: false,
+					DryRun:  true,
+				}, nil
+			},
+			restart: func(_ context.Context) (bool, error) {
+				restarted = true
+				return true, nil
+			},
 		},
-		restart: func(_ context.Context) (bool, error) {
-			restarted = true
-			return true, nil
-		},
-	})
+	)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	err := runUpdateWithWriters(context.Background(), []string{"apply", "-dry-run"}, &stdout, &stderr)
+	err := runUpdateWithWriters(
+		context.Background(),
+		[]string{"apply", "-dry-run"},
+		&stdout,
+		&stderr,
+	)
 	if err != nil {
 		t.Fatalf("runUpdateWithWriters: %v\nstderr=%s", err, stderr.String())
 	}
+
 	if restarted {
 		t.Fatal("service restart was triggered for a dry run")
 	}
+
 	if !strings.Contains(stdout.String(), "gha-mac-broker: update apply dry run ok") {
 		t.Fatalf("stdout = %q, want dry-run message", stdout.String())
 	}
@@ -417,36 +484,52 @@ func TestStartUpdateSchedulerStopsServeContextForRelaunch(t *testing.T) {
 	defer cancel()
 	stopCalled := false
 	var capturedHooks selfupdate.SchedulerHooks
-	withUpdateTestHooks(t, updateTestHooks{
-		runScheduler: func(_ context.Context, hooks selfupdate.SchedulerHooks) {
-			capturedHooks = hooks
+	withUpdateTestHooks(
+		t,
+		updateTestHooks{
+			runScheduler: func(_ context.Context, hooks selfupdate.SchedulerHooks) {
+				capturedHooks = hooks
+			},
 		},
-	})
+	)
 
-	startUpdateScheduler(ctx, func() {
-		stopCalled = true
-		cancel()
-	}, slog.Default())
+	startUpdateScheduler(
+		ctx,
+		func() {
+			stopCalled = true
+			cancel()
+		},
+		slog.Default(),
+	)
 
 	if capturedHooks.Enabled == nil || !capturedHooks.Enabled() {
 		t.Fatal("scheduler enabled hook is missing or false")
 	}
+
 	if capturedHooks.Mode == nil || capturedHooks.Mode() != selfupdate.ModeApply {
 		t.Fatalf("scheduler mode = %q, want apply", capturedHooks.Mode())
 	}
+
 	if capturedHooks.Options == nil {
 		t.Fatal("scheduler options hook is missing")
 	}
+
 	if capturedHooks.Options().Config.ValidateMatch != "gha-mac-broker " {
-		t.Fatalf("scheduler validate match = %q, want gha-mac-broker ", capturedHooks.Options().Config.ValidateMatch)
+		t.Fatalf(
+			"scheduler validate match = %q, want gha-mac-broker ",
+			capturedHooks.Options().Config.ValidateMatch,
+		)
 	}
+
 	if capturedHooks.StopForRelaunch == nil {
 		t.Fatal("scheduler stop hook is missing")
 	}
+
 	capturedHooks.StopForRelaunch()
 	if !stopCalled {
 		t.Fatal("scheduler stop hook did not call serve stop function")
 	}
+
 	if ctx.Err() == nil {
 		t.Fatal("serve context was not canceled")
 	}
@@ -470,18 +553,23 @@ func withUpdateTestHooks(t *testing.T, hooks updateTestHooks) {
 	if hooks.check != nil {
 		checkUpdate = hooks.check
 	}
+
 	if hooks.apply != nil {
 		applyUpdate = hooks.apply
 	}
+
 	if hooks.loadState != nil {
 		loadUpdateState = hooks.loadState
 	}
+
 	if hooks.restart != nil {
 		restartManagedService = hooks.restart
 	}
+
 	if hooks.runScheduler != nil {
 		runSelfUpdateScheduler = hooks.runScheduler
 	}
+
 	t.Cleanup(func() {
 		checkUpdate = oldCheck
 		applyUpdate = oldApply

@@ -48,12 +48,21 @@ func TestHTTPServeServesWebhookAndStatusOnInjectedListener(t *testing.T) {
 	webhookSecret := []byte("webhook-secret")
 	capacityToken := []byte("capacity-token")
 	pool := &stubPool{ready: true, enqueued: nil, cancelled: nil}
-	srv := server.New(webhookSecret, testServeConfig(), capacityToken, nil, pool, hostedload.NewTracker(), nil)
+	srv := server.New(
+		webhookSecret,
+		testServeConfig(),
+		capacityToken,
+		nil,
+		pool,
+		hostedload.NewTracker(),
+		nil,
+	)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+
 	addr := listener.Addr().String()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -77,54 +86,74 @@ func TestHTTPServeServesWebhookAndStatusOnInjectedListener(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build status request: %v", err)
 	}
+
 	statusReq.Header.Set("Authorization", "Bearer "+string(capacityToken))
 	statusResp, err := http.DefaultClient.Do(statusReq)
 	if err != nil {
 		t.Fatalf("status request: %v", err)
 	}
+
 	defer func() { _ = statusResp.Body.Close() }()
 	if statusResp.StatusCode != http.StatusOK {
 		t.Fatalf("status code = %d, want 200", statusResp.StatusCode)
 	}
+
 	var statusBody struct {
 		Snapshot runnerpool.Snapshot `json:"snapshot"`
 	}
 	if err := json.NewDecoder(statusResp.Body).Decode(&statusBody); err != nil {
 		t.Fatalf("decode status: %v", err)
 	}
+
 	if !statusBody.Snapshot.Ready {
 		t.Fatalf("status snapshot ready = false, want true")
 	}
 
 	// A signed completed+cancelled webhook cancels the run and returns 204, proving
 	// the webhook endpoint serves and verifies signatures on the injected listener.
-	payload := []byte(`{"action":"completed","repository":{"full_name":"owner/repo"},"workflow_job":{"id":77,"run_id":9,"conclusion":"cancelled"}}`)
+	payload := []byte(
+		`{"action":"completed","repository":{"full_name":"owner/repo"},"workflow_job":{"id":77,"run_id":9,"conclusion":"cancelled"}}`,
+	)
 	webhookResp := postWebhook(t, ctx, addr, webhookSecret, payload)
 	defer func() { _ = webhookResp.Body.Close() }()
 	if webhookResp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(webhookResp.Body)
 		t.Fatalf("webhook code = %d, want 204; body = %s", webhookResp.StatusCode, string(body))
 	}
+
 	if len(pool.cancelled) != 1 || pool.cancelled[0] != 77 {
 		t.Fatalf("cancelled runs = %v, want [77]", pool.cancelled)
 	}
 }
 
-func postWebhook(t *testing.T, ctx context.Context, addr string, secret []byte, payload []byte) *http.Response {
+func postWebhook(
+	t *testing.T,
+	ctx context.Context,
+	addr string,
+	secret []byte,
+	payload []byte,
+) *http.Response {
 	t.Helper()
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write(payload)
 	signature := "sha256=" + hex.EncodeToString(mac.Sum(nil))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+"/webhook", strings.NewReader(string(payload)))
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"http://"+addr+"/webhook",
+		strings.NewReader(string(payload)),
+	)
 	if err != nil {
 		t.Fatalf("build webhook request: %v", err)
 	}
+
 	req.Header.Set("X-Hub-Signature-256", signature)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("webhook request: %v", err)
 	}
+
 	return resp
 }
 
@@ -140,6 +169,7 @@ func TestReloadOrRestartRestartsManagedService(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reloadOrRestart: %v", err)
 	}
+
 	if !changed || !restartCalled {
 		t.Fatalf("changed=%v restartCalled=%v, want both true", changed, restartCalled)
 	}
@@ -155,13 +185,17 @@ func TestRunDeployPlansServiceRestartForHostChange(t *testing.T) {
 	var stdout strings.Builder
 	var stderr strings.Builder
 	args := []string{
-		"-config", configPath,
-		"-compiled-host-fingerprint", "host-new",
-		"-running-host-fingerprint", "host-old",
+		"-config",
+		configPath,
+		"-compiled-host-fingerprint",
+		"host-new",
+		"-running-host-fingerprint",
+		"host-old",
 	}
 	if err := runDeployWithWriters(context.Background(), args, &stdout, &stderr); err != nil {
 		t.Fatalf("runDeployWithWriters: %v; stderr=%s", err, stderr.String())
 	}
+
 	// With one serve daemon and no host supervisor, a host-only change always plans
 	// a full service restart rather than an in-place worker reload.
 	if !strings.Contains(stdout.String(), "deploy plan: service-restart") {

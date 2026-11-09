@@ -15,92 +15,121 @@ func writeConfig(t *testing.T, body string) string {
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
+
 	return path
 }
 
 func TestLoadDefaults(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"
 
 [tart]
-`)
+`,
+	)
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+
 	if cfg.ListenAddr != "[::1]:8080" {
 		t.Errorf("default listen addr = %q", cfg.ListenAddr)
 	}
+
 	if cfg.RunnerCount != 3 {
 		t.Errorf("default runner count = %d", cfg.RunnerCount)
 	}
+
 	if cfg.JobsPerVM != 1 {
 		t.Errorf("default jobs per VM = %d", cfg.JobsPerVM)
 	}
+
 	if cfg.HostedMacOSConcurrencyLimit != 5 {
-		t.Errorf("default hosted macOS concurrency limit = %d, want 5", cfg.HostedMacOSConcurrencyLimit)
+		t.Errorf(
+			"default hosted macOS concurrency limit = %d, want 5",
+			cfg.HostedMacOSConcurrencyLimit,
+		)
 	}
+
 	// MaxIdle and MaxAge are honored verbatim, so an unset value stays zero and
 	// disables that recycle trigger rather than defaulting.
 	if time.Duration(cfg.MaxIdle) != 0 {
 		t.Errorf("unset max idle = %s, want 0 (disabled)", time.Duration(cfg.MaxIdle))
 	}
+
 	if time.Duration(cfg.MaxAge) != 0 {
 		t.Errorf("unset max age = %s, want 0 (disabled)", time.Duration(cfg.MaxAge))
 	}
+
 	if cfg.Tart.WarmBudget != 2 {
 		t.Errorf("default warm budget = %d", cfg.Tart.WarmBudget)
 	}
+
 	if cfg.Tart.GoldenBudget != 3 {
 		t.Errorf("default golden budget = %d", cfg.Tart.GoldenBudget)
 	}
+
 	if cfg.Tart.Binary != "tart" {
 		t.Errorf("default tart binary = %q", cfg.Tart.Binary)
 	}
+
 	if cfg.Tart.FastPull == nil {
 		t.Fatal("default fast pull should be set")
 	}
+
 	if !*cfg.Tart.FastPull {
 		t.Error("default fast pull should be true")
 	}
+
 	wantFastPullDir := filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
 	if cfg.Tart.FastPullDir != wantFastPullDir {
 		t.Errorf("default fast pull dir = %q, want %q", cfg.Tart.FastPullDir, wantFastPullDir)
 	}
+
 	wantCacheDir := filepath.Join(os.TempDir(), "gha-mac-broker-pool-cache")
 	if home, err := os.UserHomeDir(); err == nil {
 		wantCacheDir = filepath.Join(home, "pool-cache")
 	}
+
 	if cfg.Tart.CacheDir != wantCacheDir {
 		t.Errorf("default cache dir = %q, want %q", cfg.Tart.CacheDir, wantCacheDir)
 	}
+
 	if cfg.Maintenance.Command != "" {
 		t.Errorf("default maintenance command = %q, want empty", cfg.Maintenance.Command)
 	}
+
 	if cfg.Maintenance.IntervalSeconds != 3600 {
 		t.Errorf("default maintenance interval = %d, want 3600", cfg.Maintenance.IntervalSeconds)
 	}
+
 	image, ok := cfg.ResolveImage("", "")
 	if !ok {
 		t.Fatal("empty request should resolve to default base image")
 	}
+
 	if image != DefaultBaseImage {
 		t.Errorf("default image = %q, want %q", image, DefaultBaseImage)
 	}
+
 	image, ok = cfg.ResolveImage("tahoe", "26.5")
 	if !ok {
 		t.Fatal("default mapping should resolve tahoe + 26.5")
 	}
+
 	if image != DefaultBaseImage {
 		t.Errorf("mapped image = %q, want %q", image, DefaultBaseImage)
 	}
 }
 
 func TestLoadIgnoresLegacyAllowedReposKey(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 allowed_repos = ["agoodkind/lmd"]
 
 [app]
@@ -108,7 +137,8 @@ app_id = "12345"
 private_key_path = "/tmp/key.pem"
 
 [tart]
-`)
+`,
+	)
 
 	if _, err := Load(path); err != nil {
 		t.Fatalf("Load with legacy allowed_repos key: %v", err)
@@ -116,7 +146,9 @@ private_key_path = "/tmp/key.pem"
 }
 
 func TestLoadMaintenanceConfig(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 allowed_repos = ["agoodkind/lmd"]
 
 [app]
@@ -128,22 +160,27 @@ command = "printf hello"
 interval_seconds = 900
 
 [tart]
-`)
+`,
+	)
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+
 	if cfg.Maintenance.Command != "printf hello" {
 		t.Errorf("maintenance command = %q, want %q", cfg.Maintenance.Command, "printf hello")
 	}
+
 	if cfg.Maintenance.IntervalSeconds != 900 {
 		t.Errorf("maintenance interval = %d, want 900", cfg.Maintenance.IntervalSeconds)
 	}
 }
 
 func TestLoadRunnerPoolSettings(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 runner_count = 5
 jobs_per_vm = 2
 max_idle = "45m"
@@ -159,43 +196,55 @@ private_key_path = "/tmp/key.pem"
 
 [tart]
 warm_budget = 7
-`)
+`,
+	)
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+
 	if cfg.RunnerCount != 5 {
 		t.Fatalf("runner count = %d, want 5", cfg.RunnerCount)
 	}
+
 	if cfg.JobsPerVM != 2 {
 		t.Fatalf("jobs per VM = %d, want 2", cfg.JobsPerVM)
 	}
+
 	if time.Duration(cfg.MaxIdle) != 45*time.Minute {
 		t.Fatalf("max idle = %s, want 45m0s", time.Duration(cfg.MaxIdle))
 	}
+
 	if time.Duration(cfg.MaxAge) != 6*time.Hour {
 		t.Fatalf("max age = %s, want 6h0m0s", time.Duration(cfg.MaxAge))
 	}
+
 	if time.Duration(cfg.MaxBind) != 90*time.Minute {
 		t.Fatalf("max bind = %s, want 1h30m0s", time.Duration(cfg.MaxBind))
 	}
+
 	if time.Duration(cfg.PickupTimeout) != 7*time.Minute {
 		t.Fatalf("pickup timeout = %s, want 7m0s", time.Duration(cfg.PickupTimeout))
 	}
+
 	if time.Duration(cfg.StallTimeout) != 11*time.Minute {
 		t.Fatalf("stall timeout = %s, want 11m0s", time.Duration(cfg.StallTimeout))
 	}
+
 	if !cfg.StallReap {
 		t.Fatal("stall reap = false, want true")
 	}
+
 	if cfg.Tart.WarmBudget != 7 {
 		t.Fatalf("warm budget = %d, want back-compat parse value 7", cfg.Tart.WarmBudget)
 	}
 }
 
 func TestResolveImageUsesConfiguredMappings(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"
@@ -209,19 +258,23 @@ golden_budget = 5
 macos = "ventura"
 xcode = "15.4"
 tag = "ghcr.io/cirruslabs/macos-ventura-xcode:15.4"
-`)
+`,
+	)
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+
 	image, ok := cfg.ResolveImage("VENTURA", "15.4")
 	if !ok {
 		t.Fatal("configured mapping should resolve case-insensitively")
 	}
+
 	if image != "ghcr.io/cirruslabs/macos-ventura-xcode:15.4" {
 		t.Fatalf("image = %q", image)
 	}
+
 	if _, ok := cfg.ResolveImage("ventura", "16.0"); ok {
 		t.Fatal("unmapped declared pair should not resolve")
 	}
@@ -243,7 +296,9 @@ func TestResolveImageRejectsUnsafeConfiguredTag(t *testing.T) {
 			BaseImage:    DefaultBaseImage,
 			WarmBudget:   2,
 			GoldenBudget: 3,
-			Images:       []ImageMapping{{MacOS: "tahoe", Xcode: "raw", Tag: "docker.io/library/alpine:latest"}},
+			Images: []ImageMapping{
+				{MacOS: "tahoe", Xcode: "raw", Tag: "docker.io/library/alpine:latest"},
+			},
 			VMNamePrefix: "gha-runner",
 			CacheDir:     "",
 			FastPull:     nil,
@@ -257,10 +312,13 @@ func TestResolveImageRejectsUnsafeConfiguredTag(t *testing.T) {
 }
 
 func TestLoadMissingRequired(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 [app]
 app_id = "12345"
-`)
+`,
+	)
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for missing required fields")
@@ -268,7 +326,9 @@ app_id = "12345"
 }
 
 func TestLoadRejectsJobsPerVMLessThanOne(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 runner_count = 1
 jobs_per_vm = -1
 
@@ -277,11 +337,13 @@ app_id = "12345"
 private_key_path = "/tmp/key.pem"
 
 [tart]
-`)
+`,
+	)
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for jobs_per_vm less than 1")
 	}
+
 	if !strings.Contains(err.Error(), "jobs_per_vm must be at least 1") {
 		t.Errorf("error = %q, want jobs_per_vm validation", err.Error())
 	}
@@ -306,16 +368,25 @@ func TestNegativeHostedMacOSConcurrencyLimitIsAcceptedAsDisableSentinel(t *testi
 	// leaves it unchanged (only an explicit zero is defaulted), so it reaches the
 	// server's limit <= 0 branch that keeps hosted_free always true.
 	if err := cfg.validate(); err != nil {
-		t.Fatalf("negative hosted_macos_concurrency_limit should be accepted as a disable sentinel, got %v", err)
+		t.Fatalf(
+			"negative hosted_macos_concurrency_limit should be accepted as a disable sentinel, got %v",
+			err,
+		)
 	}
+
 	cfg.applyDefaults()
 	if cfg.HostedMacOSConcurrencyLimit != -1 {
-		t.Errorf("applyDefaults changed negative limit to %d, want it left as -1", cfg.HostedMacOSConcurrencyLimit)
+		t.Errorf(
+			"applyDefaults changed negative limit to %d, want it left as -1",
+			cfg.HostedMacOSConcurrencyLimit,
+		)
 	}
 }
 
 func TestLoadRejectsFastPullDirInsideCacheDir(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"
@@ -323,18 +394,22 @@ private_key_path = "/tmp/key.pem"
 [tart]
 cache_dir = "/tmp/pool-cache"
 fast_pull_dir = "/tmp/pool-cache/fastpull-blobs"
-`)
+`,
+	)
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for fast_pull_dir inside cache_dir")
 	}
+
 	if !strings.Contains(err.Error(), "must not be inside") {
 		t.Errorf("error = %q, want it to mention the containment violation", err.Error())
 	}
 }
 
 func TestLoadRejectsNegativeStallTimeout(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 stall_timeout = "-1m"
 
 [app]
@@ -342,45 +417,56 @@ app_id = "12345"
 private_key_path = "/tmp/key.pem"
 
 [tart]
-`)
+`,
+	)
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for negative stall timeout")
 	}
+
 	if !strings.Contains(err.Error(), "stall_timeout must not be negative") {
 		t.Errorf("error = %q, want stall_timeout validation", err.Error())
 	}
 }
 
 func TestLoadMetricsDefaults(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"
 
 [tart]
-`)
+`,
+	)
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+
 	if time.Duration(cfg.Metrics.Interval) != 60*time.Second {
 		t.Errorf("default metrics interval = %s, want 60s", time.Duration(cfg.Metrics.Interval))
 	}
+
 	if cfg.Metrics.DiskPath != "/" {
 		t.Errorf("default metrics disk_path = %q, want /", cfg.Metrics.DiskPath)
 	}
+
 	if cfg.Metrics.Enabled == nil {
 		t.Fatal("default metrics enabled should be set")
 	}
+
 	if !*cfg.Metrics.Enabled {
 		t.Error("default metrics enabled should be true")
 	}
 }
 
 func TestLoadMetricsConfig(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"
@@ -391,28 +477,35 @@ interval = "30s"
 disk_path = "/data"
 
 [tart]
-`)
+`,
+	)
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+
 	if time.Duration(cfg.Metrics.Interval) != 30*time.Second {
 		t.Errorf("metrics interval = %s, want 30s", time.Duration(cfg.Metrics.Interval))
 	}
+
 	if cfg.Metrics.DiskPath != "/data" {
 		t.Errorf("metrics disk_path = %q, want /data", cfg.Metrics.DiskPath)
 	}
+
 	if cfg.Metrics.Enabled == nil {
 		t.Fatal("metrics enabled should be set")
 	}
+
 	if *cfg.Metrics.Enabled {
 		t.Error("metrics enabled should be false")
 	}
 }
 
 func TestLoadRejectsNegativeMetricsInterval(t *testing.T) {
-	path := writeConfig(t, `
+	path := writeConfig(
+		t,
+		`
 [app]
 app_id = "12345"
 private_key_path = "/tmp/key.pem"
@@ -421,11 +514,13 @@ private_key_path = "/tmp/key.pem"
 interval = "-1m"
 
 [tart]
-`)
+`,
+	)
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for negative metrics interval")
 	}
+
 	if !strings.Contains(err.Error(), "metrics.interval must not be negative") {
 		t.Errorf("error = %q, want metrics.interval validation", err.Error())
 	}

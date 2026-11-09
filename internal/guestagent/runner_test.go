@@ -32,13 +32,19 @@ type commandStub struct {
 	responder func(name string, args []string) (string, error)
 }
 
-func (s *commandStub) run(_ context.Context, name string, args []string, env map[string]string) (string, error) {
+func (s *commandStub) run(_ context.Context, name string, args []string, env map[string]string) (
+	string,
+	error,
+) {
 	s.mu.Lock()
-	s.commands = append(s.commands, recordedCommand{
-		name: name,
-		args: append([]string(nil), args...),
-		env:  env,
-	})
+	s.commands = append(
+		s.commands,
+		recordedCommand{
+			name: name,
+			args: append([]string(nil), args...),
+			env:  env,
+		},
+	)
 	s.mu.Unlock()
 	if s.responder != nil {
 		return s.responder(name, args)
@@ -62,7 +68,10 @@ func (s *commandStub) count(name string) int {
 	return len(s.named(name))
 }
 
-func newTestExecutor(t *testing.T, baseHome string, slotCount uint32) (*runnerExecutor, *commandStub) {
+func newTestExecutor(t *testing.T, baseHome string, slotCount uint32) (
+	*runnerExecutor,
+	*commandStub,
+) {
 	t.Helper()
 	stub := &commandStub{}
 	executor := &runnerExecutor{
@@ -83,7 +92,11 @@ func writeGoldenRunner(t *testing.T, baseHome string) {
 	if err := os.MkdirAll(runnerDir, 0o700); err != nil {
 		t.Fatalf("create golden runner dir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(runnerDir, runnerLaunchScript), []byte("#!/bin/sh\n"), 0o700); err != nil {
+	if err := os.WriteFile(
+		filepath.Join(runnerDir, runnerLaunchScript),
+		[]byte("#!/bin/sh\n"),
+		0o700,
+	); err != nil {
 		t.Fatalf("write stub run.sh: %v", err)
 	}
 }
@@ -93,13 +106,21 @@ func TestBuildProducesAbsoluteRunnerSpecForSlot(t *testing.T) {
 	writeGoldenRunner(t, baseHome)
 	executor, _ := newTestExecutor(t, baseHome, 2)
 
-	spec, err := executor.Build(context.Background(), JobRequest{
-		ExecutionID: "exec-7",
-		Slot:        1,
-		Meta:        guestexec.JobMeta{Repo: "owner/repo", JobID: 42, RunID: 99, RunnerName: "runner-1"},
-		JitConfig:   "encoded-jit",
-		Env:         map[string]string{"FOO": "bar"},
-	})
+	spec, err := executor.Build(
+		context.Background(),
+		JobRequest{
+			ExecutionID: "exec-7",
+			Slot:        1,
+			Meta: guestexec.JobMeta{
+				Repo:       "owner/repo",
+				JobID:      42,
+				RunID:      99,
+				RunnerName: "runner-1",
+			},
+			JitConfig: "encoded-jit",
+			Env:       map[string]string{"FOO": "bar"},
+		},
+	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -138,7 +159,11 @@ func TestBuildProducesAbsoluteRunnerSpecForSlot(t *testing.T) {
 		t.Fatalf("spec.Args prefix = %v, want %v", spec.Args[:len(wantArgsPrefix)], wantArgsPrefix)
 	}
 	if !slices.Equal(spec.Args[len(spec.Args)-len(wantArgsSuffix):], wantArgsSuffix) {
-		t.Fatalf("spec.Args suffix = %v, want %v", spec.Args[len(spec.Args)-len(wantArgsSuffix):], wantArgsSuffix)
+		t.Fatalf(
+			"spec.Args suffix = %v, want %v",
+			spec.Args[len(spec.Args)-len(wantArgsSuffix):],
+			wantArgsSuffix,
+		)
 	}
 	wantWorkingDir := filepath.Join(baseHome, "actions-runner-1")
 	if spec.WorkingDir != wantWorkingDir {
@@ -154,14 +179,22 @@ func TestBuildSingleSlotUsesBaseHomeInAquaWrapper(t *testing.T) {
 	writeGoldenRunner(t, baseHome)
 	executor, _ := newTestExecutor(t, baseHome, 1)
 
-	spec, err := executor.Build(context.Background(), JobRequest{
-		ExecutionID: "exec-8",
-		Slot:        0,
-		JitConfig:   "encoded-jit",
-		// A caller-supplied HOME, TMPDIR, and GIT_TERMINAL_PROMPT must not win over
-		// the executor's runner values.
-		Env: map[string]string{"HOME": "/attacker", "TMPDIR": "/attacker-tmp", "GIT_TERMINAL_PROMPT": "1", "FOO": "bar"},
-	})
+	spec, err := executor.Build(
+		context.Background(),
+		JobRequest{
+			ExecutionID: "exec-8",
+			Slot:        0,
+			JitConfig:   "encoded-jit",
+			// A caller-supplied HOME, TMPDIR, and GIT_TERMINAL_PROMPT must not win over
+			// the executor's runner values.
+			Env: map[string]string{
+				"HOME":                "/attacker",
+				"TMPDIR":              "/attacker-tmp",
+				"GIT_TERMINAL_PROMPT": "1",
+				"FOO":                 "bar",
+			},
+		},
+	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -207,7 +240,11 @@ func TestBuildSingleSlotUsesBaseHomeInAquaWrapper(t *testing.T) {
 		"encoded-jit",
 	}
 	if !slices.Equal(spec.Args[len(spec.Args)-len(wantArgsSuffix):], wantArgsSuffix) {
-		t.Fatalf("spec.Args suffix = %v, want %v", spec.Args[len(spec.Args)-len(wantArgsSuffix):], wantArgsSuffix)
+		t.Fatalf(
+			"spec.Args suffix = %v, want %v",
+			spec.Args[len(spec.Args)-len(wantArgsSuffix):],
+			wantArgsSuffix,
+		)
 	}
 }
 
@@ -216,12 +253,15 @@ func TestBuildMultiSlotUsesIsolatedSlotHome(t *testing.T) {
 	writeGoldenRunner(t, baseHome)
 	executor, _ := newTestExecutor(t, baseHome, 2)
 
-	spec, err := executor.Build(context.Background(), JobRequest{
-		ExecutionID: "exec-multi",
-		Slot:        1,
-		JitConfig:   "encoded-jit",
-		Env:         map[string]string{"HOME": "/attacker", "TMPDIR": "/attacker-tmp"},
-	})
+	spec, err := executor.Build(
+		context.Background(),
+		JobRequest{
+			ExecutionID: "exec-multi",
+			Slot:        1,
+			JitConfig:   "encoded-jit",
+			Env:         map[string]string{"HOME": "/attacker", "TMPDIR": "/attacker-tmp"},
+		},
+	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -239,12 +279,19 @@ func TestBuildMultiSlotUsesIsolatedSlotHome(t *testing.T) {
 func TestBuildSingleSlotClonesRunnerWithoutSlotHomeOrKeychain(t *testing.T) {
 	baseHome := t.TempDir()
 	writeGoldenRunner(t, baseHome)
-	if err := os.WriteFile(filepath.Join(baseHome, ".gitconfig"), []byte("[user]\n"), 0o600); err != nil {
+	if err := os.WriteFile(
+		filepath.Join(baseHome, ".gitconfig"),
+		[]byte("[user]\n"),
+		0o600,
+	); err != nil {
 		t.Fatalf("write .gitconfig: %v", err)
 	}
 	executor, stub := newTestExecutor(t, baseHome, 1)
 
-	if _, err := executor.Build(context.Background(), JobRequest{ExecutionID: "exec-single", Slot: 0, JitConfig: "jit"}); err != nil {
+	if _, err := executor.Build(
+		context.Background(),
+		JobRequest{ExecutionID: "exec-single", Slot: 0, JitConfig: "jit"},
+	); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
@@ -252,12 +299,21 @@ func TestBuildSingleSlotClonesRunnerWithoutSlotHomeOrKeychain(t *testing.T) {
 	slotHome := filepath.Join(baseHome, "slot-home-0")
 	wantRunnerClone := false
 	for _, command := range stub.named("cp") {
-		if slices.Equal(command.args, []string{"-R", filepath.Join(baseHome, goldenRunnerDir), runnerHome}) {
+		if slices.Equal(
+			command.args,
+			[]string{"-R", filepath.Join(baseHome, goldenRunnerDir), runnerHome},
+		) {
 			wantRunnerClone = true
 		}
 		for _, argument := range command.args {
-			if argument == slotHome || strings.HasPrefix(argument, slotHome+string(os.PathSeparator)) {
-				t.Fatalf("cp command = %v, want no slot-home seed in single-slot mode", command.args)
+			if argument == slotHome || strings.HasPrefix(
+				argument,
+				slotHome+string(os.PathSeparator),
+			) {
+				t.Fatalf(
+					"cp command = %v, want no slot-home seed in single-slot mode",
+					command.args,
+				)
 			}
 		}
 	}
@@ -271,7 +327,11 @@ func TestBuildSingleSlotClonesRunnerWithoutSlotHomeOrKeychain(t *testing.T) {
 		t.Fatalf("slot-home-0 stat err = %v, want unused slot home absent", err)
 	}
 	if info, err := os.Stat(filepath.Join(baseHome, "tmp-0")); err != nil || !info.IsDir() {
-		t.Fatalf("tmp-0 stat err = %v, isDir = %v, want created dir", err, info != nil && info.IsDir())
+		t.Fatalf(
+			"tmp-0 stat err = %v, isDir = %v, want created dir",
+			err,
+			info != nil && info.IsDir(),
+		)
 	}
 }
 
@@ -279,7 +339,11 @@ func TestBuildMultiSlotProvisionsSlotHomeAndKeychain(t *testing.T) {
 	baseHome := t.TempDir()
 	writeGoldenRunner(t, baseHome)
 	// Two present warm caches and one absent, so seeding is by presence.
-	if err := os.WriteFile(filepath.Join(baseHome, ".gitconfig"), []byte("[user]\n"), 0o600); err != nil {
+	if err := os.WriteFile(
+		filepath.Join(baseHome, ".gitconfig"),
+		[]byte("[user]\n"),
+		0o600,
+	); err != nil {
 		t.Fatalf("write .gitconfig: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(baseHome, ".swiftpm"), 0o700); err != nil {
@@ -287,12 +351,19 @@ func TestBuildMultiSlotProvisionsSlotHomeAndKeychain(t *testing.T) {
 	}
 	executor, stub := newTestExecutor(t, baseHome, 2)
 
-	if _, err := executor.Build(context.Background(), JobRequest{ExecutionID: "exec-9", Slot: 1, JitConfig: "jit"}); err != nil {
+	if _, err := executor.Build(
+		context.Background(),
+		JobRequest{ExecutionID: "exec-9", Slot: 1, JitConfig: "jit"},
+	); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
 	if info, err := os.Stat(filepath.Join(baseHome, "tmp-1")); err != nil || !info.IsDir() {
-		t.Fatalf("tmp-1 stat err = %v, isDir = %v, want created dir", err, info != nil && info.IsDir())
+		t.Fatalf(
+			"tmp-1 stat err = %v, isDir = %v, want created dir",
+			err,
+			info != nil && info.IsDir(),
+		)
 	}
 	if info, err := os.Stat(filepath.Join(baseHome, "slot-home-1")); err != nil || !info.IsDir() {
 		t.Fatalf("slot-home-1 stat err = %v, want created dir", err)
@@ -312,9 +383,15 @@ func TestBuildMultiSlotProvisionsSlotHomeAndKeychain(t *testing.T) {
 		}
 	}
 	if !wantRunnerClone {
-		t.Fatalf("cp commands = %+v, want a -R clone of the golden runner into actions-runner-1", cpCommands)
+		t.Fatalf(
+			"cp commands = %+v, want a -R clone of the golden runner into actions-runner-1",
+			cpCommands,
+		)
 	}
-	if !seededCaches[filepath.Join(baseHome, ".gitconfig")] || !seededCaches[filepath.Join(baseHome, ".swiftpm")] {
+	if !seededCaches[filepath.Join(
+		baseHome,
+		".gitconfig",
+	)] || !seededCaches[filepath.Join(baseHome, ".swiftpm")] {
 		t.Fatalf("seeded caches = %v, want .gitconfig and .swiftpm cloned", seededCaches)
 	}
 	if seededCaches[filepath.Join(baseHome, ".netrc")] {
@@ -341,7 +418,10 @@ func TestBuildMultiSlotProvisionsSlotHomeAndKeychain(t *testing.T) {
 		}
 	}
 	if !sawDefaultKeychain {
-		t.Fatalf("security commands = %+v, want default-keychain set to the slot keychain", securityCommands)
+		t.Fatalf(
+			"security commands = %+v, want default-keychain set to the slot keychain",
+			securityCommands,
+		)
 	}
 }
 
@@ -371,13 +451,21 @@ func TestBuildProvisionsSlotOnceAcrossJobs(t *testing.T) {
 	// Directory provisioning (cp: runner-home clone and cache seeds) runs once per
 	// slot, so the cp count does not grow on the second job.
 	if got := stub.count("cp"); got != firstCPCount {
-		t.Fatalf("cp invocations after second Build = %d, want %d (provisioned once)", got, firstCPCount)
+		t.Fatalf(
+			"cp invocations after second Build = %d, want %d (provisioned once)",
+			got,
+			firstCPCount,
+		)
 	}
 	// Keychain setup (security) runs on every job so the slot's default keychain,
 	// search list, and unlock are re-established each build and cannot drift over a
 	// long-lived slot's life.
 	if got := stub.count("security"); got <= firstSecurityCount {
-		t.Fatalf("security invocations after second Build = %d, want > %d (keychain reset per job)", got, firstSecurityCount)
+		t.Fatalf(
+			"security invocations after second Build = %d, want > %d (keychain reset per job)",
+			got,
+			firstSecurityCount,
+		)
 	}
 }
 
@@ -418,9 +506,16 @@ func TestKeychainSearchListDropsPriorSlotKeychainCopy(t *testing.T) {
 	keychain := filepath.Join(slotHome, loginKeychainRelPath)
 	executor, stub := newTestExecutor(t, baseHome, 2)
 	stub.responder = func(name string, args []string) (string, error) {
-		if name == "security" && len(args) >= 3 && args[0] == "list-keychains" && args[1] == "-d" && args[2] == "user" && len(args) == 3 {
+		if name == "security" && len(
+			args,
+		) >= 3 && args[0] == "list-keychains" && args[1] == "-d" && args[2] == "user" && len(
+			args,
+		) == 3 {
 			// The existing user list already carries the slot keychain plus System.
-			return fmt.Sprintf("    %q\n    \"/Library/Keychains/System.keychain\"\n", keychain), nil
+			return fmt.Sprintf(
+				"    %q\n    \"/Library/Keychains/System.keychain\"\n",
+				keychain,
+			), nil
 		}
 		return "", nil
 	}
@@ -431,7 +526,9 @@ func TestKeychainSearchListDropsPriorSlotKeychainCopy(t *testing.T) {
 
 	var setListArgs []string
 	for _, command := range stub.named("security") {
-		if len(command.args) >= 4 && command.args[0] == "list-keychains" && command.args[3] == "-s" {
+		if len(
+			command.args,
+		) >= 4 && command.args[0] == "list-keychains" && command.args[3] == "-s" {
 			setListArgs = command.args
 		}
 	}
@@ -480,7 +577,9 @@ func TestBrewRefreshRetriesOnLockContention(t *testing.T) {
 		if name == "brew" {
 			attempt++
 			if attempt == 1 {
-				return "Another active Homebrew update process is already running.", fmt.Errorf("exit status 1")
+				return "Another active Homebrew update process is already running.", fmt.Errorf(
+					"exit status 1",
+				)
 			}
 			return "", nil
 		}
@@ -569,7 +668,10 @@ func TestBrewMarkerRefusesSymlinkViaONoFollow(t *testing.T) {
 	// through the link, and the symlink is left in place rather than replaced.
 	executor.writeBootRefreshMarker(context.Background())
 	if _, err := os.Stat(victim); !os.IsNotExist(err) {
-		t.Fatalf("victim stat err = %v, want the write refused (no create through the symlink)", err)
+		t.Fatalf(
+			"victim stat err = %v, want the write refused (no create through the symlink)",
+			err,
+		)
 	}
 	info, err := os.Lstat(markerPath)
 	if err != nil {
@@ -642,7 +744,11 @@ func TestBrewMarkerWriteDoesNotTruncateExistingFile(t *testing.T) {
 		t.Fatalf("read marker: %v", err)
 	}
 	if string(got) != original {
-		t.Fatalf("marker content = %q, want the raced-in file left untruncated %q", string(got), original)
+		t.Fatalf(
+			"marker content = %q, want the raced-in file left untruncated %q",
+			string(got),
+			original,
+		)
 	}
 }
 

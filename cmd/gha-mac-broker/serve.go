@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -29,9 +28,11 @@ func runServe(ctx context.Context, args []string) error {
 		slog.ErrorContext(ctx, "serve flag parse failed", "err", err)
 		return fmt.Errorf("serve flags: %w", err)
 	}
+
 	if *configPath == "" {
 		*configPath = config.DefaultConfigPath()
 	}
+
 	return serveDaemon(ctx, *configPath)
 }
 
@@ -71,9 +72,19 @@ func serveDaemon(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
+
 	hostedTracker := hostedload.NewTracker()
 	sampler := newHostStatsSampler(cfg, p)
-	srv := server.New(secret, cfg, capacityToken, webhookCIDRs, p, hostedTracker, sampler, server.WithRunCanceller(gh))
+	srv := server.New(
+		secret,
+		cfg,
+		capacityToken,
+		webhookCIDRs,
+		p,
+		hostedTracker,
+		sampler,
+		server.WithRunCanceller(gh),
+	)
 
 	listener, err := listenTCP(ctx, cfg.ListenAddr)
 	if err != nil {
@@ -93,54 +104,29 @@ func serveDaemon(ctx context.Context, configPath string) error {
 	shutCtx, shutCancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 	defer shutCancel()
 	p.Shutdown(shutCtx)
+
 	return serveErr
 }
 
-// httpServe serves handler on an already-bound listener and shuts down gracefully
-// on ctx cancel. It takes the listener as a seam rather than binding one itself, so
-// a test can hand it an injected listener, and it sets no WriteTimeout because the
-// /status stream is long-lived. onReady, when set, is called once the server is
-// serving, so a caller can synchronize on readiness.
-func httpServe(ctx context.Context, listener net.Listener, handler http.Handler, onReady func()) error {
-	httpSrv := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: httpTimeout,
-		ReadTimeout:       httpTimeout,
+// httpServe delegates listener serving and shutdown to the server package.
+func httpServe(
+	ctx context.Context,
+	listener net.Listener,
+	handler http.Handler,
+	onReady func(),
+) error {
+	if err := server.Serve(
+		ctx,
+		listener,
+		handler,
+		onReady,
+		httpTimeout,
+		shutdownTimeout,
+	); err != nil {
+		slog.ErrorContext(ctx, "serve failed", "err", err)
+		return fmt.Errorf("serve: %w", err)
 	}
 
-	errCh := make(chan error, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "server goroutine panic recovered", "err", fmt.Errorf("panic: %v", r))
-				errCh <- fmt.Errorf("serve: panic: %v", r)
-			}
-		}()
-		slog.InfoContext(ctx, "server listening", "addr", listener.Addr().String())
-		if err := httpSrv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.ErrorContext(ctx, "server error", "err", err)
-			errCh <- fmt.Errorf("serve: listen: %w", err)
-			return
-		}
-		errCh <- nil
-	}()
-
-	if onReady != nil {
-		onReady()
-	}
-
-	select {
-	case <-ctx.Done():
-		slog.InfoContext(ctx, "shutting down", "reason", ctx.Err())
-	case err := <-errCh:
-		return err
-	}
-
-	shutCtx, shutCancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
-	defer shutCancel()
-	if err := httpSrv.Shutdown(shutCtx); err != nil {
-		slog.WarnContext(shutCtx, "http shutdown error", "err", err)
-	}
 	return nil
 }
 
@@ -152,5 +138,6 @@ func listenTCP(ctx context.Context, addr string) (net.Listener, error) {
 		slog.ErrorContext(ctx, "serve listen failed", "err", err, "addr", addr)
 		return nil, fmt.Errorf("serve: listen %q: %w", addr, err)
 	}
+
 	return listener, nil
 }

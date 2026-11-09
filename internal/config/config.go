@@ -193,7 +193,9 @@ func (d *Duration) UnmarshalText(text []byte) error {
 	if err != nil {
 		return fmt.Errorf("config: parse duration %q: %w", string(text), err)
 	}
+
 	*d = Duration(parsed)
+
 	return nil
 }
 
@@ -204,10 +206,12 @@ func DefaultConfigPath() string {
 	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
 		return filepath.Join(dir, "gha-mac-broker", "config.toml")
 	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "."
 	}
+
 	return filepath.Join(home, ".config", "gha-mac-broker", "config.toml")
 }
 
@@ -218,15 +222,18 @@ func Load(path string) (*Config, error) {
 		slog.Error("config read failed", "err", err, "path", path)
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
+
 	var cfg Config
 	if err := toml.Unmarshal(raw, &cfg); err != nil {
 		slog.Error("config parse failed", "err", err, "path", path)
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
+
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+
 	return &cfg, nil
 }
 
@@ -235,6 +242,7 @@ func Load(path string) (*Config, error) {
 func Default() *Config {
 	var cfg Config
 	cfg.applyDefaults()
+
 	return &cfg
 }
 
@@ -242,39 +250,50 @@ func (c *Config) applyDefaults() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = "[::1]:8080"
 	}
+
 	if c.RunnerCount == 0 {
 		c.RunnerCount = defaultRunnerCount
 	}
+
 	if c.JobsPerVM == 0 {
 		c.JobsPerVM = defaultJobsPerVM
 	}
+
 	if c.HostedMacOSConcurrencyLimit == 0 {
 		c.HostedMacOSConcurrencyLimit = defaultHostedMacOSConcurrencyLimit
 	}
+
 	if c.Tart.Binary == "" {
 		c.Tart.Binary = "tart"
 	}
+
 	if c.Tart.VMNamePrefix == "" {
 		c.Tart.VMNamePrefix = "gha-runner"
 	}
+
 	if c.Tart.BaseImage == "" {
 		c.Tart.BaseImage = DefaultBaseImage
 	}
+
 	if c.Tart.WarmBudget == 0 {
 		c.Tart.WarmBudget = defaultWarmBudget
 	}
+
 	if c.Tart.GoldenBudget == 0 {
 		c.Tart.GoldenBudget = defaultGoldenBudget
 	}
+
 	if len(c.Tart.Images) == 0 {
 		c.Tart.Images = []ImageMapping{
 			{MacOS: "tahoe", Xcode: "26.5", Tag: c.Tart.BaseImage},
 		}
 	}
+
 	if c.Tart.FastPull == nil {
 		c.Tart.FastPull = new(bool)
 		*c.Tart.FastPull = true
 	}
+
 	if c.Tart.CacheDir == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			c.Tart.CacheDir = filepath.Join(home, "pool-cache")
@@ -282,28 +301,35 @@ func (c *Config) applyDefaults() {
 			c.Tart.CacheDir = filepath.Join(os.TempDir(), "gha-mac-broker-pool-cache")
 		}
 	}
+
 	if c.Tart.FastPullDir == "" {
 		// FastPullDir holds the multi-GB base-image blobs and must stay OUT of
 		// CacheDir, because CacheDir is mounted into every guest and the image
 		// blobs have no business inside a build VM.
 		c.Tart.FastPullDir = filepath.Join(os.TempDir(), "gha-mac-broker-fastpull-blobs")
 	}
+
 	if c.Tart.FastPullParallel <= 0 {
 		c.Tart.FastPullParallel = defaultFastPullParallel
 	}
+
 	if c.Maintenance.IntervalSeconds <= 0 {
 		c.Maintenance.IntervalSeconds = defaultMaintenanceIntervalSeconds
 	}
+
 	if c.Metrics.Interval == 0 {
 		c.Metrics.Interval = Duration(defaultMetricsInterval)
 	}
+
 	if c.Metrics.DiskPath == "" {
 		c.Metrics.DiskPath = "/"
 	}
+
 	if c.Metrics.Enabled == nil {
 		c.Metrics.Enabled = new(bool)
 		*c.Metrics.Enabled = true
 	}
+
 	if len(c.Labels) == 0 {
 		c.Labels = []string{"self-hosted", "macOS", "ARM64", "agk-local-macos-26"}
 	}
@@ -314,53 +340,78 @@ func (c *Config) validate() error {
 	if c.App.AppID == "" {
 		missing = append(missing, "app.app_id")
 	}
+
 	if c.App.PrivateKeyPath == "" {
 		missing = append(missing, "app.private_key_path")
 	}
+
 	if len(missing) > 0 {
 		return fmt.Errorf("config: missing required fields: %s", strings.Join(missing, ", "))
 	}
+
 	if c.RunnerCount < 1 {
 		return fmt.Errorf("config: runner_count must be at least 1")
 	}
+
 	if c.JobsPerVM < 1 {
 		return fmt.Errorf("config: jobs_per_vm must be at least 1")
 	}
+
 	if c.MaxIdle < 0 {
 		return fmt.Errorf("config: max_idle must not be negative")
 	}
+
 	if c.MaxAge < 0 {
 		return fmt.Errorf("config: max_age must not be negative")
 	}
+
 	if c.MaxBind < 0 {
 		return fmt.Errorf("config: max_bind must not be negative")
 	}
+
 	if c.PickupTimeout < 0 {
 		return fmt.Errorf("config: pickup_timeout must not be negative")
 	}
+
 	if c.StallTimeout < 0 {
 		return fmt.Errorf("config: stall_timeout must not be negative")
 	}
+
 	if c.Metrics.Interval < 0 {
 		return fmt.Errorf("config: metrics.interval must not be negative")
 	}
+
 	if !safeCirrusImageTag(c.Tart.BaseImage) {
-		return fmt.Errorf("config: tart.base_image must be a ghcr.io/cirruslabs/macos-*-xcode:* tag")
+		return fmt.Errorf(
+			"config: tart.base_image must be a ghcr.io/cirruslabs/macos-*-xcode:* tag",
+		)
 	}
+
 	for _, image := range c.Tart.Images {
 		if image.MacOS == "" || image.Xcode == "" || image.Tag == "" {
 			return fmt.Errorf("config: tart.images entries require macos, xcode, and tag")
 		}
+
 		if !safeCirrusImageTag(image.Tag) {
-			return fmt.Errorf("config: tart.images tag %q must be a ghcr.io/cirruslabs/macos-*-xcode:* tag", image.Tag)
+			return fmt.Errorf(
+				"config: tart.images tag %q must be a ghcr.io/cirruslabs/macos-*-xcode:* tag",
+				image.Tag,
+			)
 		}
 	}
+
 	// CacheDir is mounted into every guest, so the multi-GB base-image blob
 	// store must not live under it, whether an operator set fast_pull_dir
 	// explicitly or a default placed it there.
-	if c.Tart.CacheDir != "" && c.Tart.FastPullDir != "" && isWithin(c.Tart.FastPullDir, c.Tart.CacheDir) {
-		return fmt.Errorf("config: tart.fast_pull_dir %q must not be inside tart.cache_dir %q (cache_dir is mounted into every VM)", c.Tart.FastPullDir, c.Tart.CacheDir)
+	if c.Tart.CacheDir != "" && c.Tart.FastPullDir != "" &&
+		isWithin(c.Tart.FastPullDir, c.Tart.CacheDir) {
+		return fmt.Errorf(
+			"config: tart.fast_pull_dir %q must not be inside tart.cache_dir %q (cache_dir is mounted into every VM)",
+			c.Tart.FastPullDir,
+			c.Tart.CacheDir,
+		)
 	}
+
 	return nil
 }
 
@@ -371,14 +422,17 @@ func isWithin(path, root string) bool {
 	if err != nil {
 		return false
 	}
+
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return false
 	}
+
 	rel, err := filepath.Rel(absRoot, absPath)
 	if err != nil {
 		return false
 	}
+
 	return rel == "." || !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".."
 }
 
@@ -392,23 +446,30 @@ func (c *Config) ResolveImage(macos, xcode string) (tag string, ok bool) {
 		if safeCirrusImageTag(c.Tart.BaseImage) {
 			return c.Tart.BaseImage, true
 		}
+
 		return "", false
 	}
+
 	if macos == "" || xcode == "" {
 		return "", false
 	}
+
 	for _, image := range c.Tart.Images {
 		if normalizeImageKey(image.MacOS) != macos {
 			continue
 		}
+
 		if normalizeImageKey(image.Xcode) != xcode {
 			continue
 		}
+
 		if !safeCirrusImageTag(image.Tag) {
 			return "", false
 		}
+
 		return image.Tag, true
 	}
+
 	return "", false
 }
 
@@ -422,20 +483,25 @@ func safeCirrusImageTag(tag string) bool {
 	if !ok {
 		return false
 	}
+
 	if version == "" || strings.ContainsAny(version, "/ \t\r\n") {
 		return false
 	}
+
 	if !strings.HasPrefix(repository, cirrusImagePrefix+"macos-") {
 		return false
 	}
+
 	if !strings.HasSuffix(repository, "-xcode") {
 		return false
 	}
+
 	macosPart := strings.TrimPrefix(repository, cirrusImagePrefix+"macos-")
 	macosPart = strings.TrimSuffix(macosPart, "-xcode")
 	if macosPart == "" {
 		return false
 	}
+
 	return !strings.ContainsAny(macosPart, "/ \t\r\n")
 }
 
@@ -446,6 +512,7 @@ func (c *Config) ReadPrivateKey() ([]byte, error) {
 		slog.Error("read private key failed", "err", err, "path", c.App.PrivateKeyPath)
 		return nil, fmt.Errorf("config: read private key %s: %w", c.App.PrivateKeyPath, err)
 	}
+
 	return key, nil
 }
 
@@ -457,11 +524,13 @@ func (c *Config) ReadCapacityToken() ([]byte, error) {
 	if c.App.CapacityTokenPath == "" {
 		return nil, nil
 	}
+
 	token, err := os.ReadFile(c.App.CapacityTokenPath)
 	if err != nil {
 		slog.Error("read capacity token failed", "err", err, "path", c.App.CapacityTokenPath)
 		return nil, fmt.Errorf("config: read capacity token %s: %w", c.App.CapacityTokenPath, err)
 	}
+
 	return bytes.TrimRight(token, "\r\n"), nil
 }
 
@@ -474,11 +543,13 @@ func (c *Config) ReadWebhookSecret() ([]byte, error) {
 	if c.App.WebhookSecretPath == "" {
 		return nil, fmt.Errorf("config: webhook_secret_path is required")
 	}
+
 	secret, err := os.ReadFile(c.App.WebhookSecretPath)
 	if err != nil {
 		slog.Error("read webhook secret failed", "err", err, "path", c.App.WebhookSecretPath)
 		return nil, fmt.Errorf("config: read webhook secret %s: %w", c.App.WebhookSecretPath, err)
 	}
+
 	return bytes.TrimRight(secret, "\r\n"), nil
 }
 
@@ -490,23 +561,29 @@ func (c *Config) ReadWebhookCIDRs() ([]*net.IPNet, error) {
 	if c.App.WebhookCIDRsPath == "" {
 		return nil, nil
 	}
+
 	raw, err := os.ReadFile(c.App.WebhookCIDRsPath)
 	if err != nil {
 		slog.Error("read webhook CIDRs failed", "err", err, "path", c.App.WebhookCIDRsPath)
 		return nil, fmt.Errorf("config: read webhook CIDRs %s: %w", c.App.WebhookCIDRsPath, err)
 	}
+
 	var nets []*net.IPNet
+
 	for line := range strings.SplitSeq(string(raw), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
+
 		_, ipNet, parseErr := net.ParseCIDR(line)
 		if parseErr != nil {
 			slog.Error("parse webhook CIDR failed", "err", parseErr, "cidr", line)
 			return nil, fmt.Errorf("config: parse CIDR %q: %w", line, parseErr)
 		}
+
 		nets = append(nets, ipNet)
 	}
+
 	return nets, nil
 }

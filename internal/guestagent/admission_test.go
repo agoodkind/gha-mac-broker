@@ -22,7 +22,10 @@ type blockingSpecBuilder struct {
 	release chan struct{}
 }
 
-func (b *blockingSpecBuilder) Build(_ context.Context, request JobRequest) (guestexec.ExecSpec, error) {
+func (b *blockingSpecBuilder) Build(_ context.Context, request JobRequest) (
+	guestexec.ExecSpec,
+	error,
+) {
 	b.builds.Add(1)
 	b.started <- request.ExecutionID
 	<-b.release
@@ -51,7 +54,13 @@ func (l *fakeSlotLauncher) Run(spec guestexec.ExecSpec) (guestexec.Outcome, erro
 		_ = stdoutWriter.Close()
 		return guestexec.OutcomeUnspecified, err
 	}
-	outcome, registerErr := l.registry.Register(spec, fakeSlotPID, fakeSlotPID, stdoutReader, stderrReader)
+	outcome, registerErr := l.registry.Register(
+		spec,
+		fakeSlotPID,
+		fakeSlotPID,
+		stdoutReader,
+		stderrReader,
+	)
 	_ = stdoutWriter.Close()
 	_ = stderrWriter.Close()
 	if registerErr == nil && outcome == guestexec.OutcomeAccepted {
@@ -70,7 +79,10 @@ const fakeSlotPID = 999999
 // running Build. Without the slot lock the second would peek the still-idle slot
 // and Build concurrently, which the started-channel assertion catches.
 func TestRunJobSerializesConcurrentSameSlot(t *testing.T) {
-	registry := guestexec.New(guestexec.Options{Retention: time.Minute, HeartbeatInterval: time.Hour})
+	registry := guestexec.New(guestexec.Options{
+		Retention:         time.Minute,
+		HeartbeatInterval: time.Hour,
+	})
 	builder := &blockingSpecBuilder{
 		builds:  atomic.Int32{},
 		started: make(chan string, 2),
@@ -80,11 +92,14 @@ func TestRunJobSerializesConcurrentSameSlot(t *testing.T) {
 	handler := New(registry, Options{SlotCount: 1, SpecBuilder: builder, ChildLauncher: launcher})
 
 	runJob := func(executionID string) (guestproto.RunJobResponse_Outcome, error) {
-		response, err := handler.RunJob(context.Background(), &guestproto.RunJobRequest{
-			ExecutionId: executionID,
-			Slot:        0,
-			JitConfig:   "jit",
-		})
+		response, err := handler.RunJob(
+			context.Background(),
+			&guestproto.RunJobRequest{
+				ExecutionId: executionID,
+				Slot:        0,
+				JitConfig:   "jit",
+			},
+		)
 		if err != nil {
 			return guestproto.RunJobResponse_OUTCOME_UNSPECIFIED, err
 		}
@@ -129,9 +144,15 @@ func TestRunJobSerializesConcurrentSameSlot(t *testing.T) {
 	// never reach Build. Without the lock it would Build the same slot concurrently.
 	select {
 	case id := <-builder.started:
-		t.Fatalf("second Build ran (id=%q) while the first held the slot lock; serialization missing", id)
+		t.Fatalf(
+			"second Build ran (id=%q) while the first held the slot lock; serialization missing",
+			id,
+		)
 	case outcome := <-secondResult:
-		t.Fatalf("second returned %v before the first released; want it to block on the slot lock", outcome)
+		t.Fatalf(
+			"second returned %v before the first released; want it to block on the slot lock",
+			outcome,
+		)
 	case err := <-secondErr:
 		t.Fatalf("second RunJob error before release: %v", err)
 	case <-time.After(300 * time.Millisecond):
@@ -176,7 +197,12 @@ func TestRunJobSerializesConcurrentSameSlot(t *testing.T) {
 // is fake, so a later RunJob for the same id or slot must be refused. The pipe
 // write ends close immediately, so capture reaches EOF while the execution stays
 // running because no exit is ever reported.
-func registerRunningSlot(t *testing.T, registry *guestexec.Registry, executionID string, slot uint32) {
+func registerRunningSlot(
+	t *testing.T,
+	registry *guestexec.Registry,
+	executionID string,
+	slot uint32,
+) {
 	t.Helper()
 	stdoutReader, stdoutWriter, err := os.Pipe()
 	if err != nil {
@@ -213,7 +239,10 @@ func writeSentinel(t *testing.T, path string) {
 // busy slot are both refused without wiping the running slot's directories.
 func TestRunJobSkipsDestructivePrepWhenSlotBusy(t *testing.T) {
 	ctx := context.Background()
-	registry := guestexec.New(guestexec.Options{Retention: time.Minute, HeartbeatInterval: time.Hour})
+	registry := guestexec.New(guestexec.Options{
+		Retention:         time.Minute,
+		HeartbeatInterval: time.Hour,
+	})
 	registerRunningSlot(t, registry, "job-live", 0)
 
 	baseHome := t.TempDir()
@@ -233,11 +262,14 @@ func TestRunJobSkipsDestructivePrepWhenSlotBusy(t *testing.T) {
 	}
 	handler := New(registry, Options{SlotCount: 1, SpecBuilder: executor})
 
-	sameResponse, err := handler.RunJob(ctx, &guestproto.RunJobRequest{
-		ExecutionId: "job-live",
-		Slot:        0,
-		JitConfig:   "jit",
-	})
+	sameResponse, err := handler.RunJob(
+		ctx,
+		&guestproto.RunJobRequest{
+			ExecutionId: "job-live",
+			Slot:        0,
+			JitConfig:   "jit",
+		},
+	)
 	if err != nil {
 		t.Fatalf("RunJob same id: %v", err)
 	}
@@ -245,11 +277,14 @@ func TestRunJobSkipsDestructivePrepWhenSlotBusy(t *testing.T) {
 		t.Fatalf("same-id outcome = %v, want ALREADY_RUNNING", got)
 	}
 
-	conflictResponse, err := handler.RunJob(ctx, &guestproto.RunJobRequest{
-		ExecutionId: "job-new",
-		Slot:        0,
-		JitConfig:   "jit",
-	})
+	conflictResponse, err := handler.RunJob(
+		ctx,
+		&guestproto.RunJobRequest{
+			ExecutionId: "job-new",
+			Slot:        0,
+			JitConfig:   "jit",
+		},
+	)
 	if err != nil {
 		t.Fatalf("RunJob conflicting slot: %v", err)
 	}
@@ -264,6 +299,9 @@ func TestRunJobSkipsDestructivePrepWhenSlotBusy(t *testing.T) {
 		t.Fatalf("home sentinel stat err = %v, want the busy slot's HOME untouched", err)
 	}
 	if got := stub.count("cp") + stub.count("security") + stub.count("brew"); got != 0 {
-		t.Fatalf("system commands run = %d, want 0 (no destructive prep on a refused admission)", got)
+		t.Fatalf(
+			"system commands run = %d, want 0 (no destructive prep on a refused admission)",
+			got,
+		)
 	}
 }

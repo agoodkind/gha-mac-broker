@@ -21,9 +21,14 @@ const (
 // present. It requires tart and skopeo on PATH and fails with install hints
 // otherwise.
 func buildGoldenIfAbsent(ctx context.Context, cfg *config.Config) error {
-	if err := requireHostBinary(ctx, cfg.Tart.Binary, "brew install cirruslabs/cli/tart"); err != nil {
+	if err := requireHostBinary(
+		ctx,
+		cfg.Tart.Binary,
+		"brew install cirruslabs/cli/tart",
+	); err != nil {
 		return err
 	}
+
 	stager := fastPullStager(cfg)
 	// skopeo is only needed by the fast-pull stager; a host that disabled
 	// fast_pull builds the golden by cloning the base ref directly, so it must
@@ -37,15 +42,20 @@ func buildGoldenIfAbsent(ctx context.Context, cfg *config.Config) error {
 	vm := tart.New(cfg.Tart.Binary)
 	builder := golden.New(vm, golden.WithBaseStager(stager))
 	goldenName := golden.NameForImage(cfg.Tart.BaseImage)
-	if _, err := builder.EnsureGolden(ctx, golden.EnsureOptions{
-		Image:         cfg.Tart.BaseImage,
-		BuildVM:       goldenName + buildVMSuffix,
-		RunnerVersion: "",
-	}); err != nil {
+	if _, err := builder.EnsureGolden(
+		ctx,
+		golden.EnsureOptions{
+			Image:         cfg.Tart.BaseImage,
+			BuildVM:       goldenName + buildVMSuffix,
+			RunnerVersion: "",
+		},
+	); err != nil {
 		slog.ErrorContext(ctx, "golden ensure failed", "err", err, "golden", goldenName)
 		return fmt.Errorf("install: ensure golden: %w", err)
 	}
+
 	slog.InfoContext(ctx, "golden ready", "golden", goldenName)
+
 	return nil
 }
 
@@ -56,6 +66,7 @@ func fastPullStager(cfg *config.Config) golden.BaseStager {
 	if cfg.Tart.FastPull != nil && !*cfg.Tart.FastPull {
 		return nil
 	}
+
 	return fastpull.New(fastpull.Options{
 		Copier: skopeo.New("skopeo", cfg.Tart.FastPullParallel),
 		Dir:    cfg.Tart.FastPullDir,

@@ -80,16 +80,29 @@ func (s *Stager) Stage(ctx context.Context, image string) (string, func(), error
 		slog.ErrorContext(ctx, "fastpull parse ref failed", "err", err, "image", image)
 		return "", nil, fmt.Errorf("fastpull: parse %s: %w", image, err)
 	}
+
 	host := ref.Context().RegistryStr()
 	repo := ref.Context().RepositoryStr()
 	if host != cirrusRegistry || !isCirrusXcodeRepo(repo) {
 		err := fmt.Errorf("fastpull: refusing non-cirrus image %q", image)
-		slog.ErrorContext(ctx, "fastpull refusing non-cirrus image", "err", err, "image", image, "host", host)
+		slog.ErrorContext(
+			ctx,
+			"fastpull refusing non-cirrus image",
+			"err",
+			err,
+			"image",
+			image,
+			"host",
+			host,
+		)
+
 		return "", nil, err
 	}
+
 	if s.copier == nil {
 		err := fmt.Errorf("fastpull: missing OCI layout copier")
 		slog.ErrorContext(ctx, "fastpull copier missing", "err", err)
+
 		return "", nil, err
 	}
 
@@ -100,25 +113,35 @@ func (s *Stager) Stage(ctx context.Context, image string) (string, func(), error
 	}
 
 	client := &http.Client{Timeout: clientTimeout}
-	handler := registry.New(registry.WithBlobHandler(registry.NewDiskBlobHandler(filepath.Join(s.dir, "blobs"))))
+	handler := registry.New(
+		registry.WithBlobHandler(registry.NewDiskBlobHandler(filepath.Join(s.dir, "blobs"))),
+	)
 	var listenConfig net.ListenConfig
 	listener, err := listenConfig.Listen(ctx, "tcp", loopbackHost+":0")
 	if err != nil {
 		slog.ErrorContext(ctx, "fastpull listen failed", "err", err)
 		return "", nil, fmt.Errorf("fastpull: listen %s: %w", loopbackHost, err)
 	}
+
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	if !ok {
 		_ = listener.Close()
 		err := fmt.Errorf("fastpull: unexpected listener address type %T", listener.Addr())
 		slog.ErrorContext(ctx, "fastpull listener addr type", "err", err)
+
 		return "", nil, err
 	}
+
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: readHeaderTimeout}
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "fastpull registry goroutine panic", "err", fmt.Errorf("panic: %v", r))
+				slog.ErrorContext(
+					ctx,
+					"fastpull registry goroutine panic",
+					"err",
+					fmt.Errorf("panic: %v", r),
+				)
 			}
 		}()
 		_ = srv.Serve(listener)
@@ -133,21 +156,37 @@ func (s *Stager) Stage(ctx context.Context, image string) (string, func(), error
 
 	localRef := loopbackHost + ":" + strconv.Itoa(port) + "/" + repo + ":" + tag
 	slog.InfoContext(ctx, "fastpull staged base image", "ref", localRef)
+
 	return localRef, stop, nil
 }
 
-func (s *Stager) registerManifest(ctx context.Context, client *http.Client, port int, repo, tag string) error {
+func (s *Stager) registerManifest(
+	ctx context.Context,
+	client *http.Client,
+	port int,
+	repo string,
+	tag string,
+) error {
 	desc, manifestBytes, err := s.readLayoutManifest(ctx)
 	if err != nil {
 		return err
 	}
+
 	base := "http://" + loopbackHost + ":" + strconv.Itoa(port) + "/v2/" + repo + "/manifests/"
-	if err := putManifest(ctx, client, base+desc.Digest, desc.MediaType, manifestBytes); err != nil {
+	if err := putManifest(
+		ctx,
+		client,
+		base+desc.Digest,
+		desc.MediaType,
+		manifestBytes,
+	); err != nil {
 		return err
 	}
+
 	if err := putManifest(ctx, client, base+tag, desc.MediaType, manifestBytes); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -158,32 +197,65 @@ func (s *Stager) readLayoutManifest(ctx context.Context) (ociDescriptor, []byte,
 		slog.ErrorContext(ctx, "fastpull read OCI index failed", "err", err, "path", indexPath)
 		return ociDescriptor{}, nil, fmt.Errorf("fastpull: read OCI index %s: %w", indexPath, err)
 	}
+
 	var index ociIndex
 	if err := json.Unmarshal(indexBytes, &index); err != nil {
 		slog.ErrorContext(ctx, "fastpull parse OCI index failed", "err", err, "path", indexPath)
 		return ociDescriptor{}, nil, fmt.Errorf("fastpull: parse OCI index %s: %w", indexPath, err)
 	}
+
 	if len(index.Manifests) != 1 {
 		err := fmt.Errorf("fastpull: OCI index has %d manifests, want 1", len(index.Manifests))
-		slog.ErrorContext(ctx, "fastpull OCI index manifest count invalid", "err", err, "path", indexPath)
+		slog.ErrorContext(
+			ctx,
+			"fastpull OCI index manifest count invalid",
+			"err",
+			err,
+			"path",
+			indexPath,
+		)
+
 		return ociDescriptor{}, nil, err
 	}
+
 	desc := index.Manifests[0]
 	if desc.MediaType == "" || desc.Digest == "" {
 		err := fmt.Errorf("fastpull: OCI index manifest descriptor missing mediaType or digest")
 		slog.ErrorContext(ctx, "fastpull OCI descriptor invalid", "err", err, "path", indexPath)
+
 		return ociDescriptor{}, nil, err
 	}
+
 	manifestPath, err := blobPathForDigest(s.dir, desc.Digest)
 	if err != nil {
-		slog.ErrorContext(ctx, "fastpull OCI manifest digest invalid", "err", err, "digest", desc.Digest)
+		slog.ErrorContext(
+			ctx,
+			"fastpull OCI manifest digest invalid",
+			"err",
+			err,
+			"digest",
+			desc.Digest,
+		)
 		return ociDescriptor{}, nil, err
 	}
+
 	manifestBytes, err := os.ReadFile(manifestPath)
 	if err != nil {
-		slog.ErrorContext(ctx, "fastpull read OCI manifest blob failed", "err", err, "path", manifestPath)
-		return ociDescriptor{}, nil, fmt.Errorf("fastpull: read OCI manifest %s: %w", manifestPath, err)
+		slog.ErrorContext(
+			ctx,
+			"fastpull read OCI manifest blob failed",
+			"err",
+			err,
+			"path",
+			manifestPath,
+		)
+		return ociDescriptor{}, nil, fmt.Errorf(
+			"fastpull: read OCI manifest %s: %w",
+			manifestPath,
+			err,
+		)
 	}
+
 	return desc, manifestBytes, nil
 }
 
@@ -192,28 +264,39 @@ func blobPathForDigest(layoutDir string, digest string) (string, error) {
 	if !found || algorithm == "" || hexValue == "" {
 		return "", fmt.Errorf("fastpull: invalid digest %q", digest)
 	}
+
 	return filepath.Join(layoutDir, "blobs", algorithm, hexValue), nil
 }
 
 // putManifest PUTs raw manifest bytes to the loopback registry.
-func putManifest(ctx context.Context, client *http.Client, url, mediaType string, body []byte) error {
+func putManifest(
+	ctx context.Context,
+	client *http.Client,
+	url string,
+	mediaType string,
+	body []byte,
+) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, mediaTypeReader(body))
 	if err != nil {
 		slog.ErrorContext(ctx, "fastpull build put failed", "err", err, "url", url)
 		return fmt.Errorf("fastpull: build put %s: %w", url, err)
 	}
+
 	req.Header.Set("Content-Type", mediaType)
 	resp, err := client.Do(req)
 	if err != nil {
 		slog.ErrorContext(ctx, "fastpull put request failed", "err", err, "url", url)
 		return fmt.Errorf("fastpull: put %s: %w", url, err)
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		err := fmt.Errorf("fastpull: put %s status %d", url, resp.StatusCode)
 		slog.ErrorContext(ctx, "fastpull put non-2xx", "err", err, "status", resp.StatusCode)
+
 		return err
 	}
+
 	return nil
 }
 

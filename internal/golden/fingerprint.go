@@ -46,13 +46,18 @@ func Fingerprint(inputs FingerprintInputs) string {
 	writeFingerprintField(digest, "binary", inputs.BinaryDigest)
 	payloads := make([]PayloadDigest, len(inputs.Payloads))
 	copy(payloads, inputs.Payloads)
-	sort.Slice(payloads, func(i, j int) bool {
-		return payloads[i].Name < payloads[j].Name
-	})
+	sort.Slice(
+		payloads,
+		func(i, j int) bool {
+			return payloads[i].Name < payloads[j].Name
+		},
+	)
+
 	for _, payload := range payloads {
 		writeFingerprintField(digest, "payload-name", payload.Name)
 		writeFingerprintField(digest, "payload-digest", payload.Digest)
 	}
+
 	return hex.EncodeToString(digest.Sum(nil))
 }
 

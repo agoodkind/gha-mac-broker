@@ -29,8 +29,10 @@ func testKeyPEM(t *testing.T) ([]byte, *rsa.PrivateKey) {
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
+
 	der := x509.MarshalPKCS1PrivateKey(key)
 	block := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: der}
+
 	return pem.EncodeToMemory(block), key
 }
 
@@ -41,12 +43,14 @@ func TestAppJWTVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	client.now = func() time.Time { return fixed }
 
 	token, err := client.appJWT(context.Background())
 	if err != nil {
 		t.Fatalf("appJWT: %v", err)
 	}
+
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		t.Fatalf("expected 3 jwt parts, got %d", len(parts))
@@ -58,6 +62,7 @@ func TestAppJWTVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode sig: %v", err)
 	}
+
 	if err := rsa.VerifyPKCS1v15(&key.PublicKey, crypto.SHA256, digest[:], sig); err != nil {
 		t.Fatalf("jwt signature did not verify: %v", err)
 	}
@@ -66,6 +71,7 @@ func TestAppJWTVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode claims: %v", err)
 	}
+
 	var claims struct {
 		Iss string `json:"iss"`
 		Iat int64  `json:"iat"`
@@ -74,12 +80,15 @@ func TestAppJWTVerifies(t *testing.T) {
 	if err := json.Unmarshal(claimsJSON, &claims); err != nil {
 		t.Fatalf("unmarshal claims: %v", err)
 	}
+
 	if claims.Iss != "12345" {
 		t.Errorf("iss = %q, want 12345", claims.Iss)
 	}
+
 	if claims.Exp <= claims.Iat {
 		t.Errorf("exp %d must be after iat %d", claims.Exp, claims.Iat)
 	}
+
 	if got := claims.Exp - claims.Iat; got > int64((10 * time.Minute).Seconds()) {
 		t.Errorf("jwt window %ds exceeds GitHub 10 minute cap", got)
 	}
@@ -92,8 +101,12 @@ func TestGenerateJITConfigFlow(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/installation":
 			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-				t.Errorf("installation lookup must use App JWT bearer, got %q", r.Header.Get("Authorization"))
+				t.Errorf(
+					"installation lookup must use App JWT bearer, got %q",
+					r.Header.Get("Authorization"),
+				)
 			}
+
 			_ = json.NewEncoder(w).Encode(installationResponse{ID: 999})
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/999/access_tokens":
 			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "ghs_installationtoken"})
@@ -101,11 +114,13 @@ func TestGenerateJITConfigFlow(t *testing.T) {
 			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
 				t.Errorf("jitconfig must use installation token, got %q", got)
 			}
+
 			var body jitConfigRequest
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			if body.Name != "warm-vm-1" {
 				t.Errorf("runner name = %v, want warm-vm-1", body.Name)
 			}
+
 			_ = json.NewEncoder(w).Encode(JITConfig{
 				EncodedJITConfig: "ZW5jb2RlZA==",
 				Runner:           runnerInfo{ID: 7, Name: "warm-vm-1"},
@@ -119,6 +134,7 @@ func TestGenerateJITConfigFlow(t *testing.T) {
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, r)
+
 			return recorder.Result(), nil
 		}),
 	}
@@ -127,6 +143,7 @@ func TestGenerateJITConfigFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	client.apiBase = "https://api.github.test"
 	ctx := context.Background()
 
@@ -134,6 +151,7 @@ func TestGenerateJITConfigFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InstallationID: %v", err)
 	}
+
 	if installationID != 999 {
 		t.Fatalf("installationID = %d, want 999", installationID)
 	}
@@ -143,13 +161,22 @@ func TestGenerateJITConfigFlow(t *testing.T) {
 		t.Fatalf("InstallationToken: %v", err)
 	}
 
-	jit, err := client.GenerateJITConfig(ctx, token, "agoodkind", "lmd", "warm-vm-1", []string{"self-hosted", "macOS", "agk-local-macos-26"})
+	jit, err := client.GenerateJITConfig(
+		ctx,
+		token,
+		"agoodkind",
+		"lmd",
+		"warm-vm-1",
+		[]string{"self-hosted", "macOS", "agk-local-macos-26"},
+	)
 	if err != nil {
 		t.Fatalf("GenerateJITConfig: %v", err)
 	}
+
 	if jit.EncodedJITConfig != "ZW5jb2RlZA==" {
 		t.Errorf("encoded config = %q", jit.EncodedJITConfig)
 	}
+
 	if jit.Runner.Name != "warm-vm-1" {
 		t.Errorf("runner name = %q", jit.Runner.Name)
 	}
@@ -162,8 +189,12 @@ func TestRunManagementFlow(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/installation":
 			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-				t.Errorf("installation lookup must use App JWT bearer, got %q", r.Header.Get("Authorization"))
+				t.Errorf(
+					"installation lookup must use App JWT bearer, got %q",
+					r.Header.Get("Authorization"),
+				)
 			}
+
 			_ = json.NewEncoder(w).Encode(installationResponse{ID: 999})
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/999/access_tokens":
 			var body accessTokenRequest
@@ -171,22 +202,30 @@ func TestRunManagementFlow(t *testing.T) {
 			if len(body.Repositories) != 1 || body.Repositories[0] != "lmd" {
 				t.Errorf("token repositories = %v, want lmd", body.Repositories)
 			}
+
 			if body.Permissions.Administration != "write" {
-				t.Errorf("administration permission = %q, want write", body.Permissions.Administration)
+				t.Errorf(
+					"administration permission = %q, want write",
+					body.Permissions.Administration,
+				)
 			}
+
 			if body.Permissions.Actions != "write" {
 				t.Errorf("actions permission = %q, want write", body.Permissions.Actions)
 			}
+
 			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "ghs_installationtoken"})
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/agoodkind/lmd/actions/runs/321/cancel":
 			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
 				t.Errorf("cancel must use installation token, got %q", got)
 			}
+
 			w.WriteHeader(http.StatusAccepted)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/agoodkind/lmd/actions/runners":
 			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
 				t.Errorf("runner list must use installation token, got %q", got)
 			}
+
 			_ = json.NewEncoder(w).Encode(runnerListResponse{
 				TotalCount: 2,
 				Runners: []Runner{
@@ -198,6 +237,7 @@ func TestRunManagementFlow(t *testing.T) {
 			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
 				t.Errorf("runner delete must use installation token, got %q", got)
 			}
+
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -208,6 +248,7 @@ func TestRunManagementFlow(t *testing.T) {
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, r)
+
 			return recorder.Result(), nil
 		}),
 	}
@@ -216,22 +257,27 @@ func TestRunManagementFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	client.apiBase = "https://api.github.test"
 	ctx := context.Background()
 
 	if err := client.CancelRun(ctx, "agoodkind/lmd", 321); err != nil {
 		t.Fatalf("CancelRun: %v", err)
 	}
+
 	runners, err := client.ListRunners(ctx, "agoodkind/lmd")
 	if err != nil {
 		t.Fatalf("ListRunners: %v", err)
 	}
+
 	if len(runners) != 2 {
 		t.Fatalf("runner count = %d, want 2", len(runners))
 	}
+
 	if runners[0].Status != "offline" {
 		t.Fatalf("first runner status = %q, want offline", runners[0].Status)
 	}
+
 	if err := client.DeleteRunner(ctx, "agoodkind/lmd", 11); err != nil {
 		t.Fatalf("DeleteRunner: %v", err)
 	}
@@ -250,13 +296,16 @@ func TestListRunnersReadsAllPages(t *testing.T) {
 			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
 				t.Errorf("runner list must use installation token, got %q", got)
 			}
+
 			if got := r.URL.Query().Get("per_page"); got != "100" {
 				t.Errorf("per_page = %q, want 100", got)
 			}
+
 			page := r.URL.Query().Get("page")
 			if page == "" {
 				page = "1"
 			}
+
 			switch page {
 			case "1":
 				_ = json.NewEncoder(w).Encode(runnerListResponse{
@@ -288,6 +337,7 @@ func TestListRunnersReadsAllPages(t *testing.T) {
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, r)
+
 			return recorder.Result(), nil
 		}),
 	}
@@ -296,15 +346,18 @@ func TestListRunnersReadsAllPages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	client.apiBase = "https://api.github.test"
 
 	runners, err := client.ListRunners(context.Background(), "agoodkind/lmd")
 	if err != nil {
 		t.Fatalf("ListRunners: %v", err)
 	}
+
 	if len(runners) != 3 {
 		t.Fatalf("runner count = %d, want 3", len(runners))
 	}
+
 	if runners[2].ID != 13 {
 		t.Fatalf("third runner id = %d, want 13", runners[2].ID)
 	}
@@ -320,6 +373,7 @@ func TestListInProgressHostedMacOSJobsFiltersToHostedMacOS(t *testing.T) {
 			if page == "" {
 				page = "1"
 			}
+
 			switch page {
 			case "1":
 				_ = json.NewEncoder(w).Encode([]map[string]int64{{"id": 100}})
@@ -339,11 +393,14 @@ func TestListInProgressHostedMacOSJobsFiltersToHostedMacOS(t *testing.T) {
 			if got := r.URL.Query().Get("status"); got != "in_progress" {
 				t.Errorf("runs status = %q, want in_progress", got)
 			}
+
 			_ = json.NewEncoder(w).Encode(inProgressRunsResponse{
 				TotalCount: 1,
 				WorkflowRuns: []struct {
 					ID int64 `json:"id"`
-				}{{ID: 555}},
+				}{
+					{ID: 555},
+				},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/actions/runs/555/jobs":
 			_ = json.NewEncoder(w).Encode(runJobsResponse{
@@ -366,6 +423,7 @@ func TestListInProgressHostedMacOSJobsFiltersToHostedMacOS(t *testing.T) {
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, r)
+
 			return recorder.Result(), nil
 		}),
 	}
@@ -374,18 +432,25 @@ func TestListInProgressHostedMacOSJobsFiltersToHostedMacOS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	client.apiBase = "https://api.github.test"
 
-	jobs, err := client.ListInProgressHostedMacOSJobs(context.Background(), []string{"self-hosted", "agk-local-macos-26"})
+	jobs, err := client.ListInProgressHostedMacOSJobs(
+		context.Background(),
+		[]string{"self-hosted", "agk-local-macos-26"},
+	)
 	if err != nil {
 		t.Fatalf("ListInProgressHostedMacOSJobs: %v", err)
 	}
+
 	if len(jobs) != 1 {
 		t.Fatalf("job count = %d, want 1 (only the hosted macOS job)", len(jobs))
 	}
+
 	if _, ok := jobs[1001]; !ok {
 		t.Errorf("expected hosted macOS job 1001 in set, got %v", jobs)
 	}
+
 	if _, ok := jobs[1002]; ok {
 		t.Errorf("ubuntu job 1002 must not be in the hosted macOS set")
 	}
@@ -405,12 +470,17 @@ func TestListInstalledReposReadsAppInstallations(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/app/installations":
 			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-				t.Errorf("installation list must use App JWT bearer, got %q", r.Header.Get("Authorization"))
+				t.Errorf(
+					"installation list must use App JWT bearer, got %q",
+					r.Header.Get("Authorization"),
+				)
 			}
+
 			page := r.URL.Query().Get("page")
 			if page == "" {
 				page = "1"
 			}
+
 			switch page {
 			case "1":
 				_ = json.NewEncoder(w).Encode([]map[string]int64{{"id": 100}, {"id": 200}})
@@ -421,8 +491,11 @@ func TestListInstalledReposReadsAppInstallations(t *testing.T) {
 			var body map[string]json.RawMessage
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			if _, ok := body["repositories"]; ok {
-				t.Error("installed repository listing token should not be scoped to named repositories")
+				t.Error(
+					"installed repository listing token should not be scoped to named repositories",
+				)
 			}
+
 			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "token-100"})
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/200/access_tokens":
 			_ = json.NewEncoder(w).Encode(accessTokenResponse{Token: "token-200"})
@@ -456,6 +529,7 @@ func TestListInstalledReposReadsAppInstallations(t *testing.T) {
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, r)
+
 			return recorder.Result(), nil
 		}),
 	}
@@ -464,12 +538,14 @@ func TestListInstalledReposReadsAppInstallations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	client.apiBase = "https://api.github.test"
 
 	repos, err := client.ListInstalledRepos(context.Background())
 	if err != nil {
 		t.Fatalf("ListInstalledRepos: %v", err)
 	}
+
 	want := []string{"owner/one", "owner/two", "other/repo"}
 	if strings.Join(repos, ",") != strings.Join(want, ",") {
 		t.Fatalf("repos = %v, want %v", repos, want)
@@ -491,9 +567,11 @@ func TestCancelActiveRunsForHeadSHACancelsOnlyActiveRuns(t *testing.T) {
 			if got := r.URL.Query().Get("head_sha"); got != headSHA {
 				t.Errorf("head_sha query = %q, want %q", got, headSHA)
 			}
+
 			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
 				t.Errorf("runs list must use installation token, got %q", got)
 			}
+
 			_ = json.NewEncoder(w).Encode(runsByHeadResponse{
 				TotalCount: 5,
 				WorkflowRuns: []struct {
@@ -507,11 +585,18 @@ func TestCancelActiveRunsForHeadSHACancelsOnlyActiveRuns(t *testing.T) {
 					{ID: 999, Status: "completed"},
 				},
 			})
-		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/repos/agoodkind/lmd/actions/runs/") && strings.HasSuffix(r.URL.Path, "/cancel"):
+		case r.Method == http.MethodPost && strings.HasPrefix(
+			r.URL.Path,
+			"/repos/agoodkind/lmd/actions/runs/",
+		) && strings.HasSuffix(r.URL.Path, "/cancel"):
 			if got := r.Header.Get("Authorization"); got != "token ghs_installationtoken" {
 				t.Errorf("cancel must use installation token, got %q", got)
 			}
-			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/repos/agoodkind/lmd/actions/runs/"), "/cancel")
+
+			id := strings.TrimSuffix(
+				strings.TrimPrefix(r.URL.Path, "/repos/agoodkind/lmd/actions/runs/"),
+				"/cancel",
+			)
 			cancelled = append(cancelled, id)
 			w.WriteHeader(http.StatusAccepted)
 		default:
@@ -523,6 +608,7 @@ func TestCancelActiveRunsForHeadSHACancelsOnlyActiveRuns(t *testing.T) {
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, r)
+
 			return recorder.Result(), nil
 		}),
 	}
@@ -531,19 +617,25 @@ func TestCancelActiveRunsForHeadSHACancelsOnlyActiveRuns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	client.apiBase = "https://api.github.test"
 
 	count, err := client.CancelActiveRunsForHeadSHA(context.Background(), "agoodkind/lmd", headSHA)
 	if err != nil {
 		t.Fatalf("CancelActiveRunsForHeadSHA: %v", err)
 	}
+
 	if count != 4 {
 		t.Fatalf("cancelled count = %d, want 4", count)
 	}
+
 	// queued, in_progress, requested, and waiting are all non-completed and must be
 	// cancelled; the completed run 999 must be skipped.
 	if strings.Join(cancelled, ",") != "321,322,323,324" {
-		t.Fatalf("cancelled runs = %v, want [321 322 323 324]; the completed run 999 must be skipped", cancelled)
+		t.Fatalf(
+			"cancelled runs = %v, want [321 322 323 324]; the completed run 999 must be skipped",
+			cancelled,
+		)
 	}
 }
 
@@ -581,6 +673,7 @@ func TestCancelActiveRunsForHeadSHAReturnsErrorWhenACancelFails(t *testing.T) {
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, r)
+
 			return recorder.Result(), nil
 		}),
 	}
@@ -589,12 +682,14 @@ func TestCancelActiveRunsForHeadSHAReturnsErrorWhenACancelFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	client.apiBase = "https://api.github.test"
 
 	count, err := client.CancelActiveRunsForHeadSHA(context.Background(), "agoodkind/lmd", headSHA)
 	if err == nil {
 		t.Fatal("CancelActiveRunsForHeadSHA returned nil error, want error when a cancel fails")
 	}
+
 	if count != 1 {
 		t.Fatalf("cancelled count = %d, want 1 (run 321 cancelled, run 322 failed)", count)
 	}

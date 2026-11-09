@@ -17,17 +17,39 @@ func runGuestWriteSlots(ctx context.Context, args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("guest-write-slots requires exactly one slot count argument")
 	}
+
 	parsed, err := strconv.ParseUint(args[0], 10, 32)
 	if err != nil {
-		slog.ErrorContext(ctx, "guest-write-slots parse slot count failed", "err", err, "arg", args[0])
+		slog.ErrorContext(
+			ctx,
+			"guest-write-slots parse slot count failed",
+			"err",
+			err,
+			"arg",
+			args[0],
+		)
 		return fmt.Errorf("guest-write-slots parse slot count %q: %w", args[0], err)
 	}
+
 	if parsed == 0 {
 		return fmt.Errorf("guest-write-slots requires a positive slot count")
 	}
-	if err := guestsupervisor.WriteSlotCount(guestsupervisor.SlotCountPath, uint32(parsed)); err != nil {
+
+	if err := guestsupervisor.WriteSlotCount(
+		guestsupervisor.SlotCountPath,
+		uint32(parsed),
+	); err != nil {
 		return fmt.Errorf("guest-write-slots: %w", err)
 	}
-	slog.InfoContext(ctx, "guest-write-slots wrote slot count", "path", guestsupervisor.SlotCountPath, "slot_count", parsed)
+
+	slog.InfoContext(
+		ctx,
+		"guest-write-slots wrote slot count",
+		"path",
+		guestsupervisor.SlotCountPath,
+		"slot_count",
+		parsed,
+	)
+
 	return nil
 }

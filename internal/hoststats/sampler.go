@@ -24,13 +24,19 @@ type Sampler struct {
 // through inventory, configured with opts. now supplies the clock used to
 // stamp each Sample; callers pass [time.Now] in production and a fake clock
 // in tests.
-func New(reader Reader, inventory func(context.Context) Inventory, now func() time.Time, opts Options) *Sampler {
+func New(
+	reader Reader,
+	inventory func(context.Context) Inventory,
+	now func() time.Time,
+	opts Options,
+) *Sampler {
 	s := new(Sampler)
 	s.reader = reader
 	s.inventory = inventory
 	s.now = now
 	s.enabled = opts.Enabled
 	s.interval = opts.Interval
+
 	return s
 }
 
@@ -39,6 +45,7 @@ func New(reader Reader, inventory func(context.Context) Inventory, now func() ti
 func (s *Sampler) Latest() Sample {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return s.latest
 }
 
@@ -56,6 +63,7 @@ func (s *Sampler) Reconfigure(opts Options) {
 func (s *Sampler) currentInterval() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return s.interval
 }
 
@@ -77,6 +85,7 @@ func (s *Sampler) sampleOnce(ctx context.Context) {
 	if err != nil {
 		return
 	}
+
 	inv := s.inventory(ctx)
 	sample := Sample{Host: h, Inventory: inv, SampledAt: s.now()}
 
@@ -84,16 +93,27 @@ func (s *Sampler) sampleOnce(ctx context.Context) {
 	s.latest = sample
 	s.mu.Unlock()
 
-	slog.InfoContext(ctx, "host stats sampled",
-		"idle_pct", h.IdlePct,
-		"load1", h.Load1,
-		"mem_used_pct", h.MemUsedPct,
-		"swap_out", h.SwapOut,
-		"disk_used_pct", h.DiskUsedPct,
-		"uptime_seconds", h.UptimeSeconds,
-		"running_vms", inv.RunnerCount,
-		"busy", inv.Busy,
-		"queued", inv.Queued,
+	slog.InfoContext(
+		ctx,
+		"host stats sampled",
+		"idle_pct",
+		h.IdlePct,
+		"load1",
+		h.Load1,
+		"mem_used_pct",
+		h.MemUsedPct,
+		"swap_out",
+		h.SwapOut,
+		"disk_used_pct",
+		h.DiskUsedPct,
+		"uptime_seconds",
+		h.UptimeSeconds,
+		"running_vms",
+		inv.RunnerCount,
+		"busy",
+		inv.Busy,
+		"queued",
+		inv.Queued,
 	)
 }
 
@@ -103,7 +123,12 @@ func (s *Sampler) sampleOnce(ctx context.Context) {
 func (s *Sampler) sampleOnceSafe(ctx context.Context) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			slog.ErrorContext(ctx, "host stats sample panic recovered; skipping this observation", "err", recovered)
+			slog.ErrorContext(
+				ctx,
+				"host stats sample panic recovered; skipping this observation",
+				"err",
+				recovered,
+			)
 		}
 	}()
 	s.sampleOnce(ctx)
@@ -120,12 +145,18 @@ func (s *Sampler) Start(ctx context.Context) {
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				slog.ErrorContext(ctx, "host stats sampler goroutine panic recovered", "err", recovered)
+				slog.ErrorContext(
+					ctx,
+					"host stats sampler goroutine panic recovered",
+					"err",
+					recovered,
+				)
 			}
 		}()
 		s.sampleOnceSafe(ctx)
 		timer := time.NewTimer(s.currentInterval())
 		defer timer.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():

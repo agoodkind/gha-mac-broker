@@ -51,6 +51,7 @@ func DialContext(_ context.Context, dial GuestDialer, token string) *Client {
 	}
 	transport.Protocols = new(http.Protocols)
 	transport.Protocols.SetUnencryptedHTTP2(true)
+
 	return &Client{
 		httpClient:  &http.Client{Transport: transport},
 		interceptor: NewClientAuthInterceptor(token),
@@ -106,31 +107,38 @@ func Serve(
 	server.Protocols.SetHTTP1(true)
 	server.Protocols.SetUnencryptedHTTP2(true)
 	shutdownDone := make(chan error, 1)
-	stopShutdown := context.AfterFunc(ctx, func() {
-		shutdownContext, cancelShutdown := context.WithTimeout(
-			context.WithoutCancel(ctx),
-			shutdownTimeout,
-		)
-		defer cancelShutdown()
-		shutdownError := server.Shutdown(shutdownContext)
-		closeError := trackedListener.closeConnections()
-		if shutdownError != nil {
-			shutdownDone <- shutdownError
-			return
-		}
-		shutdownDone <- closeError
-	})
+	stopShutdown := context.AfterFunc(
+		ctx,
+		func() {
+			shutdownContext, cancelShutdown := context.WithTimeout(
+				context.WithoutCancel(ctx),
+				shutdownTimeout,
+			)
+			defer cancelShutdown()
+			shutdownError := server.Shutdown(shutdownContext)
+			closeError := trackedListener.closeConnections()
+			if shutdownError != nil {
+				shutdownDone <- shutdownError
+				return
+			}
+
+			shutdownDone <- closeError
+		},
+	)
 
 	serveError := normalizeServerError(server.Serve(trackedListener))
 	if stopShutdown() {
 		return serveError
 	}
+
 	if shutdownError := <-shutdownDone; shutdownError != nil {
 		return shutdownError
 	}
+
 	if serveError != nil {
 		return serveError
 	}
+
 	return transportError{operation: "context", err: ctx.Err()}
 }
 
@@ -153,6 +161,7 @@ func (listener *trackedListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, transportError{operation: "accept", err: err}
 	}
+
 	tracked := &trackedConnection{
 		Conn:     connection,
 		listener: listener,
@@ -162,23 +171,28 @@ func (listener *trackedListener) Accept() (net.Conn, error) {
 	listener.mutex.Lock()
 	listener.connections[tracked] = struct{}{}
 	listener.mutex.Unlock()
+
 	return tracked, nil
 }
 
 func (listener *trackedListener) closeConnections() error {
 	listener.mutex.Lock()
+
 	connections := make([]*trackedConnection, 0, len(listener.connections))
 	for connection := range listener.connections {
 		connections = append(connections, connection)
 	}
+
 	listener.mutex.Unlock()
 
 	var closeError error
+
 	for _, connection := range connections {
 		if err := connection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			closeError = err
 		}
 	}
+
 	return closeError
 }
 
@@ -200,6 +214,7 @@ func (connection *trackedConnection) Close() error {
 		connection.err = connection.Conn.Close()
 		connection.listener.remove(connection)
 	})
+
 	return connection.err
 }
 
@@ -212,7 +227,9 @@ func NewClientAuthInterceptor(token string) connect.ClientInterceptor {
 			if !found {
 				return nil, errors.New("guest transport: missing client call metadata")
 			}
+
 			info.RequestHeader().Set(authorizationHeader, bearerPrefix+token)
+
 			return next(ctx, spec)
 		}
 	}
@@ -227,9 +244,11 @@ func NewServerAuthInterceptor(token string) connect.ServerInterceptor {
 			if !found {
 				return unauthenticatedError()
 			}
+
 			if !validAuthorizationValue(info.RequestHeader().Get(authorizationHeader), token) {
 				return unauthenticatedError()
 			}
+
 			return next(ctx, spec, stream)
 		}
 	}
@@ -237,11 +256,13 @@ func NewServerAuthInterceptor(token string) connect.ServerInterceptor {
 
 func requireBearerToken(next http.Handler, token string) http.Handler {
 	errorWriter := connecthttp.NewErrorWriter()
+
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if validAuthorization(request.Header, token) {
 			next.ServeHTTP(response, request)
 			return
 		}
+
 		if err := errorWriter.Write(response, request, unauthenticatedError()); err != nil {
 			http.Error(response, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 		}
@@ -257,8 +278,10 @@ func validAuthorizationValue(value string, expectedToken string) bool {
 	if !found {
 		providedToken = ""
 	}
+
 	providedHash := sha256.Sum256([]byte(providedToken))
 	expectedHash := sha256.Sum256([]byte(expectedToken))
+
 	return found && subtle.ConstantTimeCompare(providedHash[:], expectedHash[:]) == 1
 }
 
@@ -270,6 +293,7 @@ func normalizeServerError(err error) error {
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
+
 	return err
 }
 
