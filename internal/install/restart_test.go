@@ -86,6 +86,7 @@ func TestRestartSystemdReloadsAndRestartsExistingUnit(t *testing.T) {
 				commands,
 				capturedServiceCommand{name: name, args: append([]string(nil), args...)},
 			)
+
 			return nil, nil
 		},
 	)

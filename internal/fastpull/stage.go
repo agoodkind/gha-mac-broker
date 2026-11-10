@@ -236,6 +236,7 @@ func (s *Stager) readLayoutManifest(ctx context.Context) (ociDescriptor, []byte,
 			"digest",
 			desc.Digest,
 		)
+
 		return ociDescriptor{}, nil, err
 	}
 
@@ -249,6 +250,7 @@ func (s *Stager) readLayoutManifest(ctx context.Context) (ociDescriptor, []byte,
 			"path",
 			manifestPath,
 		)
+
 		return ociDescriptor{}, nil, fmt.Errorf(
 			"fastpull: read OCI manifest %s: %w",
 			manifestPath,

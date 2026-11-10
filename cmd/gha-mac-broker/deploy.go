@@ -140,6 +140,7 @@ func executeDeploy(ctx context.Context, action deploy.Action, stdout io.Writer) 
 				"action",
 				action.String(),
 			)
+
 			return fmt.Errorf("deploy: reconcile host: %w", err)
 		}
 
@@ -156,6 +157,7 @@ func executeDeploy(ctx context.Context, action deploy.Action, stdout io.Writer) 
 			stdout,
 			"deploy: "+action.String()+" touches the pool and is held for the operator; not applied",
 		)
+
 		return nil
 	default:
 		err := fmt.Errorf("deploy: unknown action %s", action)

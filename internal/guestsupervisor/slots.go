@@ -150,6 +150,7 @@ func AwaitSlotCount(
 				"fallback",
 				fallback,
 			)
+
 			return fallback
 		case <-ticker.C:
 		}

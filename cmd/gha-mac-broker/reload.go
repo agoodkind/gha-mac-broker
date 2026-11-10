@@ -106,6 +106,7 @@ func (w *configReloadWatcher) poll(ctx context.Context) {
 			"path",
 			w.path,
 		)
+
 		return
 	}
 
@@ -171,6 +172,7 @@ func (w *configReloadWatcher) poll(ctx context.Context) {
 			"path",
 			w.path,
 		)
+
 		return
 	}
 

@@ -21,6 +21,7 @@ func TestFingerprintIsDeterministic(t *testing.T) {
 	if first != second {
 		t.Fatalf("fingerprint not deterministic: %q != %q", first, second)
 	}
+
 	if first == "" {
 		t.Fatal("fingerprint is empty")
 	}

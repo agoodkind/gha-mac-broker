@@ -1,3 +1,5 @@
+# deadcode: generated_at=2026-11-10T10:02:15Z
+internal/guesttransport/guesttransport.go:240:6: unreachable func: NewServerAuthInterceptor	# deadcode:first_added=2026-11-10T10:02:15Z last_seen=2026-11-10T10:02:15Z
 internal/guestclient/client.go:105:6: unreachable func: baseURL
 internal/guestclient/client.go:23:6: unreachable func: New
 internal/guestclient/client.go:34:23: unreachable func: Client.Hello
@@ -6,7 +8,6 @@ internal/guestclient/client.go:60:23: unreachable func: Client.JobStatus
 internal/guestclient/client.go:80:23: unreachable func: Client.Reattach
 internal/guestclient/client.go:93:23: unreachable func: Client.CancelJob
 internal/guesttransport/guesttransport.go:194:6: unreachable func: NewClientAuthInterceptor
-internal/guesttransport/guesttransport.go:200:6: unreachable func: NewServerAuthInterceptor
 internal/guesttransport/guesttransport.go:209:37: unreachable func: authInterceptor.WrapUnary
 internal/guesttransport/guesttransport.go:220:37: unreachable func: authInterceptor.WrapStreamingClient
 internal/guesttransport/guesttransport.go:232:37: unreachable func: authInterceptor.WrapStreamingHandler

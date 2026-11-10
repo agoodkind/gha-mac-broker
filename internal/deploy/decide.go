@@ -83,6 +83,7 @@ func Decide(in Inputs) Action {
 	if in.CompiledBaseRef != in.RunningBaseRef {
 		return ActionGoldenRebuildRecycle
 	}
+
 	// A guest fingerprint change with a compatible protocol reloads the guest in
 	// place, so running jobs re-adopt and no VM recycles. An incompatible protocol
 	// cannot re-adopt across the break, so it falls back to a golden rebuild.
@@ -90,15 +91,19 @@ func Decide(in Inputs) Action {
 		if in.GuestProtocolMajor == in.CompiledProtocolMajor {
 			return ActionGuestReload
 		}
+
 		return ActionGoldenRebuildRecycle
 	}
+
 	// A host-only change replaces the worker in place when a supervisor is present,
 	// otherwise it restarts the whole service; adoption reattaches jobs either way.
 	if in.CompiledHostFingerprint != in.RunningHostFingerprint {
 		if in.SupervisorPresent {
 			return ActionWorkerReload
 		}
+
 		return ActionServiceRestart
 	}
+
 	return ActionNoop
 }

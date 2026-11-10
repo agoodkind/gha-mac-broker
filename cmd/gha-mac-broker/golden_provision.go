@@ -180,6 +180,7 @@ func provisionGolden(ctx context.Context, req provisionRequest) error {
 			"dest",
 			req.paths.plistDest,
 		)
+
 		return fmt.Errorf("golden-provision: write guest agent plist: %w", err)
 	}
 
@@ -210,6 +211,7 @@ func provisionGolden(ctx context.Context, req provisionRequest) error {
 			"dest",
 			req.paths.fingerprintDest,
 		)
+
 		return fmt.Errorf("golden-provision: write fingerprint: %w", err)
 	}
 
@@ -303,6 +305,7 @@ func installRunner(
 			"runner_dir",
 			runnerDir,
 		)
+
 		return fmt.Errorf(
 			"golden-provision: runner %s missing after extract: %w",
 			runnerRunScript,
@@ -443,6 +446,7 @@ func extractTarEntry(
 			"target",
 			target,
 		)
+
 		return nil
 	}
 }
@@ -693,6 +697,7 @@ func codesignAdhoc(ctx context.Context, path string) error {
 			"output",
 			strings.TrimSpace(string(out)),
 		)
+
 		return fmt.Errorf(
 			"golden-provision: codesign %s: %w: %s",
 			path,

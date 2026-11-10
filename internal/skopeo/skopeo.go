@@ -135,6 +135,7 @@ func (c *Client) CopyToOCILayout(
 			"output",
 			strings.TrimSpace(string(out)),
 		)
+
 		return fmt.Errorf("skopeo: copy %s to %s: %w", srcImageRef, layoutDir, err)
 	}
 

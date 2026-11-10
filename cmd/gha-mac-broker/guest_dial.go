@@ -33,6 +33,7 @@ func runGuestDial(ctx context.Context, _ []string) error {
 		slog.ErrorContext(ctx, "guest-dial connect failed", "err", err, "address", address)
 		return fmt.Errorf("guest-dial: connect %s: %w", address, err)
 	}
+
 	defer func() { _ = conn.Close() }()
 
 	// Copy each direction independently. A buffered channel holds both results so
@@ -53,6 +54,7 @@ func runGuestDial(ctx context.Context, _ []string) error {
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			_ = tcpConn.CloseWrite()
 		}
+
 		relayDone <- copyErr
 	}()
 	go func() {
@@ -78,5 +80,6 @@ func runGuestDial(ctx context.Context, _ []string) error {
 		slog.ErrorContext(ctx, "guest-dial relay failed", "err", firstErr, "address", address)
 		return fmt.Errorf("guest-dial: relay: %w", firstErr)
 	}
+
 	return nil
 }

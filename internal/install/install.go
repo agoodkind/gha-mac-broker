@@ -224,6 +224,7 @@ func requireHostBinary(ctx context.Context, binary string, installHint string) e
 			"binary",
 			binary,
 		)
+
 		return fmt.Errorf(
 			"install: %s not found on PATH; install it with `%s`: %w",
 			binary,

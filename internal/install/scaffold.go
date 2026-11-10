@@ -145,6 +145,7 @@ func ensureWebhookCIDRs(ctx context.Context, dir string) {
 			"path",
 			path,
 		)
+
 		return
 	}
 
@@ -164,6 +165,7 @@ func ensureWebhookCIDRs(ctx context.Context, dir string) {
 			"path",
 			path,
 		)
+
 		return
 	}
 
@@ -195,6 +197,7 @@ func fetchMetaHooks(ctx context.Context) ([]string, error) {
 			"status",
 			resp.StatusCode,
 		)
+
 		return nil, fmt.Errorf("install: meta status %d", resp.StatusCode)
 	}
 

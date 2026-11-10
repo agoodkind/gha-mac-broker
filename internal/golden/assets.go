@@ -34,5 +34,6 @@ var guestAgentPlist []byte
 func GuestAgentPlist() []byte {
 	out := make([]byte, len(guestAgentPlist))
 	copy(out, guestAgentPlist)
+
 	return out
 }

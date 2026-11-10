@@ -406,6 +406,7 @@ func (s *Server) cancelClosedPullRequestRuns(ctx context.Context, repo, headSHA 
 			"cancelled",
 			cancelled,
 		)
+
 		return
 	}
 
