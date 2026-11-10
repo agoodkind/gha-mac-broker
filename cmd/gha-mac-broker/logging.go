@@ -34,6 +34,7 @@ func parseLogLevel(raw string) slog.Level {
 	if level, ok := logLevelNames[strings.ToUpper(strings.TrimSpace(raw))]; ok {
 		return level
 	}
+
 	return slog.LevelInfo
 }
 

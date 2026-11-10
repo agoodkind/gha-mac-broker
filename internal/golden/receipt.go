@@ -21,9 +21,11 @@ func (r RunnerReceipt) Validate() error {
 	if strings.TrimSpace(r.Version) == "" || strings.TrimSpace(r.Version) != r.Version {
 		return fmt.Errorf("golden: runner receipt version is empty or padded")
 	}
+
 	digest, err := hex.DecodeString(r.TarballDigest)
 	if err != nil || len(digest) != sha256.Size {
 		return fmt.Errorf("golden: runner receipt digest must be a hex SHA-256")
 	}
+
 	return nil
 }

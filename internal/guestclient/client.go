@@ -83,6 +83,7 @@ func (client *Client) JobStatus(
 	)
 	if err != nil {
 		slog.WarnContext(ctx, "guestclient job status failed", "err", err)
+
 		return guestprotoconnect.GuestAgentServiceJobStatusClientStream{}, fmt.Errorf(
 			"guestclient job status: %w",
 			err,

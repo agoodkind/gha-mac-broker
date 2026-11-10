@@ -47,6 +47,7 @@ func (t *Tracker) Reconcile(jobIDs map[int64]struct{}) {
 	for jobID := range jobIDs {
 		replacement[jobID] = struct{}{}
 	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.jobs = replacement
@@ -56,6 +57,7 @@ func (t *Tracker) Reconcile(jobIDs map[int64]struct{}) {
 func (t *Tracker) Count() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	return len(t.jobs)
 }
 
@@ -74,15 +76,18 @@ const hostedMacOSLabelPrefix = "macos-"
 //	    runner.
 func IsHostedMacOSJob(jobLabels, poolLabels []string) bool {
 	hasHostedLabel := false
+
 	for _, label := range jobLabels {
 		if strings.HasPrefix(strings.ToLower(label), hostedMacOSLabelPrefix) {
 			hasHostedLabel = true
 			break
 		}
 	}
+
 	if !hasHostedLabel {
 		return false
 	}
+
 	for _, label := range jobLabels {
 		for _, poolLabel := range poolLabels {
 			if strings.EqualFold(label, poolLabel) {
@@ -90,5 +95,6 @@ func IsHostedMacOSJob(jobLabels, poolLabels []string) bool {
 			}
 		}
 	}
+
 	return true
 }

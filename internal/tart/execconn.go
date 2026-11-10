@@ -35,11 +35,13 @@ func (t *Tart) ExecConn(ctx context.Context, name string, argv ...string) (net.C
 		syscall.CloseOnExec(fds[0])
 		syscall.CloseOnExec(fds[1])
 	}
+
 	syscall.ForkLock.RUnlock()
 	if err != nil {
 		slog.ErrorContext(ctx, "tart exec conn socketpair failed", "err", err, "vm", name)
 		return nil, fmt.Errorf("tart: exec conn socketpair for %s: %w", name, err)
 	}
+
 	// The parent file becomes a net.Conn; the child file wires to the guest
 	// command's stdin and stdout so it reads requests and writes replies over one
 	// socket.
@@ -63,8 +65,10 @@ func (t *Tart) ExecConn(ctx context.Context, name string, argv ...string) (net.C
 		_ = parentFile.Close()
 		_ = childFile.Close()
 		slog.ErrorContext(ctx, "tart exec conn start failed", "err", err, "vm", name)
+
 		return nil, fmt.Errorf("tart: exec conn start %s: %w", name, err)
 	}
+
 	// The child now holds its socket end through stdin and stdout, so the parent
 	// no longer needs that end.
 	_ = childFile.Close()
@@ -76,10 +80,13 @@ func (t *Tart) ExecConn(ctx context.Context, name string, argv ...string) (net.C
 		if cmd.Process != nil {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
+
 		_ = cmd.Wait()
 		slog.ErrorContext(ctx, "tart exec conn wrap socket failed", "err", err, "vm", name)
+
 		return nil, fmt.Errorf("tart: exec conn wrap socket for %s: %w", name, err)
 	}
+
 	return &execConn{Conn: conn, cmd: cmd, closeOnce: sync.Once{}, closeErr: nil}, nil
 }
 
@@ -103,8 +110,10 @@ func (c *execConn) Close() error {
 			// Negating the pid signals the whole group started by Setpgid.
 			_ = syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
 		}
+
 		_ = c.cmd.Wait()
 		c.closeErr = connErr
 	})
+
 	return c.closeErr
 }

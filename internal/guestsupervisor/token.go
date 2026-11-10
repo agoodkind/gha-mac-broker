@@ -41,12 +41,15 @@ func EnsureBootToken(envToken string, path string) (string, error) {
 			if err != nil {
 				return "", err
 			}
+
 			token = minted
 		}
 	}
+
 	if err := WriteTokenFile(path, token); err != nil {
 		return "", err
 	}
+
 	return token, nil
 }
 
@@ -57,6 +60,7 @@ func readBootToken(path string) string {
 	if err != nil {
 		return ""
 	}
+
 	return strings.TrimSpace(string(data))
 }
 
@@ -67,6 +71,7 @@ func MintToken() (string, error) {
 		slog.Error("guest supervisor mint token failed", "err", err)
 		return "", fmt.Errorf("guestsupervisor: mint token: %w", err)
 	}
+
 	return hex.EncodeToString(entropy), nil
 }
 
@@ -80,30 +85,40 @@ func WriteTokenFile(path string, token string) error {
 		slog.Error("guest supervisor create token temp file failed", "err", err, "path", path)
 		return fmt.Errorf("guestsupervisor: create token temp file for %s: %w", path, err)
 	}
+
 	tempName := temp.Name()
 	if _, err := temp.WriteString(token); err != nil {
 		_ = temp.Close()
 		_ = os.Remove(tempName)
 		slog.Error("guest supervisor write token temp file failed", "err", err, "path", tempName)
+
 		return fmt.Errorf("guestsupervisor: write token temp file %s: %w", tempName, err)
 	}
+
 	if err := temp.Close(); err != nil {
 		_ = os.Remove(tempName)
 		slog.Error("guest supervisor close token temp file failed", "err", err, "path", tempName)
+
 		return fmt.Errorf("guestsupervisor: close token temp file %s: %w", tempName, err)
 	}
+
 	// os.CreateTemp already creates the file 0600, so a reader of the temp path
 	// never sees looser perms; set it explicitly to be defensive against a umask.
 	if err := os.Chmod(tempName, tokenFileMode); err != nil {
 		_ = os.Remove(tempName)
 		slog.Error("guest supervisor chmod token temp file failed", "err", err, "path", tempName)
+
 		return fmt.Errorf("guestsupervisor: chmod token temp file %s: %w", tempName, err)
 	}
+
 	if err := os.Rename(tempName, path); err != nil {
 		_ = os.Remove(tempName)
 		slog.Error("guest supervisor rename token file failed", "err", err, "path", path)
+
 		return fmt.Errorf("guestsupervisor: rename token file to %s: %w", path, err)
 	}
+
 	slog.Info("guest supervisor token file written", "path", path)
+
 	return nil
 }

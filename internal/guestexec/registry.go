@@ -375,6 +375,7 @@ func (r *Registry) Subscribe(
 			"execution_id",
 			executionID,
 		)
+
 		return nil, nil, fmt.Errorf("%w: %s", ErrExecutionNotFound, executionID)
 	}
 
@@ -407,6 +408,7 @@ func (r *Registry) Cancel(executionID string) error {
 			"execution_id",
 			executionID,
 		)
+
 		return fmt.Errorf("%w: %s", ErrExecutionNotFound, executionID)
 	}
 

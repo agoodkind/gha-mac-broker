@@ -67,6 +67,7 @@ func installLaunchdMaintenance(ctx context.Context, cfg Config) error {
 			"path",
 			scriptPath,
 		)
+
 		return fmt.Errorf("install: create maintenance script dir: %w", err)
 	}
 
@@ -91,6 +92,7 @@ func installLaunchdMaintenance(ctx context.Context, cfg Config) error {
 			"path",
 			plistPath,
 		)
+
 		return fmt.Errorf("install: create maintenance LaunchAgents dir: %w", err)
 	}
 
@@ -142,6 +144,7 @@ func installLaunchdMaintenance(ctx context.Context, cfg Config) error {
 			"out",
 			string(out),
 		)
+
 		return fmt.Errorf("install: launchctl maintenance bootstrap: %w", err)
 	}
 
@@ -158,6 +161,7 @@ func uninstallMaintenanceTimer(ctx context.Context, cfg Config) error {
 			"os",
 			runtime.GOOS,
 		)
+
 		return nil
 	}
 

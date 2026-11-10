@@ -41,6 +41,7 @@ func installRunningBinary(ctx context.Context, sourcePath string, destinationPat
 			"destination",
 			destinationPath,
 		)
+
 		return err
 	}
 
@@ -100,6 +101,7 @@ func copyBinary(ctx context.Context, sourcePath string, destinationPath string) 
 			"directory",
 			destinationDir,
 		)
+
 		return fmt.Errorf("install: create binary dir %s: %w", destinationDir, err)
 	}
 
@@ -152,6 +154,7 @@ func copyBinary(ctx context.Context, sourcePath string, destinationPath string) 
 			"destination",
 			destinationPath,
 		)
+
 		return fmt.Errorf("install: replace binary %s: %w", destinationPath, err)
 	}
 

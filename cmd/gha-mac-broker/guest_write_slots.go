@@ -28,6 +28,7 @@ func runGuestWriteSlots(ctx context.Context, args []string) error {
 			"arg",
 			args[0],
 		)
+
 		return fmt.Errorf("guest-write-slots parse slot count %q: %w", args[0], err)
 	}
 

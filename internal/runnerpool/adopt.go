@@ -16,19 +16,23 @@ func (p *Pool) adoptWorkers(ctx context.Context) []broker.AdoptedVM {
 		slog.WarnContext(ctx, "runnerpool adopt running vms failed", "err", err)
 		return nil
 	}
+
 	return adopted
 }
 
 func (p *Pool) installAdoptedWorkersLocked(adopted []broker.AdoptedVM) {
 	now := p.options.Now()
 	stateIndex := 0
+
 	for _, adoptedVM := range adopted {
 		if stateIndex >= len(p.states) {
 			break
 		}
+
 		if adoptedVM.VM == nil {
 			continue
 		}
+
 		state := &p.states[stateIndex]
 		stateIndex++
 		state.vm = adoptedVM.VM
@@ -40,17 +44,21 @@ func (p *Pool) installAdoptedWorkersLocked(adopted []broker.AdoptedVM) {
 		state.recycle = false
 		state.lastErr = nil
 		state.slots = make([]slotState, p.options.JobsPerVM)
+
 		for _, binding := range adoptedVM.Slots {
 			if binding.SlotIndex < 0 || binding.SlotIndex >= len(state.slots) {
 				continue
 			}
+
 			if !adoptedSlotBindingBusy(binding) {
 				continue
 			}
+
 			boundAt := binding.BoundAt
 			if boundAt.IsZero() {
 				boundAt = now
 			}
+
 			state.slots[binding.SlotIndex] = slotState{
 				boundAt:      boundAt,
 				busy:         true,
@@ -72,5 +80,6 @@ func adoptedSlotBindingBusy(binding broker.SlotBinding) bool {
 	if binding.ObservedActive {
 		return true
 	}
+
 	return binding.HasJobMetadata()
 }

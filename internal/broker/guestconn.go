@@ -155,6 +155,7 @@ func (b *Binder) waitForGuestHello(ctx context.Context, client guestConn, vmName
 				"vm",
 				vmName,
 			)
+
 			return fmt.Errorf("broker: waiting for guest hello on %s: %w", vmName, ctx.Err())
 		case <-ticker.C:
 		}

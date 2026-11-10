@@ -12,6 +12,7 @@ func TestCopyToOCILayoutArgs(t *testing.T) {
 	stub := func(_ context.Context, bin string, args ...string) ([]byte, error) {
 		gotBin = bin
 		gotArgs = slices.Clone(args)
+
 		return nil, nil
 	}
 	client := New("skopeo", 16)
@@ -32,6 +33,7 @@ func TestCopyToOCILayoutArgs(t *testing.T) {
 	if gotBin != "skopeo" {
 		t.Fatalf("bin = %q, want skopeo", gotBin)
 	}
+
 	wantArgs := []string{
 		"copy",
 		"--image-parallel-copies",
